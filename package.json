@@ -2,6 +2,7 @@
   "name": "stophammer-crawler",
   "version": "1.0.0",
   "description": "RSS feed crawler for stophammer V4V music index",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
