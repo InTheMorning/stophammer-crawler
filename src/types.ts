@@ -50,6 +50,9 @@ export interface IngestFeedData {
   author_name?: string;
   owner_name?: string;
   pub_date?: number;
+  /// Feed-level podcast:value recipients; tracks fall back to these when they
+  /// have no payment routes of their own.
+  feed_payment_routes: IngestPaymentRoute[];
   tracks: IngestTrackData[];
 }
 

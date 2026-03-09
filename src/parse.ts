@@ -302,6 +302,7 @@ export function parseFeed(xmlText: string): IngestFeedData | null {
     author_name: authorName,
     owner_name: ownerName,
     pub_date: parsePubDate(text(channel["pubDate"])),
+    feed_payment_routes: parsePaymentRoutes(channel["podcast:value"]),
     tracks,
   };
 }
