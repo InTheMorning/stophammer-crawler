@@ -84,6 +84,33 @@ Includes in-memory dedup with cooldown to avoid re-crawling the same URL within
 | `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
 | `PODPING_WS_URL` | no | `wss://api.livewire.io/ws/podping` | Podping WebSocket endpoint |
 
+## Architecture
+
+```
+stophammer-crawler
+  src/
+    main.rs           CLI dispatcher (clap subcommands)
+    crawl.rs          Shared pipeline: fetch → SHA-256 → parse → POST
+    pool.rs           Bounded concurrency pool (tokio semaphore)
+    dedup.rs          In-memory cooldown map (podping mode)
+    modes/
+      crawl.rs        Load URLs from file/env/stdin, run pool
+      import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
+      podping.rs      WebSocket listener, music filter, dedup, persistent workers
+```
+
+The core pipeline in `crawl.rs` calls `stophammer-parser` as a Rust library — no
+subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function:
+
+1. **Fetch** the RSS feed via `reqwest`
+2. **Hash** the raw response body with SHA-256
+3. **Parse** the XML with `stophammer-parser::profile::stophammer()` (or
+   `stophammer_with_fallback()` for import mode with PodcastIndex GUIDs)
+4. **POST** the result as JSON to the stophammer `/ingest/feed` endpoint
+
+Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
+fixed task list; podping mode runs an unbounded stream with a permit-based cap.
+
 ## Docker
 
 ```bash
