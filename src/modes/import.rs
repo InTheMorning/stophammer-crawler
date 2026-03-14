@@ -2,11 +2,14 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
 use crate::crawl::{crawl_feed, CrawlConfig, CrawlOutcome};
 use crate::pool::run_pool;
+
+const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 
 struct CandidateRow {
     id: i64,
@@ -100,6 +103,33 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
     .collect()
 }
 
+async fn crawl_feed_with_import_retries(
+    client: &reqwest::Client,
+    url: &str,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    row_id: i64,
+) -> CrawlOutcome {
+    let mut attempt = 1;
+
+    loop {
+        let outcome = crawl_feed(client, url, fallback_guid, config).await;
+        match &outcome {
+            CrawlOutcome::FetchError(err) if attempt < IMPORT_FETCH_ATTEMPTS => {
+                let backoff = Duration::from_secs(1_u64 << (attempt - 1));
+                eprintln!(
+                    "  import: retrying fetch after attempt {attempt}/{} for id={row_id} {}: {err}",
+                    IMPORT_FETCH_ATTEMPTS,
+                    url
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            _ => return outcome,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db_path: String,
@@ -176,7 +206,13 @@ pub async fn run(
                     let errors = Arc::clone(&errors);
                     move || async move {
                         let fallback = row.podcast_guid.as_deref();
-                        let outcome = crawl_feed(&client, &row.url, fallback, &config).await;
+                        let outcome = crawl_feed_with_import_retries(
+                            &client,
+                            &row.url,
+                            fallback,
+                            &config,
+                            row.id,
+                        ).await;
 
                         match &outcome {
                             CrawlOutcome::Accepted { .. } => {
