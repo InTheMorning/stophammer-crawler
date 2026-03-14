@@ -79,9 +79,7 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
         .prepare_cached(
             "SELECT id, url, podcastGuid
              FROM   podcasts
-             WHERE  dead = 0
-               AND (category1 LIKE '%music%' OR category2 LIKE '%music%' OR itunesType = 'serial')
-               AND  id > ?1
+             WHERE  id > ?1
              ORDER BY id ASC
              LIMIT ?2",
         )
