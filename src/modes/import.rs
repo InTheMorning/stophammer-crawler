@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -19,7 +21,17 @@ struct ProgressStore {
 
 impl ProgressStore {
     fn open(path: &str) -> Self {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).unwrap_or_else(|e| {
+                    panic!("failed to create import state directory {}: {e}", parent.display())
+                });
+            }
+        }
+
         let conn = Connection::open(path).expect("failed to open import state DB");
+        conn.pragma_update(None, "journal_mode", "MEMORY")
+            .expect("failed to set import state journal mode");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS import_progress (
                 key   TEXT PRIMARY KEY,
@@ -43,13 +55,13 @@ impl ProgressStore {
     }
 
     fn set_last_id(&self, id: i64) {
-        self.conn
-            .execute(
-                "INSERT INTO import_progress (key, value) VALUES ('last_processed_id', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [id.to_string()],
-            )
-            .expect("failed to update cursor");
+        if let Err(e) = self.conn.execute(
+            "INSERT INTO import_progress (key, value) VALUES ('last_processed_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [id.to_string()],
+        ) {
+            eprintln!("import: WARNING: failed to persist cursor at id={id}: {e}");
+        }
     }
 
     fn reset(&self) {
