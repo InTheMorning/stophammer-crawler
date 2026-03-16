@@ -10,6 +10,7 @@ use crate::crawl::{crawl_feed, CrawlConfig, CrawlOutcome};
 use crate::pool::run_pool;
 
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
+const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 
 struct CandidateRow {
     id: i64,
@@ -147,7 +148,10 @@ pub async fn run(
     }
 
     let mut cursor = progress.get_last_id();
-    eprintln!("import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}");
+    eprintln!(
+        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={}s",
+        IMPORT_FETCH_TIMEOUT_SECS
+    );
 
     let pi_db = Connection::open_with_flags(
         &db_path,
@@ -164,11 +168,13 @@ pub async fn run(
             crawl_token: String::new(),
             ingest_url: String::new(),
             user_agent: "stophammer-crawler/0.1 (dry-run)".to_string(),
-            fetch_timeout: std::time::Duration::from_secs(20),
+            fetch_timeout: std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
             ingest_timeout: std::time::Duration::from_secs(10),
         }
     } else {
-        CrawlConfig::from_env()
+        let mut config = CrawlConfig::from_env();
+        config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
+        config
     });
 
     let client = Arc::new(reqwest::Client::new());
