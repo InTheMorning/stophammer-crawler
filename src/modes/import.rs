@@ -1,10 +1,16 @@
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
 use crate::crawl::{crawl_feed, CrawlConfig, CrawlOutcome};
 use crate::pool::run_pool;
+
+const IMPORT_FETCH_ATTEMPTS: u32 = 2;
+const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 
 struct CandidateRow {
     id: i64,
@@ -19,7 +25,17 @@ struct ProgressStore {
 
 impl ProgressStore {
     fn open(path: &str) -> Self {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).unwrap_or_else(|e| {
+                    panic!("failed to create import state directory {}: {e}", parent.display())
+                });
+            }
+        }
+
         let conn = Connection::open(path).expect("failed to open import state DB");
+        conn.pragma_update(None, "journal_mode", "MEMORY")
+            .expect("failed to set import state journal mode");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS import_progress (
                 key   TEXT PRIMARY KEY,
@@ -43,13 +59,13 @@ impl ProgressStore {
     }
 
     fn set_last_id(&self, id: i64) {
-        self.conn
-            .execute(
-                "INSERT INTO import_progress (key, value) VALUES ('last_processed_id', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [id.to_string()],
-            )
-            .expect("failed to update cursor");
+        if let Err(e) = self.conn.execute(
+            "INSERT INTO import_progress (key, value) VALUES ('last_processed_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [id.to_string()],
+        ) {
+            eprintln!("import: WARNING: failed to persist cursor at id={id}: {e}");
+        }
     }
 
     fn reset(&self) {
@@ -67,9 +83,7 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
         .prepare_cached(
             "SELECT id, url, podcastGuid
              FROM   podcasts
-             WHERE  dead = 0
-               AND (category1 LIKE '%music%' OR category2 LIKE '%music%' OR itunesType = 'serial')
-               AND  id > ?1
+             WHERE  id > ?1
              ORDER BY id ASC
              LIMIT ?2",
         )
@@ -90,6 +104,33 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
     .collect()
 }
 
+async fn crawl_feed_with_import_retries(
+    client: &reqwest::Client,
+    url: &str,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    row_id: i64,
+) -> CrawlOutcome {
+    let mut attempt = 1;
+
+    loop {
+        let outcome = crawl_feed(client, url, fallback_guid, config).await;
+        match &outcome {
+            CrawlOutcome::FetchError(err) if attempt < IMPORT_FETCH_ATTEMPTS => {
+                let backoff = Duration::from_secs(1_u64 << (attempt - 1));
+                eprintln!(
+                    "  import: retrying fetch after attempt {attempt}/{} for id={row_id} {}: {err}",
+                    IMPORT_FETCH_ATTEMPTS,
+                    url
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+            _ => return outcome,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     db_path: String,
@@ -107,7 +148,10 @@ pub async fn run(
     }
 
     let mut cursor = progress.get_last_id();
-    eprintln!("import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}");
+    eprintln!(
+        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={}s",
+        IMPORT_FETCH_TIMEOUT_SECS
+    );
 
     let pi_db = Connection::open_with_flags(
         &db_path,
@@ -124,11 +168,13 @@ pub async fn run(
             crawl_token: String::new(),
             ingest_url: String::new(),
             user_agent: "stophammer-crawler/0.1 (dry-run)".to_string(),
-            fetch_timeout: std::time::Duration::from_secs(20),
+            fetch_timeout: std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
             ingest_timeout: std::time::Duration::from_secs(10),
         }
     } else {
-        CrawlConfig::from_env()
+        let mut config = CrawlConfig::from_env();
+        config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
+        config
     });
 
     let client = Arc::new(reqwest::Client::new());
@@ -166,7 +212,13 @@ pub async fn run(
                     let errors = Arc::clone(&errors);
                     move || async move {
                         let fallback = row.podcast_guid.as_deref();
-                        let outcome = crawl_feed(&client, &row.url, fallback, &config).await;
+                        let outcome = crawl_feed_with_import_retries(
+                            &client,
+                            &row.url,
+                            fallback,
+                            &config,
+                            row.id,
+                        ).await;
 
                         match &outcome {
                             CrawlOutcome::Accepted { .. } => {
