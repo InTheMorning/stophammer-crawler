@@ -13,7 +13,10 @@ where
     let mut handles = Vec::with_capacity(tasks.len());
 
     for task in tasks {
-        let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore closed");
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
         handles.push(tokio::spawn(async move {
             task().await;
             drop(permit);

@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::crawl::{crawl_feed, CrawlConfig};
+use crate::crawl::{CrawlConfig, crawl_feed};
 use crate::dedup::Dedup;
 
 // ── Podping wire types ────────────────────────────────────────────────────────

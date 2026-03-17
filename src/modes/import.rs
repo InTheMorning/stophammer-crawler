@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::crawl::{crawl_feed, CrawlConfig, CrawlOutcome};
+use crate::crawl::{CrawlConfig, CrawlOutcome, crawl_feed};
 use crate::pool::run_pool;
 
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
@@ -28,7 +28,10 @@ impl ProgressStore {
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    panic!("failed to create import state directory {}: {e}", parent.display())
+                    panic!(
+                        "failed to create import state directory {}: {e}",
+                        parent.display()
+                    )
                 });
             }
         }
@@ -89,16 +92,13 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
         )
         .expect("failed to prepare query");
 
-    stmt.query_map(
-        rusqlite::params![start_id, batch_size],
-        |row| {
-            Ok(CandidateRow {
-                id: row.get(0)?,
-                url: row.get(1)?,
-                podcast_guid: row.get(2)?,
-            })
-        },
-    )
+    stmt.query_map(rusqlite::params![start_id, batch_size], |row| {
+        Ok(CandidateRow {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            podcast_guid: row.get(2)?,
+        })
+    })
     .expect("query failed")
     .filter_map(Result::ok)
     .collect()
@@ -120,8 +120,7 @@ async fn crawl_feed_with_import_retries(
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
                     "  import: retrying fetch after attempt {attempt}/{} for id={row_id} {}: {err}",
-                    IMPORT_FETCH_ATTEMPTS,
-                    url
+                    IMPORT_FETCH_ATTEMPTS, url
                 );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
@@ -213,12 +212,9 @@ pub async fn run(
                     move || async move {
                         let fallback = row.podcast_guid.as_deref();
                         let outcome = crawl_feed_with_import_retries(
-                            &client,
-                            &row.url,
-                            fallback,
-                            &config,
-                            row.id,
-                        ).await;
+                            &client, &row.url, fallback, &config, row.id,
+                        )
+                        .await;
 
                         match &outcome {
                             CrawlOutcome::Accepted { .. } => {

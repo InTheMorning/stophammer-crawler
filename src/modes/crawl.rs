@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-use crate::crawl::{crawl_feed, CrawlConfig};
+use crate::crawl::{CrawlConfig, crawl_feed};
 use crate::pool::run_pool;
 
 /// Load URLs from: positional args → `FEED_URLS` env → stdin (one per line).
