@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use stophammer_parser::profile;
+use stophammer_parser::types::IngestFeedData;
 
 /// Configuration shared by all crawl modes.
 pub struct CrawlConfig {
@@ -76,60 +77,41 @@ struct IngestResponse {
     warnings: Option<Vec<String>>,
 }
 
-/// Fetch → SHA-256 → parse → POST. Never panics.
-pub async fn crawl_feed(
-    client: &reqwest::Client,
-    url: &str,
-    fallback_guid: Option<&str>,
-    config: &CrawlConfig,
-) -> CrawlOutcome {
-    // 1. Fetch
-    let resp = match client
-        .get(url)
-        .header("User-Agent", &config.user_agent)
-        .timeout(config.fetch_timeout)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return CrawlOutcome::FetchError(e.to_string()),
-    };
-
-    let status = resp.status().as_u16();
-
-    let body = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return CrawlOutcome::FetchError(e.to_string()),
-    };
-
-    // 2. SHA-256 hash of raw bytes
-    let hash = hex::encode(Sha256::digest(&body));
-
-    // 3. Parse (direct library call — no subprocess)
-    let xml = String::from_utf8_lossy(&body);
+fn parse_feed_xml(xml: &str, fallback_guid: Option<&str>) -> Result<Option<IngestFeedData>, String> {
     let parser = match fallback_guid {
         Some(guid) => profile::stophammer_with_fallback(guid.to_string()),
         None => profile::stophammer(),
     };
-    let feed_data = match parser.parse(&xml) {
-        Ok(data) => Some(data),
+
+    match parser.parse(xml) {
+        Ok(data) => Ok(Some(data)),
         Err(e) => {
             if e.is_xml() {
-                return CrawlOutcome::ParseError(e.to_string());
+                Err(e.to_string())
+            } else {
+                // Missing fields (no title, no guid) → still POST with `feed_data: null`
+                // so the server can record the crawl attempt.
+                Ok(None)
             }
-            // Missing fields (no title, no guid) → still POST with feed_data: null
-            // so the server can record the crawl attempt
-            None
         }
-    };
+    }
+}
 
-    // 4. POST to /ingest/feed
+async fn post_ingest_payload(
+    client: &reqwest::Client,
+    canonical_url: &str,
+    source_url: &str,
+    http_status: u16,
+    content_hash: &str,
+    feed_data: Option<IngestFeedData>,
+    config: &CrawlConfig,
+) -> CrawlOutcome {
     let payload = serde_json::json!({
-        "canonical_url": url,
-        "source_url": url,
+        "canonical_url": canonical_url,
+        "source_url": source_url,
         "crawl_token": config.crawl_token,
-        "http_status": status,
-        "content_hash": hash,
+        "http_status": http_status,
+        "content_hash": content_hash,
         "feed_data": feed_data,
     });
 
@@ -166,4 +148,69 @@ pub async fn crawl_feed(
             CrawlOutcome::Rejected { reason, warnings }
         }
     }
+}
+
+/// Parse cached XML and POST it to `/ingest/feed`. Never panics.
+pub async fn ingest_cached_feed(
+    client: &reqwest::Client,
+    source_url: &str,
+    canonical_url: &str,
+    http_status: u16,
+    raw_xml: &str,
+    content_hash: Option<&str>,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+) -> CrawlOutcome {
+    let content_hash = content_hash
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| hex::encode(Sha256::digest(raw_xml.as_bytes())));
+
+    let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
+        Ok(data) => data,
+        Err(e) => return CrawlOutcome::ParseError(e),
+    };
+
+    post_ingest_payload(
+        client,
+        canonical_url,
+        source_url,
+        http_status,
+        &content_hash,
+        feed_data,
+        config,
+    )
+    .await
+}
+
+/// Fetch → SHA-256 → parse → POST. Never panics.
+pub async fn crawl_feed(
+    client: &reqwest::Client,
+    url: &str,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+) -> CrawlOutcome {
+    // 1. Fetch
+    let resp = match client
+        .get(url)
+        .header("User-Agent", &config.user_agent)
+        .timeout(config.fetch_timeout)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return CrawlOutcome::FetchError(e.to_string()),
+    };
+
+    let status = resp.status().as_u16();
+
+    let body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return CrawlOutcome::FetchError(e.to_string()),
+    };
+
+    // 2. SHA-256 hash of raw bytes
+    let hash = hex::encode(Sha256::digest(&body));
+    let xml = String::from_utf8_lossy(&body);
+
+    ingest_cached_feed(client, url, url, status, &xml, Some(&hash), fallback_guid, config).await
 }

@@ -127,6 +127,7 @@ Available binaries:
 
 - `cargo run --bin feed_audit -- ...`
 - `cargo run --bin audit_analyzer -- ...`
+- `cargo run --bin audit_import -- ...`
 
 By default:
 
@@ -134,6 +135,9 @@ By default:
   `./analysis/data/feed_audit.ndjson`
 - `audit_analyzer` reads `./analysis/data/feed_audit.ndjson` and writes reports
   under `./analysis/reports/`
+- `audit_import` reads `./analysis/data/feed_audit.ndjson` and replays cached
+  feeds into `/ingest/feed` using `./analysis/data/audit_import_state.db` as its
+  resume cursor
 
 ## Docker
 

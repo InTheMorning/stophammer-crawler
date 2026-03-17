@@ -13,6 +13,10 @@ path = "analysis/bin/feed_audit.rs"
 name = "audit_analyzer"
 path = "analysis/bin/audit_analyzer.rs"
 
+[[bin]]
+name = "audit_import"
+path = "analysis/bin/audit_import.rs"
+
 [dependencies]
 stophammer-parser = { path = "../stophammer-parser" }
 tokio       = { version = "1", features = ["full"] }
