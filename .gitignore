@@ -1,3 +1,9 @@
 /target
 import_state.db
 podcastindex_feeds.db
+analysis/data/*.db
+analysis/data/*.db-shm
+analysis/data/*.db-wal
+analysis/data/*.ndjson
+analysis/reports/*.json
+analysis/reports/*.md

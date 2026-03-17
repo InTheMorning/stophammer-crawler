@@ -111,6 +111,30 @@ subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function
 Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
 fixed task list; podping mode runs an unbounded stream with a permit-based cap.
 
+## Analysis Tools
+
+Audit and corpus-analysis tools live under `analysis/` so they stay separate from
+the crawler's operational code and runtime data:
+
+```text
+analysis/
+  bin/                 Rust binaries for feed audits and corpus analysis
+  data/                Local audit inputs/outputs (NDJSON, SQLite snapshots)
+  reports/             Generated Markdown/JSON reports and clustering artifacts
+```
+
+Available binaries:
+
+- `cargo run --bin feed_audit -- ...`
+- `cargo run --bin audit_analyzer -- ...`
+
+By default:
+
+- `feed_audit` reads `./analysis/data/stophammer-feeds.db` and writes
+  `./analysis/data/feed_audit.ndjson`
+- `audit_analyzer` reads `./analysis/data/feed_audit.ndjson` and writes reports
+  under `./analysis/reports/`
+
 ## Docker
 
 ```bash

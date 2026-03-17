@@ -5,6 +5,14 @@ edition = "2024"
 license = "AGPL-3.0-only"
 description = "Unified RSS feed crawler with crawl, import, and podping modes"
 
+[[bin]]
+name = "feed_audit"
+path = "analysis/bin/feed_audit.rs"
+
+[[bin]]
+name = "audit_analyzer"
+path = "analysis/bin/audit_analyzer.rs"
+
 [dependencies]
 stophammer-parser = { path = "../stophammer-parser" }
 tokio       = { version = "1", features = ["full"] }
@@ -17,6 +25,7 @@ rusqlite    = { version = "0.31", features = ["bundled"] }
 clap        = { version = "4", features = ["derive", "env"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+roxmltree = "0.21"
 
 [profile.release]
 opt-level = 3
