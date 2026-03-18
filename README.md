@@ -142,15 +142,17 @@ By default:
 ## Docker
 
 ```bash
-# One-shot crawl
-docker compose run --rm crawler
-
-# Long-running podping listener
-docker compose up -d podping
+# This repo does not ship a general-purpose crawler compose stack.
+# The top-level repo only includes test environments:
+docker compose -f ../docker-compose.e2e.yml up -d --build --wait
+docker compose -f ../docker-compose.e2e.yml down -v
 ```
 
-See the main [docker-compose.yml](https://github.com/dardevelin/stophammer/blob/main/docker-compose.yml)
-for full service definitions.
+For day-to-day crawler operation, run the binary directly or supply your own
+compose file / scheduler. The available top-level compose files are:
+
+- `../docker-compose.e2e.yml`
+- `../docker-compose.e2e-tls.yml`
 
 ## License
 
