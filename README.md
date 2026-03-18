@@ -16,6 +16,28 @@ Three subcommands cover every discovery path:
 - Rust 1.85+ (edition 2024)
 - For import mode: a [PodcastIndex](https://podcastindex.org) database snapshot
 
+## Build and run
+
+From this checkout:
+
+```bash
+# Operational crawler modes
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- import --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- podping --help
+
+# Analysis / replay tools
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- --help
+```
+
+Or build binaries once:
+
+```bash
+cargo build --manifest-path stophammer-crawler/Cargo.toml --release --bins
+```
+
 ## Usage
 
 ### crawl
@@ -24,16 +46,28 @@ Fetch and ingest a list of feed URLs:
 
 ```bash
 # From arguments
-CRAWL_TOKEN=secret stophammer-crawler crawl https://example.com/feed.xml
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  crawl https://example.com/feed.xml
 
 # From a file
-CRAWL_TOKEN=secret stophammer-crawler crawl feeds.txt
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  crawl feeds.txt
 
 # From env
-CRAWL_TOKEN=secret FEED_URLS="https://a.com/feed,https://b.com/feed" stophammer-crawler crawl
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+FEED_URLS="https://a.com/feed,https://b.com/feed" \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  crawl
 
 # From stdin
-cat urls.txt | CRAWL_TOKEN=secret stophammer-crawler crawl
+cat urls.txt | CRAWL_TOKEN=secret \
+  INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+  cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl
 ```
 
 ### import
@@ -41,7 +75,9 @@ cat urls.txt | CRAWL_TOKEN=secret stophammer-crawler crawl
 Batch-scan a PodcastIndex snapshot for music feeds:
 
 ```bash
-CRAWL_TOKEN=secret stophammer-crawler import \
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
   --db /path/to/podcastindex_feeds.db \
   --batch 100 --concurrency 5
 ```
@@ -66,7 +102,10 @@ stophammer deduplicates on content hash.
 Listen to the Podping WebSocket stream for music feed updates:
 
 ```bash
-CRAWL_TOKEN=secret stophammer-crawler podping --concurrency 3
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  podping --concurrency 3
 ```
 
 Filters: accepts `medium=music` or absent medium; drops `reason=newValueBlock`.
@@ -138,6 +177,26 @@ By default:
 - `audit_import` reads `./analysis/data/feed_audit.ndjson` and replays cached
   feeds into `/ingest/feed` using `./analysis/data/audit_import_state.db` as its
   resume cursor
+
+Examples:
+
+```bash
+# Create / refresh the cached NDJSON corpus
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
+  --db ./analysis/data/stophammer-feeds.db \
+  --output ./analysis/data/feed_audit.ndjson
+
+# Re-analyze the cached corpus
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- \
+  --input ./analysis/data/feed_audit.ndjson
+
+# Replay cached feeds into a running primary
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
+  --input ./analysis/data/feed_audit.ndjson \
+  --reset
+```
 
 ## Docker
 
