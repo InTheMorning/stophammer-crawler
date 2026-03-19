@@ -8,3 +8,4 @@ analysis/data/*.db-wal
 analysis/data/*.ndjson
 analysis/reports/*.json
 analysis/reports/*.md
+rebuilddb.sh
