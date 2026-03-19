@@ -171,7 +171,7 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
 | `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping) | Worker pool size |
 | `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
 | `PODCASTINDEX_DB_URL` | no | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Override the PodcastIndex snapshot archive URL for import mode |
-| `RESOLVER_DB_PATH` | no | — | If set, import mode runs `resolverctl --db <path> import-active` at start and `import-idle` on exit |
+| `RESOLVER_DB_PATH` | no | — | If set, import mode runs `resolverctl --db <path> import-active` at start, refreshes that heartbeat while the import is active, and runs `import-idle` on exit |
 | `RESOLVERCTL_BIN` | no | `resolverctl` | Override the resolver control binary used with `RESOLVER_DB_PATH` |
 | `PODPING_WS_URL` | no | `wss://api.livewire.io/ws/podping` | Podping WebSocket endpoint |
 | `HIVE_API_URL` | no | `https://api.hive.blog` | Hive JSON-RPC endpoint used to estimate replay start blocks |
@@ -204,10 +204,11 @@ Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
 fixed task list; podping mode runs an unbounded stream with a permit-based cap.
 
 When `RESOLVER_DB_PATH` is set, import mode also brackets the run with
-`resolverctl import-active` / `import-idle` so the primary-side phase 1
-resolver worker pauses while the bulk import is in progress. This is intended
-for single-host deployments where the importer and `stophammer` share access to
-the same primary database path.
+`resolverctl import-active` / `import-idle` and refreshes that import heartbeat
+while the bulk import is in progress. This is intended for single-host
+deployments where the importer and `stophammer` share access to the same
+primary database path. If the importer crashes, `resolverd` will eventually
+ignore the stale heartbeat and resume draining the queue.
 
 ## Analysis Tools
 

@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
@@ -18,6 +19,7 @@ const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const RESOLVERCTL_BIN_ENV: &str = "RESOLVERCTL_BIN";
 const RESOLVER_DB_PATH_ENV: &str = "RESOLVER_DB_PATH";
+const RESOLVER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 struct CandidateRow {
     id: i64,
@@ -28,6 +30,8 @@ struct CandidateRow {
 struct ResolverImportGuard {
     resolverctl_bin: String,
     resolver_db_path: String,
+    stop_heartbeat: mpsc::SyncSender<()>,
+    heartbeat_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ResolverImportGuard {
@@ -37,15 +41,36 @@ impl ResolverImportGuard {
             std::env::var(RESOLVERCTL_BIN_ENV).unwrap_or_else(|_| "resolverctl".to_string());
 
         set_import_active(&resolverctl_bin, &resolver_db_path, true);
+        let (stop_heartbeat, heartbeat_stop_rx) = mpsc::sync_channel(1);
+        let thread_bin = resolverctl_bin.clone();
+        let thread_db = resolver_db_path.clone();
+        let heartbeat_thread = std::thread::spawn(move || {
+            loop {
+                match heartbeat_stop_rx
+                    .recv_timeout(Duration::from_secs(RESOLVER_HEARTBEAT_INTERVAL_SECS))
+                {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        set_import_active(&thread_bin, &thread_db, true);
+                    }
+                }
+            }
+        });
         Some(Self {
             resolverctl_bin,
             resolver_db_path,
+            stop_heartbeat,
+            heartbeat_thread: Some(heartbeat_thread),
         })
     }
 }
 
 impl Drop for ResolverImportGuard {
     fn drop(&mut self) {
+        let _ = self.stop_heartbeat.send(());
+        if let Some(handle) = self.heartbeat_thread.take() {
+            let _ = handle.join();
+        }
         set_import_active(&self.resolverctl_bin, &self.resolver_db_path, false);
     }
 }
