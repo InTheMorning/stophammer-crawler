@@ -25,9 +25,21 @@ enum Mode {
 
     /// Import from a `PodcastIndex` snapshot database
     Import {
-        /// Path to `podcastindex_feeds.db`
-        #[arg(long)]
+        /// Path to the extracted `podcastindex_feeds.db`
+        #[arg(long, default_value = "./podcastindex_feeds.db")]
         db: String,
+
+        /// Download URL for the latest `PodcastIndex` snapshot archive
+        #[arg(
+            long,
+            env = "PODCASTINDEX_DB_URL",
+            default_value = "https://public.podcastindex.org/podcastindex_feeds.db.tgz"
+        )]
+        db_url: String,
+
+        /// Re-download the latest snapshot even if `--db` already exists
+        #[arg(long)]
+        refresh_db: bool,
 
         /// Path to import state database (resume cursor)
         #[arg(long, default_value = "./import_state.db")]
@@ -84,13 +96,25 @@ async fn main() {
         }
         Mode::Import {
             db,
+            db_url,
+            refresh_db,
             state,
             batch,
             concurrency,
             dry_run,
             reset,
         } => {
-            modes::import::run(db, state, batch, concurrency, dry_run, reset).await;
+            modes::import::run(
+                db,
+                db_url,
+                refresh_db,
+                state,
+                batch,
+                concurrency,
+                dry_run,
+                reset,
+            )
+            .await;
         }
         Mode::Podping {
             state,

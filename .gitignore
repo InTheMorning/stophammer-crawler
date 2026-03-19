@@ -1,5 +1,6 @@
 /target
 import_state.db
+podping_state.db
 podcastindex_feeds.db
 analysis/data/*.db
 analysis/data/*.db-shm

@@ -1,16 +1,20 @@
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use flate2::read::GzDecoder;
 use rusqlite::Connection;
+use tar::Archive;
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, crawl_feed};
 use crate::pool::run_pool;
 
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
+const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
 
 struct CandidateRow {
     id: i64,
@@ -104,6 +108,127 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
     .collect()
 }
 
+fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()> {
+    ensure_parent_dir(db_path)?;
+
+    let tmp_path = db_path.with_extension("download");
+    let backup_path = db_path.with_extension("backup");
+    let _ = fs::remove_file(&tmp_path);
+    let _ = fs::remove_file(&backup_path);
+    let mut wrote_db = false;
+
+    {
+        let decoder = GzDecoder::new(reader);
+        let mut archive = Archive::new(decoder);
+
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+
+            let entry_path = entry.path()?;
+            let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !Path::new(file_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+            {
+                continue;
+            }
+
+            let mut tmp_file = fs::File::create(&tmp_path)?;
+            io::copy(&mut entry, &mut tmp_file)?;
+            tmp_file.flush()?;
+            wrote_db = true;
+            break;
+        }
+    }
+
+    if !wrote_db {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot archive did not contain a .db file",
+        ));
+    }
+
+    if db_path.exists() {
+        fs::rename(db_path, &backup_path)?;
+        if let Err(err) = fs::rename(&tmp_path, db_path) {
+            let _ = fs::rename(&backup_path, db_path);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        fs::remove_file(&backup_path)?;
+    } else {
+        fs::rename(&tmp_path, db_path)?;
+    }
+    Ok(())
+}
+
+fn download_snapshot_archive(db_url: &str, db_path: &Path) -> io::Result<()> {
+    eprintln!(
+        "import: downloading latest PodcastIndex snapshot from {db_url} to {}",
+        db_path.display()
+    );
+
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(SNAPSHOT_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(io::Error::other)?
+        .get(db_url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(io::Error::other)?;
+
+    extract_snapshot_archive(response, db_path)?;
+    eprintln!(
+        "import: snapshot ready at {} (archive not retained)",
+        db_path.display()
+    );
+    Ok(())
+}
+
+async fn ensure_snapshot_db(db_path: &str, db_url: &str, refresh_db: bool) {
+    let db_path_buf = db_path.to_owned();
+    let db_url_buf = db_url.to_owned();
+    let should_download = refresh_db || !Path::new(db_path).is_file();
+
+    if !should_download {
+        eprintln!("import: using existing PodcastIndex snapshot at {db_path}");
+        return;
+    }
+
+    if refresh_db {
+        eprintln!("import: refreshing PodcastIndex snapshot at {db_path}");
+    }
+
+    tokio::task::spawn_blocking(move || {
+        download_snapshot_archive(&db_url_buf, Path::new(&db_path_buf))
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("import: snapshot download task failed: {e}");
+        std::process::exit(1);
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("import: failed to download PodcastIndex snapshot: {e}");
+        std::process::exit(1);
+    });
+}
+
 async fn crawl_feed_with_import_retries(
     client: &reqwest::Client,
     url: &str,
@@ -136,6 +261,8 @@ async fn crawl_feed_with_import_retries(
 )]
 pub async fn run(
     db_path: String,
+    db_url: String,
+    refresh_db: bool,
     state_path: String,
     batch_size: usize,
     concurrency: usize,
@@ -143,6 +270,8 @@ pub async fn run(
     reset: bool,
 ) {
     let progress = ProgressStore::open(&state_path);
+
+    ensure_snapshot_db(&db_path, &db_url, refresh_db).await;
 
     if reset {
         progress.reset();
@@ -258,4 +387,74 @@ pub async fn run(
     }
 
     eprintln!("import: complete — {total_processed} feeds processed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_snapshot_archive;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::fs;
+    use std::io::{self, Cursor};
+    use tar::{Builder, Header};
+
+    fn make_snapshot_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let gz = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = Builder::new(gz);
+
+        for (name, contents) in entries {
+            let mut header = Header::new_gnu();
+            header.set_path(name).expect("path");
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append(&header, Cursor::new(*contents)).expect("append");
+        }
+
+        tar.into_inner()
+            .expect("tar into inner")
+            .finish()
+            .expect("finish")
+    }
+
+    #[test]
+    fn extract_snapshot_archive_writes_db_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        let archive = make_snapshot_archive(&[
+            ("README.txt", b"ignore me"),
+            ("podcastindex_feeds.db", b"sqlite bytes"),
+        ]);
+
+        extract_snapshot_archive(Cursor::new(archive), &db_path).expect("extract archive");
+
+        assert_eq!(fs::read(&db_path).expect("read db"), b"sqlite bytes");
+        assert!(!db_path.with_extension("download").exists());
+    }
+
+    #[test]
+    fn extract_snapshot_archive_replaces_existing_db() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        fs::write(&db_path, b"old sqlite bytes").expect("seed old db");
+        let archive = make_snapshot_archive(&[("podcastindex_feeds.db", b"new sqlite bytes")]);
+
+        extract_snapshot_archive(Cursor::new(archive), &db_path).expect("replace archive");
+
+        assert_eq!(fs::read(&db_path).expect("read db"), b"new sqlite bytes");
+        assert!(!db_path.with_extension("download").exists());
+        assert!(!db_path.with_extension("backup").exists());
+    }
+
+    #[test]
+    fn extract_snapshot_archive_rejects_missing_db_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        let archive = make_snapshot_archive(&[("README.txt", b"ignore me")]);
+
+        let err = extract_snapshot_archive(Cursor::new(archive), &db_path).expect_err("missing db");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!db_path.exists());
+    }
 }

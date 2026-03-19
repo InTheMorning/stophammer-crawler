@@ -78,15 +78,23 @@ Batch-scan a PodcastIndex snapshot for music feeds:
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
-  --db /path/to/podcastindex_feeds.db \
   --batch 100 --concurrency 5
 ```
+
+If `--db` does not exist yet, the importer downloads the latest PodcastIndex
+snapshot archive from `https://public.podcastindex.org/podcastindex_feeds.db.tgz`,
+extracts the `.db` directly into place, and does not keep the `.tgz` on disk.
+Use `--refresh-db` to force a fresh download over an existing local snapshot.
+Downloads are streamed through gzip/tar extraction, so RAM usage stays low even
+for multi-gigabyte snapshots.
 
 #### Import options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--db <path>` | — (required) | Path to the PodcastIndex snapshot |
+| `--db <path>` | `./podcastindex_feeds.db` | Path to the extracted PodcastIndex snapshot |
+| `--db-url <url>` | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Snapshot archive URL |
+| `--refresh-db` | off | Re-download and replace the local snapshot before importing |
 | `--state <path>` | `./import_state.db` | Progress cursor database (created automatically) |
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch + ingest workers |
@@ -96,6 +104,11 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
 Progress is stored in `--state`. If the process is interrupted, the next run resumes
 from the last completed batch. A crash mid-batch re-processes that batch — safe because
 stophammer deduplicates on content hash.
+
+Operational note:
+- initial auto-download only needs space for the extracted `.db`
+- `--refresh-db` temporarily needs room for both the existing `.db` and the new
+  replacement `.db` while the importer swaps them safely
 
 ### podping
 
@@ -115,15 +128,20 @@ Includes in-memory dedup with cooldown to avoid re-crawling the same URL within
 
 Replay support:
 
-- `--block <n>` starts from an explicit Hive block number
-- `--old <hours>` computes a start block from the current Hive head block minus
-  one block per 3 seconds
-- `--time <rfc3339>` computes a start block from a timestamp using the same estimate
+- `--block <n>` starts catch-up from an explicit Hive block number
+- `--old <hours>` computes a Hive catch-up start block from the current head
+- `--time <rfc3339>` computes a Hive catch-up start block from a timestamp
 - `--state <path>` stores the latest seen Podping block cursor
 
 If no replay flag is provided and there is no stored cursor yet, Podping starts
 from the beginning of the previous Sunday in UTC, converted to an estimated
 block using the current Hive head block.
+
+Important:
+- historical catch-up is done against the Hive APIs, following the upstream
+  `podping-hivewatcher` model
+- the Livewire websocket is used only for live tailing after catch-up
+- the crawler no longer assumes undocumented websocket replay query parameters
 
 Example:
 
@@ -152,6 +170,7 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
 | `INGEST_URL` | no | `http://localhost:8008/ingest/feed` | Stophammer ingest endpoint |
 | `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping) | Worker pool size |
 | `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
+| `PODCASTINDEX_DB_URL` | no | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Override the PodcastIndex snapshot archive URL for import mode |
 | `PODPING_WS_URL` | no | `wss://api.livewire.io/ws/podping` | Podping WebSocket endpoint |
 | `HIVE_API_URL` | no | `https://api.hive.blog` | Hive JSON-RPC endpoint used to estimate replay start blocks |
 
