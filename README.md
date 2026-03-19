@@ -113,6 +113,37 @@ Includes in-memory dedup with cooldown to avoid re-crawling the same URL within
 5 minutes (30 minutes for spammy feeds). Reconnects with exponential backoff
 (1s to 60s) on disconnect.
 
+Replay support:
+
+- `--block <n>` starts from an explicit Hive block number
+- `--old <hours>` computes a start block from the current Hive head block minus
+  one block per 3 seconds
+- `--time <rfc3339>` computes a start block from a timestamp using the same estimate
+- `--state <path>` stores the latest seen Podping block cursor
+
+If no replay flag is provided and there is no stored cursor yet, Podping starts
+from the beginning of the previous Sunday in UTC, converted to an estimated
+block using the current Hive head block.
+
+Example:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  podping --old 24 --state ./podping_state.db
+```
+
+#### Podping options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--state <path>` | `./podping_state.db` | Persistent latest-seen block cursor database |
+| `--block <n>` | off | Start replay from an explicit Hive block |
+| `--old <hours>` | off | Start replay from N hours ago |
+| `--time <rfc3339>` | off | Start replay from a timestamp |
+| `--concurrency <n>` | `3` | Parallel fetch + ingest workers |
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
@@ -122,6 +153,7 @@ Includes in-memory dedup with cooldown to avoid re-crawling the same URL within
 | `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping) | Worker pool size |
 | `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
 | `PODPING_WS_URL` | no | `wss://api.livewire.io/ws/podping` | Podping WebSocket endpoint |
+| `HIVE_API_URL` | no | `https://api.hive.blog` | Hive JSON-RPC endpoint used to estimate replay start blocks |
 
 ## Architecture
 

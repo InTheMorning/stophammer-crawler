@@ -1,3 +1,9 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    reason = "offline replay tool keeps resume and batch logic in one executable flow"
+)]
+
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -24,7 +30,7 @@ use pool::run_pool;
     about = "Import cached feed_audit.ndjson rows into stophammer without refetching feeds"
 )]
 struct Cli {
-    /// Path to feed_audit NDJSON.
+    /// Path to `feed_audit` NDJSON.
     #[arg(long, default_value = "./analysis/data/feed_audit.ndjson")]
     input: String,
 
@@ -92,15 +98,15 @@ struct ProgressStore {
 
 impl ProgressStore {
     fn open(path: &str) -> Self {
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to create audit import state directory {}: {e}",
-                        parent.display()
-                    )
-                });
-            }
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                panic!(
+                    "failed to create audit import state directory {}: {e}",
+                    parent.display()
+                )
+            });
         }
 
         let conn = Connection::open(path).expect("failed to open audit import state DB");
@@ -284,11 +290,7 @@ async fn main() {
                     move || async move {
                         let Some(raw_xml) = row.raw_xml.as_deref() else {
                             skipped.fetch_add(1, Ordering::Relaxed);
-                            let reason = row
-                                .fetch
-                                .error
-                                .as_deref()
-                                .unwrap_or("missing raw_xml");
+                            let reason = row.fetch.error.as_deref().unwrap_or("missing raw_xml");
                             eprintln!(
                                 "  skipped: row={} guid={} {} ({reason})",
                                 row.row_num, row.source_db.feed_guid, row.source_db.feed_url
@@ -297,11 +299,7 @@ async fn main() {
                         };
 
                         let source_url = row.source_db.feed_url.as_str();
-                        let canonical_url = row
-                            .fetch
-                            .final_url
-                            .as_deref()
-                            .unwrap_or(source_url);
+                        let canonical_url = row.fetch.final_url.as_deref().unwrap_or(source_url);
                         let http_status = row.fetch.http_status.unwrap_or(200);
                         let fallback_guid = Some(row.source_db.feed_guid.as_str());
                         let outcome = ingest_cached_feed(

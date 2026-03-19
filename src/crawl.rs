@@ -77,7 +77,10 @@ struct IngestResponse {
     warnings: Option<Vec<String>>,
 }
 
-fn parse_feed_xml(xml: &str, fallback_guid: Option<&str>) -> Result<Option<IngestFeedData>, String> {
+fn parse_feed_xml(
+    xml: &str,
+    fallback_guid: Option<&str>,
+) -> Result<Option<IngestFeedData>, String> {
     let parser = match fallback_guid {
         Some(guid) => profile::stophammer_with_fallback(guid.to_string()),
         None => profile::stophammer(),
@@ -151,6 +154,10 @@ async fn post_ingest_payload(
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "replay/import paths pass through source URL, canonical URL, status, raw XML, optional hash, fallback GUID, and config"
+)]
 pub async fn ingest_cached_feed(
     client: &reqwest::Client,
     source_url: &str,
@@ -161,9 +168,10 @@ pub async fn ingest_cached_feed(
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
 ) -> CrawlOutcome {
-    let content_hash = content_hash
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| hex::encode(Sha256::digest(raw_xml.as_bytes())));
+    let content_hash = content_hash.map_or_else(
+        || hex::encode(Sha256::digest(raw_xml.as_bytes())),
+        ToOwned::to_owned,
+    );
 
     let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
         Ok(data) => data,
@@ -212,5 +220,15 @@ pub async fn crawl_feed(
     let hash = hex::encode(Sha256::digest(&body));
     let xml = String::from_utf8_lossy(&body);
 
-    ingest_cached_feed(client, url, url, status, &xml, Some(&hash), fallback_guid, config).await
+    ingest_cached_feed(
+        client,
+        url,
+        url,
+        status,
+        &xml,
+        Some(&hash),
+        fallback_guid,
+        config,
+    )
+    .await
 }

@@ -52,6 +52,22 @@ enum Mode {
 
     /// Listen to Podping WebSocket stream for music feeds
     Podping {
+        /// Path to Podping state database (latest seen block cursor)
+        #[arg(long, default_value = "./podping_state.db")]
+        state: String,
+
+        /// Replay starting from an explicit Hive block number
+        #[arg(long, conflicts_with_all = ["old", "time"])]
+        block: Option<u64>,
+
+        /// Replay starting from N hours ago (estimated at one block per 3 seconds)
+        #[arg(long, conflicts_with_all = ["block", "time"])]
+        old: Option<u64>,
+
+        /// Replay starting from an RFC 3339 timestamp (estimated at one block per 3 seconds)
+        #[arg(long, conflicts_with_all = ["block", "old"])]
+        time: Option<String>,
+
         /// Parallel fetch+ingest workers
         #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
         concurrency: usize,
@@ -76,8 +92,14 @@ async fn main() {
         } => {
             modes::import::run(db, state, batch, concurrency, dry_run, reset).await;
         }
-        Mode::Podping { concurrency } => {
-            modes::podping::run(concurrency).await;
+        Mode::Podping {
+            state,
+            block,
+            old,
+            time,
+            concurrency,
+        } => {
+            modes::podping::run(state, block, old, time, concurrency).await;
         }
     }
 }

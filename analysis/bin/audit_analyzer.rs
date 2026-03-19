@@ -1,3 +1,11 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::struct_field_names,
+    clippy::needless_pass_by_value,
+    clippy::single_match_else,
+    reason = "analysis binary favors report-shaped structs and long single-file transforms"
+)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::File;
@@ -28,15 +36,24 @@ struct Cli {
     output_md: String,
 
     /// Output JSON report.
-    #[arg(long, default_value = "./analysis/reports/audit_musicbrainz_report.json")]
+    #[arg(
+        long,
+        default_value = "./analysis/reports/audit_musicbrainz_report.json"
+    )]
     output_json: String,
 
     /// Output JSON artifact containing candidate feed -> release clusters.
-    #[arg(long, default_value = "./analysis/reports/audit_release_candidates.json")]
+    #[arg(
+        long,
+        default_value = "./analysis/reports/audit_release_candidates.json"
+    )]
     output_release_json: String,
 
     /// Output JSON artifact containing candidate item -> recording clusters.
-    #[arg(long, default_value = "./analysis/reports/audit_recording_candidates.json")]
+    #[arg(
+        long,
+        default_value = "./analysis/reports/audit_recording_candidates.json"
+    )]
     output_recording_json: String,
 
     /// Optional row cap for faster iteration.
@@ -339,7 +356,7 @@ fn find_channel<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
 
 fn extract_persons(channel: Node<'_, '_>, analyzer: &mut Analyzer) {
     let mut saw_feed_person = false;
-    for child in channel.children().filter(|node| node.is_element()) {
+    for child in channel.children().filter(Node::is_element) {
         if child.tag_name().name() == "person" && namespace_is_podcast(child.tag_name().namespace())
         {
             analyzer.total_feed_level_person_tags += 1;
@@ -365,7 +382,7 @@ fn extract_persons(channel: Node<'_, '_>, analyzer: &mut Analyzer) {
                 && namespace_is_podcast(child.tag_name().namespace()))
         {
             let mut item_had_person = false;
-            for grandchild in child.children().filter(|node| node.is_element()) {
+            for grandchild in child.children().filter(Node::is_element) {
                 if grandchild.tag_name().name() == "person"
                     && namespace_is_podcast(grandchild.tag_name().namespace())
                 {
@@ -1057,10 +1074,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cli.output_release_json,
         &cli.output_recording_json,
     ] {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
     }
     let parser = profile::stophammer();

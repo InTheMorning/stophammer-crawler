@@ -25,15 +25,15 @@ struct ProgressStore {
 
 impl ProgressStore {
     fn open(path: &str) -> Self {
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to create import state directory {}: {e}",
-                        parent.display()
-                    )
-                });
-            }
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).unwrap_or_else(|e| {
+                panic!(
+                    "failed to create import state directory {}: {e}",
+                    parent.display()
+                )
+            });
         }
 
         let conn = Connection::open(path).expect("failed to open import state DB");
@@ -119,8 +119,7 @@ async fn crawl_feed_with_import_retries(
             CrawlOutcome::FetchError(err) if attempt < IMPORT_FETCH_ATTEMPTS => {
                 let backoff = Duration::from_secs(1_u64 << (attempt - 1));
                 eprintln!(
-                    "  import: retrying fetch after attempt {attempt}/{} for id={row_id} {}: {err}",
-                    IMPORT_FETCH_ATTEMPTS, url
+                    "  import: retrying fetch after attempt {attempt}/{IMPORT_FETCH_ATTEMPTS} for id={row_id} {url}: {err}"
                 );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
@@ -130,7 +129,11 @@ async fn crawl_feed_with_import_retries(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "import mode keeps batch resume, fetch, and ingest orchestration in one async entrypoint"
+)]
 pub async fn run(
     db_path: String,
     state_path: String,
@@ -148,8 +151,7 @@ pub async fn run(
 
     let mut cursor = progress.get_last_id();
     eprintln!(
-        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={}s",
-        IMPORT_FETCH_TIMEOUT_SECS
+        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s"
     );
 
     let pi_db = Connection::open_with_flags(

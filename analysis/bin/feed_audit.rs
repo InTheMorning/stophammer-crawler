@@ -1,3 +1,8 @@
+#![allow(
+    clippy::too_many_lines,
+    reason = "audit binary keeps its full offline fetch/report flow in one file"
+)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -17,7 +22,7 @@ use stophammer_parser::profile;
     about = "Fetch and dump full RSS feeds from a stophammer DB"
 )]
 struct Cli {
-    /// Path to a populated stophammer SQLite DB.
+    /// Path to a populated stophammer `SQLite` DB.
     #[arg(long, default_value = "./analysis/data/stophammer-feeds.db")]
     db: String,
 
@@ -108,7 +113,10 @@ fn query_feeds(conn: &Connection, limit: Option<usize>) -> rusqlite::Result<Vec<
 
     let mut stmt = conn.prepare(sql)?;
     let rows = match limit {
-        Some(limit) => stmt.query_map([limit as i64], map_feed_row)?,
+        Some(limit) => {
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            stmt.query_map([limit_i64], map_feed_row)?
+        }
         None => stmt.query_map([], map_feed_row)?,
     };
 
@@ -127,10 +135,13 @@ fn map_feed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedRow> {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 fn format_error_chain(err: &dyn std::error::Error) -> String {
@@ -165,7 +176,7 @@ fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
 fn host_key(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+        .and_then(|parsed| parsed.host_str().map(ToString::to_string))
 }
 
 async fn wait_for_host(host_state: &HostState) -> u64 {
@@ -210,10 +221,10 @@ fn mark_failure(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    if let Some(parent) = std::path::Path::new(&cli.output).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = std::path::Path::new(&cli.output).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let conn = Connection::open_with_flags(
