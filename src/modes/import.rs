@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -15,11 +16,38 @@ use crate::pool::run_pool;
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const RESOLVERCTL_BIN_ENV: &str = "RESOLVERCTL_BIN";
+const RESOLVER_DB_PATH_ENV: &str = "RESOLVER_DB_PATH";
 
 struct CandidateRow {
     id: i64,
     url: String,
     podcast_guid: Option<String>,
+}
+
+struct ResolverImportGuard {
+    resolverctl_bin: String,
+    resolver_db_path: String,
+}
+
+impl ResolverImportGuard {
+    fn maybe_activate() -> Option<Self> {
+        let resolver_db_path = std::env::var(RESOLVER_DB_PATH_ENV).ok()?;
+        let resolverctl_bin =
+            std::env::var(RESOLVERCTL_BIN_ENV).unwrap_or_else(|_| "resolverctl".to_string());
+
+        set_import_active(&resolverctl_bin, &resolver_db_path, true);
+        Some(Self {
+            resolverctl_bin,
+            resolver_db_path,
+        })
+    }
+}
+
+impl Drop for ResolverImportGuard {
+    fn drop(&mut self) {
+        set_import_active(&self.resolverctl_bin, &self.resolver_db_path, false);
+    }
 }
 
 /// Resume cursor stored in a separate state DB.
@@ -115,6 +143,39 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn set_import_active(resolverctl_bin: &str, resolver_db_path: &str, active: bool) {
+    let command = if active {
+        "import-active"
+    } else {
+        "import-idle"
+    };
+
+    match Command::new(resolverctl_bin)
+        .args(["--db", resolver_db_path, command])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!(
+                "import: resolver queue {} via {} --db {} {}",
+                if active { "paused" } else { "resumed" },
+                resolverctl_bin,
+                resolver_db_path,
+                command,
+            );
+        }
+        Ok(status) => {
+            eprintln!(
+                "import: WARNING: resolverctl returned {status} while running `{resolverctl_bin} --db {resolver_db_path} {command}`"
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "import: WARNING: failed to run `{resolverctl_bin} --db {resolver_db_path} {command}`: {err}"
+            );
+        }
+    }
 }
 
 fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()> {
@@ -306,6 +367,12 @@ pub async fn run(
         config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
         config
     });
+
+    let _resolver_guard = if dry_run {
+        None
+    } else {
+        ResolverImportGuard::maybe_activate()
+    };
 
     let client = Arc::new(reqwest::Client::new());
     let mut total_processed: u64 = 0;
