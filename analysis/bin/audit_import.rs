@@ -24,6 +24,8 @@ mod pool;
 use crawl::{CrawlConfig, CrawlOutcome, ingest_cached_feed};
 use pool::run_pool;
 
+const AUDIT_INGEST_ATTEMPTS: u32 = 3;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "audit_import",
@@ -198,6 +200,52 @@ fn query_batch(path: &str, start_row: usize, batch_size: usize) -> Vec<AuditCand
     batch
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "audit import retry wrapper threads through cached row details plus retry context"
+)]
+async fn ingest_cached_feed_with_retries(
+    client: &reqwest::Client,
+    source_url: &str,
+    canonical_url: &str,
+    http_status: u16,
+    raw_xml: &str,
+    content_hash: Option<&str>,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    row_num: usize,
+) -> CrawlOutcome {
+    let mut attempt = 1;
+
+    loop {
+        let outcome = ingest_cached_feed(
+            client,
+            source_url,
+            canonical_url,
+            http_status,
+            raw_xml,
+            content_hash,
+            fallback_guid,
+            config,
+        )
+        .await;
+
+        if outcome.is_retryable() && attempt < AUDIT_INGEST_ATTEMPTS {
+            let backoff = outcome
+                .retry_delay(attempt)
+                .unwrap_or_else(|| std::time::Duration::from_secs(1_u64 << (attempt - 1)));
+            eprintln!(
+                "  audit_import: retrying ingest after attempt {attempt}/{AUDIT_INGEST_ATTEMPTS} for row={row_num} {source_url}: {outcome}"
+            );
+            tokio::time::sleep(backoff).await;
+            attempt += 1;
+            continue;
+        }
+
+        return outcome;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -302,7 +350,7 @@ async fn main() {
                         let canonical_url = row.fetch.final_url.as_deref().unwrap_or(source_url);
                         let http_status = row.fetch.http_status.unwrap_or(200);
                         let fallback_guid = Some(row.source_db.feed_guid.as_str());
-                        let outcome = ingest_cached_feed(
+                        let outcome = ingest_cached_feed_with_retries(
                             &client,
                             source_url,
                             canonical_url,
@@ -311,6 +359,7 @@ async fn main() {
                             row.fetch.content_sha256.as_deref(),
                             fallback_guid,
                             &config,
+                            row.row_num,
                         )
                         .await;
 
@@ -327,7 +376,7 @@ async fn main() {
                             CrawlOutcome::ParseError(_) => {
                                 parse_errors.fetch_add(1, Ordering::Relaxed);
                             }
-                            CrawlOutcome::IngestError(_) | CrawlOutcome::FetchError(_) => {
+                            CrawlOutcome::IngestError { .. } | CrawlOutcome::FetchError { .. } => {
                                 ingest_errors.fetch_add(1, Ordering::Relaxed);
                             }
                         }

@@ -20,7 +20,18 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- --
 # 2. Capture a feed corpus into NDJSON
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
   --db ./stophammer-crawler/analysis/data/stophammer-feeds.db \
-  --output ./stophammer-crawler/analysis/data/feed_audit.ndjson
+  --output ./stophammer-crawler/analysis/data/feed_audit.ndjson \
+  --failed-feeds-output ./stophammer-crawler/analysis/data/failed_feeds.txt
+
+# 2b. Append only the missing feeds back into the same NDJSON corpus
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
+  --urls-file ./stophammer-crawler/analysis/data/failed_feeds.txt \
+  --output ./stophammer-crawler/analysis/data/feed_audit.ndjson \
+  --append \
+  --failed-feeds-output ./stophammer-crawler/analysis/data/failed_feeds.txt \
+  --success-delay-ms 2000 \
+  --failure-backoff-secs 30 \
+  --max-backoff-secs 600
 
 # 3. Re-analyze the captured corpus
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- \
@@ -33,3 +44,12 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
   --input ./stophammer-crawler/analysis/data/feed_audit.ndjson \
   --reset
 ```
+
+`feed_audit` now keeps only successful `200 OK` captures in the NDJSON corpus.
+Retryable and failed feed URLs are written separately to
+`analysis/data/failed_feeds.txt` so they can be requeued later.
+`audit_import` retries transient ingest throttles such as `429 Too Many Requests`
+before treating a row as an ingest error.
+
+For live URL lists, `stophammer-crawler crawl` now spaces requests per host and
+retries transient throttles before writing retryable URLs to `failed_feeds.txt`.

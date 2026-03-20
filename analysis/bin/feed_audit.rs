@@ -3,9 +3,10 @@
     reason = "audit binary keeps its full offline fetch/report flow in one file"
 )]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader};
 use std::io::{BufWriter, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,11 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use stophammer_parser::profile;
+
+#[path = "../../src/url_queue.rs"]
+mod url_queue;
+
+use url_queue::{host_key, interleave_by_host};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,9 +32,21 @@ struct Cli {
     #[arg(long, default_value = "./analysis/data/stophammer-feeds.db")]
     db: String,
 
+    /// Optional plain-text URL file to fetch instead of loading feeds from `--db`.
+    #[arg(long)]
+    urls_file: Option<String>,
+
     /// Output NDJSON file containing one record per fetched feed.
     #[arg(long, default_value = "./analysis/data/feed_audit.ndjson")]
     output: String,
+
+    /// Append successful rows to `--output` instead of truncating it first.
+    #[arg(long)]
+    append: bool,
+
+    /// Plain-text output file containing retryable / failed feed URLs.
+    #[arg(long, default_value = "./analysis/data/failed_feeds.txt")]
+    failed_feeds_output: String,
 
     /// Maximum number of feeds to fetch.
     #[arg(long)]
@@ -123,6 +141,38 @@ fn query_feeds(conn: &Connection, limit: Option<usize>) -> rusqlite::Result<Vec<
     rows.collect()
 }
 
+fn load_feeds_from_urls(path: &str, limit: Option<usize>) -> std::io::Result<Vec<FeedRow>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut feeds = Vec::new();
+    let now = unix_now();
+
+    for line in reader.lines() {
+        let line = line?;
+        let feed_url = line.trim();
+        if feed_url.is_empty() || feed_url.starts_with('#') {
+            continue;
+        }
+
+        feeds.push(FeedRow {
+            feed_guid: feed_url.to_string(),
+            feed_url: feed_url.to_string(),
+            title: feed_url.to_string(),
+            newest_item_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        if let Some(limit) = limit
+            && feeds.len() >= limit
+        {
+            break;
+        }
+    }
+
+    Ok(feeds)
+}
+
 fn map_feed_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeedRow> {
     Ok(FeedRow {
         feed_guid: row.get(0)?,
@@ -173,10 +223,36 @@ fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-fn host_key(url: &str) -> Option<String> {
-    reqwest::Url::parse(url)
+fn is_retryable_status(status: u16) -> bool {
+    status == 408 || status == 425 || status == 429 || (500..=599).contains(&status)
+}
+
+fn should_keep_in_audit(fetch_error: Option<&String>, http_status: Option<u16>) -> bool {
+    fetch_error.is_none() && http_status == Some(200)
+}
+
+fn write_failed_feeds(path: &str, urls: &BTreeSet<String>) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let output = File::create(path)?;
+    let mut writer = BufWriter::new(output);
+    for url in urls {
+        writer.write_all(url.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
+}
+
+fn format_http_fetch_error(status: u16) -> String {
+    let reason = reqwest::StatusCode::from_u16(status)
         .ok()
-        .and_then(|parsed| parsed.host_str().map(ToString::to_string))
+        .and_then(|code| code.canonical_reason().map(str::to_string))
+        .unwrap_or_else(|| "Unknown Status".to_string());
+    format!("http {status} {reason}")
 }
 
 async fn wait_for_host(host_state: &HostState) -> u64 {
@@ -227,19 +303,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(parent)?;
     }
 
-    let conn = Connection::open_with_flags(
-        &cli.db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let feeds = query_feeds(&conn, cli.limit)?;
+    let feeds = if let Some(urls_file) = &cli.urls_file {
+        interleave_by_host(load_feeds_from_urls(urls_file, cli.limit)?, |feed| {
+            host_key(&feed.feed_url)
+        })
+    } else {
+        let conn = Connection::open_with_flags(
+            &cli.db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        interleave_by_host(query_feeds(&conn, cli.limit)?, |feed| {
+            host_key(&feed.feed_url)
+        })
+    };
 
     let client = reqwest::Client::builder()
         .user_agent("stophammer-feed-audit/0.1")
         .build()?;
 
     let mut host_states: HashMap<String, HostState> = HashMap::new();
-    let output = File::create(&cli.output)?;
+    let output = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(cli.append)
+        .truncate(!cli.append)
+        .open(&cli.output)?;
     let mut writer = BufWriter::new(output);
+    let mut failed_feeds = BTreeSet::new();
+    let mut kept_rows = 0usize;
 
     let success_delay = Duration::from_millis(cli.success_delay_ms);
     let initial_backoff = Duration::from_secs(cli.failure_backoff_secs);
@@ -247,10 +338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(cli.timeout_secs);
 
     eprintln!(
-        "feed_audit: db={} feeds={} output={} timeout={}s success_delay={}ms failure_backoff={}s",
-        cli.db,
+        "feed_audit: source={} feeds={} output={} append={} timeout={}s success_delay={}ms failure_backoff={}s",
+        cli.urls_file.as_deref().unwrap_or(&cli.db),
         feeds.len(),
         cli.output,
+        cli.append,
         cli.timeout_secs,
         cli.success_delay_ms,
         cli.failure_backoff_secs,
@@ -296,15 +388,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         content_bytes = Some(body.len());
                         content_sha256 = Some(hex::encode(Sha256::digest(&body)));
                         let xml = String::from_utf8_lossy(&body).to_string();
-                        let parser = profile::stophammer_with_fallback(feed.feed_guid.clone());
+                        if http_status == Some(200) {
+                            let parser = profile::stophammer_with_fallback(feed.feed_guid.clone());
 
-                        match parser.parse(&xml) {
-                            Ok(parsed) => {
-                                parsed_feed = Some(parsed);
+                            match parser.parse(&xml) {
+                                Ok(parsed) => {
+                                    parsed_feed = Some(parsed);
+                                }
+                                Err(err) => {
+                                    parse_error = Some(err.to_string());
+                                }
                             }
-                            Err(err) => {
-                                parse_error = Some(err.to_string());
-                            }
+                        } else if let Some(status) = http_status {
+                            fetch_error = Some(format_http_fetch_error(status));
                         }
 
                         raw_xml = Some(xml);
@@ -321,15 +417,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(host) = &host {
             let state = host_states.entry(host.clone()).or_default();
-            if fetch_error.is_none() {
+            if should_keep_in_audit(fetch_error.as_ref(), http_status) {
                 mark_success(state, success_delay);
             } else {
                 mark_failure(state, initial_backoff, max_backoff, retry_after_secs);
             }
         }
 
-        let record = AuditRecord {
-            source_db: DbFeedRecord {
+        let should_retry = fetch_error.is_some() || http_status.is_some_and(is_retryable_status);
+        if should_retry {
+            failed_feeds.insert(feed.feed_url.clone());
+        }
+
+        let source_db = parsed_feed.as_ref().map_or_else(
+            || DbFeedRecord {
                 feed_guid: feed.feed_guid.clone(),
                 feed_url: feed.feed_url.clone(),
                 title: feed.title.clone(),
@@ -337,6 +438,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 created_at: feed.created_at,
                 updated_at: feed.updated_at,
             },
+            |parsed| DbFeedRecord {
+                feed_guid: parsed.feed_guid.clone(),
+                feed_url: feed.feed_url.clone(),
+                title: parsed.title.clone(),
+                newest_item_at: feed.newest_item_at,
+                created_at: feed.created_at,
+                updated_at: feed.updated_at,
+            },
+        );
+
+        let record = AuditRecord {
+            source_db,
             fetched_at: unix_now(),
             host,
             throttle_wait_ms,
@@ -353,10 +466,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             parse_error,
         };
 
-        serde_json::to_writer(&mut writer, &record)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+        if should_keep_in_audit(record.fetch.error.as_ref(), record.fetch.http_status) {
+            serde_json::to_writer(&mut writer, &record)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            kept_rows += 1;
+        }
     }
 
+    write_failed_feeds(&cli.failed_feeds_output, &failed_feeds)?;
+    eprintln!(
+        "feed_audit: kept={} failed_urls={} output={} append={} failed_output={}",
+        kept_rows,
+        failed_feeds.len(),
+        cli.output,
+        cli.append,
+        cli.failed_feeds_output,
+    );
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retryable_status, should_keep_in_audit};
+
+    #[test]
+    fn keeps_only_successful_fetches_in_clean_audit_output() {
+        assert!(should_keep_in_audit(None, Some(200)));
+        assert!(!should_keep_in_audit(
+            Some(&"timeout".to_string()),
+            Some(200)
+        ));
+        assert!(!should_keep_in_audit(None, Some(429)));
+    }
+
+    #[test]
+    fn retries_429_and_5xx_statuses() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(404));
+    }
 }

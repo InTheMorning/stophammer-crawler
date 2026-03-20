@@ -2,6 +2,7 @@ mod crawl;
 mod dedup;
 mod modes;
 mod pool;
+mod url_queue;
 
 use clap::{Parser, Subcommand};
 
@@ -21,6 +22,18 @@ enum Mode {
 
         #[arg(long, env = "CONCURRENCY", default_value_t = 5)]
         concurrency: usize,
+
+        /// Minimum spacing between fetches to the same host
+        #[arg(long, env = "HOST_DELAY_MS", default_value_t = 1500)]
+        host_delay_ms: u64,
+
+        /// Plain-text output file for retryable feed URLs
+        #[arg(
+            long,
+            env = "FAILED_FEEDS_OUTPUT",
+            default_value = "./failed_feeds.txt"
+        )]
+        failed_feeds_output: String,
     },
 
     /// Import from a `PodcastIndex` snapshot database
@@ -52,6 +65,14 @@ enum Mode {
         /// Parallel fetch+ingest workers
         #[arg(long, env = "CONCURRENCY", default_value_t = 5)]
         concurrency: usize,
+
+        /// Plain-text output file for retryable feed URLs
+        #[arg(
+            long,
+            env = "FAILED_FEEDS_OUTPUT",
+            default_value = "./failed_feeds.txt"
+        )]
+        failed_feeds_output: String,
 
         /// Log candidates without fetching
         #[arg(long)]
@@ -91,8 +112,13 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.mode {
-        Mode::Crawl { urls, concurrency } => {
-            modes::crawl::run(urls, concurrency).await;
+        Mode::Crawl {
+            urls,
+            concurrency,
+            host_delay_ms,
+            failed_feeds_output,
+        } => {
+            modes::crawl::run(urls, concurrency, host_delay_ms, failed_feeds_output).await;
         }
         Mode::Import {
             db,
@@ -101,6 +127,7 @@ async fn main() {
             state,
             batch,
             concurrency,
+            failed_feeds_output,
             dry_run,
             reset,
         } => {
@@ -111,6 +138,7 @@ async fn main() {
                 state,
                 batch,
                 concurrency,
+                failed_feeds_output,
                 dry_run,
                 reset,
             )

@@ -231,12 +231,23 @@ Available binaries:
 By default:
 
 - `feed_audit` reads `./analysis/data/stophammer-feeds.db` and writes
-  `./analysis/data/feed_audit.ndjson`
+  successful `200 OK` XML captures to `./analysis/data/feed_audit.ndjson`
+- `feed_audit` writes retryable / failed feed URLs to
+  `./analysis/data/failed_feeds.txt`
+- `feed_audit` can also fetch a plain-text URL list via `--urls-file` and
+  append successful captures back into an existing NDJSON corpus with `--append`
 - `audit_analyzer` reads `./analysis/data/feed_audit.ndjson` and writes reports
   under `./analysis/reports/`
 - `audit_import` reads `./analysis/data/feed_audit.ndjson` and replays cached
   feeds into `/ingest/feed` using `./analysis/data/audit_import_state.db` as its
   resume cursor
+- `audit_import` retries transient ingest throttles / failures such as `429`
+  before counting the row as an ingest error
+- `crawl` / `import` write retryable feed URLs to `./failed_feeds.txt` unless
+  you override `--failed-feeds-output`
+- `crawl` also spaces requests per host (`--host-delay-ms`, default `1500`) and
+  retries transient fetch / ingest throttles before writing a URL to the failed
+  feed dump
 
 Examples:
 
@@ -244,7 +255,18 @@ Examples:
 # Create / refresh the cached NDJSON corpus
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
   --db ./analysis/data/stophammer-feeds.db \
-  --output ./analysis/data/feed_audit.ndjson
+  --output ./analysis/data/feed_audit.ndjson \
+  --failed-feeds-output ./analysis/data/failed_feeds.txt
+
+# Refill only missing feeds from failed_feeds.txt back into the same corpus
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
+  --urls-file ./analysis/data/failed_feeds.txt \
+  --output ./analysis/data/feed_audit.ndjson \
+  --append \
+  --failed-feeds-output ./analysis/data/failed_feeds.txt \
+  --success-delay-ms 2000 \
+  --failure-backoff-secs 30 \
+  --max-backoff-secs 600
 
 # Re-analyze the cached corpus
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- \
@@ -256,6 +278,15 @@ INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
   --input ./analysis/data/feed_audit.ndjson \
   --reset
+
+# Live crawl with per-host spacing and retry dumps
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl \
+  --concurrency 5 \
+  --host-delay-ms 1500 \
+  --failed-feeds-output ./failed_feeds.txt \
+  ./feeds.txt
 ```
 
 ## Docker

@@ -2,9 +2,9 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
@@ -13,6 +13,7 @@ use tar::Archive;
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, crawl_feed};
 use crate::pool::run_pool;
+use crate::url_queue::{host_key, interleave_by_host};
 
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
@@ -149,16 +150,19 @@ fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<Candida
         )
         .expect("failed to prepare query");
 
-    stmt.query_map(rusqlite::params![start_id, batch_size], |row| {
-        Ok(CandidateRow {
-            id: row.get(0)?,
-            url: row.get(1)?,
-            podcast_guid: row.get(2)?,
+    let rows: Vec<CandidateRow> = stmt
+        .query_map(rusqlite::params![start_id, batch_size], |row| {
+            Ok(CandidateRow {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                podcast_guid: row.get(2)?,
+            })
         })
-    })
-    .expect("query failed")
-    .filter_map(Result::ok)
-    .collect()
+        .expect("query failed")
+        .filter_map(Result::ok)
+        .collect();
+
+    interleave_by_host(rows, |row| host_key(&row.url))
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
@@ -327,16 +331,44 @@ async fn crawl_feed_with_import_retries(
     loop {
         let outcome = crawl_feed(client, url, fallback_guid, config).await;
         match &outcome {
-            CrawlOutcome::FetchError(err) if attempt < IMPORT_FETCH_ATTEMPTS => {
-                let backoff = Duration::from_secs(1_u64 << (attempt - 1));
+            outcome if outcome.is_retryable() && attempt < IMPORT_FETCH_ATTEMPTS => {
+                let backoff = outcome
+                    .retry_delay(attempt)
+                    .unwrap_or_else(|| Duration::from_secs(1_u64 << (attempt - 1)));
                 eprintln!(
-                    "  import: retrying fetch after attempt {attempt}/{IMPORT_FETCH_ATTEMPTS} for id={row_id} {url}: {err}"
+                    "  import: retrying crawl after attempt {attempt}/{IMPORT_FETCH_ATTEMPTS} for id={row_id} {url}: {outcome}"
                 );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
             }
             _ => return outcome,
         }
+    }
+}
+
+fn append_failed_feeds(path: &str, urls: &[String]) {
+    if urls.is_empty() {
+        return;
+    }
+
+    let path = Path::new(path);
+    ensure_parent_dir(path).unwrap_or_else(|e| {
+        panic!(
+            "failed to create failed feed output directory {}: {e}",
+            path.display()
+        )
+    });
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("failed to open failed feed output {}: {e}", path.display()));
+
+    for url in urls {
+        writeln!(file, "{url}").unwrap_or_else(|e| {
+            panic!("failed writing failed feed output {}: {e}", path.display())
+        });
     }
 }
 
@@ -352,6 +384,7 @@ pub async fn run(
     state_path: String,
     batch_size: usize,
     concurrency: usize,
+    failed_feeds_output: String,
     dry_run: bool,
     reset: bool,
 ) {
@@ -422,6 +455,7 @@ pub async fn run(
             let rejected = Arc::new(AtomicU64::new(0));
             let no_change = Arc::new(AtomicU64::new(0));
             let errors = Arc::new(AtomicU64::new(0));
+            let failed_feeds = Arc::new(Mutex::new(Vec::new()));
 
             let tasks: Vec<_> = batch
                 .into_iter()
@@ -432,6 +466,7 @@ pub async fn run(
                     let rejected = Arc::clone(&rejected);
                     let no_change = Arc::clone(&no_change);
                     let errors = Arc::clone(&errors);
+                    let failed_feeds = Arc::clone(&failed_feeds);
                     move || async move {
                         let fallback = row.podcast_guid.as_deref();
                         let outcome = crawl_feed_with_import_retries(
@@ -449,11 +484,18 @@ pub async fn run(
                             CrawlOutcome::NoChange => {
                                 no_change.fetch_add(1, Ordering::Relaxed);
                             }
-                            CrawlOutcome::FetchError(_)
+                            CrawlOutcome::FetchError { .. }
                             | CrawlOutcome::ParseError(_)
-                            | CrawlOutcome::IngestError(_) => {
+                            | CrawlOutcome::IngestError { .. } => {
                                 errors.fetch_add(1, Ordering::Relaxed);
                             }
+                        }
+
+                        if outcome.is_retryable() {
+                            failed_feeds
+                                .lock()
+                                .expect("failed feed retry list mutex poisoned")
+                                .push(row.url.clone());
                         }
 
                         eprintln!("  {outcome}: id={} {}", row.id, row.url);
@@ -462,6 +504,12 @@ pub async fn run(
                 .collect();
 
             run_pool(tasks, concurrency).await;
+            let mut failed_batch = failed_feeds
+                .lock()
+                .expect("failed feed retry list mutex poisoned");
+            failed_batch.sort();
+            failed_batch.dedup();
+            append_failed_feeds(&failed_feeds_output, &failed_batch);
 
             eprintln!(
                 "import: batch done — accepted={} rejected={} no_change={} errors={}",
