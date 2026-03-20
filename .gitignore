@@ -2,10 +2,5 @@
 import_state.db
 podping_state.db
 podcastindex_feeds.db
-analysis/data/*.db
-analysis/data/*.db-shm
-analysis/data/*.db-wal
-analysis/data/*.ndjson
-analysis/reports/*.json
-analysis/reports/*.md
-rebuilddb.sh
+analysis/data/*
+analysis/reports/*
