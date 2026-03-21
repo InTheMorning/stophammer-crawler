@@ -13,9 +13,12 @@ Typical usage from the repo root:
 
 ```bash
 # 1. Build or run the analysis binaries through the crawler manifest
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin feed_audit -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_analyzer -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_import -- --help
 
 # 2. Capture a feed corpus into NDJSON
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
@@ -34,7 +37,8 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
   --max-backoff-secs 600
 
 # 3. Re-analyze the captured corpus
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- \
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_analyzer -- \
   --input ./stophammer-crawler/analysis/data/feed_audit.ndjson
 
 # 4. Replay cached feeds into a running primary without refetching them

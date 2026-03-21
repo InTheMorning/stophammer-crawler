@@ -29,9 +29,12 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- podping --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- gossip --help
 
 # Analysis / replay tools
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin feed_audit -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_analyzer -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_import -- --help
 ```
 
 Or build binaries once:
@@ -93,19 +96,20 @@ for multi-gigabyte snapshots.
 #### Import options
 
 | Flag | Default | Description |
-|---|---|---|
-| `--db <path>` | `./podcastindex_feeds.db` | Path to the extracted PodcastIndex snapshot |
-| `--db-url <url>` | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Snapshot archive URL |
-| `--refresh-db` | off | Re-download and replace the local snapshot before importing |
-| `--state <path>` | `./import_state.db` | Progress cursor database (created automatically) |
+| ---- | ------- | ----------- |
+| `--db <path>` | `./podcastindex_feeds.db` | PodcastIndex snapshot path |
+| `--db-url <url>` | (public PI URL) | Snapshot archive URL |
+| `--refresh-db` | off | Re-download the snapshot |
+| `--state <path>` | `./import_state.db` | Progress cursor database |
 | `--batch <n>` | `100` | Feeds per DB query batch |
-| `--concurrency <n>` | `5` | Parallel fetch + ingest workers |
-| `--dry-run` | off | Log candidates without fetching or ingesting |
-| `--reset` | off | Clear cursor and restart from `id=0` |
+| `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
+| `--dry-run` | off | Log without fetching/ingesting |
+| `--reset` | off | Clear cursor, restart from 0 |
 
-Progress is stored in `--state`. If the process is interrupted, the next run resumes
-from the last completed batch. A crash mid-batch re-processes that batch — safe because
-stophammer deduplicates on content hash.
+Progress is stored in `--state`. If the process is interrupted,
+the next run resumes from the last completed batch. A crash
+mid-batch re-processes that batch -- safe because stophammer
+deduplicates on content hash.
 
 Operational note:
 
@@ -159,12 +163,12 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
 #### Podping options
 
 | Flag | Default | Description |
-|---|---|---|
-| `--state <path>` | `./podping_state.db` | Persistent latest-seen block cursor database |
-| `--block <n>` | off | Start replay from an explicit Hive block |
-| `--old <hours>` | off | Start replay from N hours ago |
-| `--time <rfc3339>` | off | Start replay from a timestamp |
-| `--concurrency <n>` | `3` | Parallel fetch + ingest workers |
+| ---- | ------- | ----------- |
+| `--state <path>` | `./podping_state.db` | Block cursor database |
+| `--block <n>` | off | Replay from a Hive block |
+| `--old <hours>` | off | Replay from N hours ago |
+| `--time <rfc3339>` | off | Replay from a timestamp |
+| `--concurrency <n>` | `3` | Parallel fetch+ingest workers |
 
 ### gossip
 
@@ -199,21 +203,37 @@ Important:
 
 ## Environment variables
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `CRAWL_TOKEN` | yes | — | Shared secret for stophammer ingest auth |
-| `INGEST_URL` | no | `http://localhost:8008/ingest/feed` | Stophammer ingest endpoint |
-| `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping/gossip) | Worker pool size |
-| `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
-| `PODCASTINDEX_DB_URL` | no | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Override the PodcastIndex snapshot archive URL for import mode |
-| `RESOLVER_DB_PATH` | no | — | If set, import mode runs `resolverctl --db <path> import-active` at start, refreshes that heartbeat while the import is active, and runs `import-idle` on exit |
-| `RESOLVERCTL_BIN` | no | `resolverctl` | Override the resolver control binary used with `RESOLVER_DB_PATH` |
-| `PODPING_WS_URL` | no | `wss://api.livewire.io/ws/podping` | Podping WebSocket endpoint |
-| `HIVE_API_URL` | no | `https://api.hive.blog` | Hive JSON-RPC endpoint used to estimate replay start blocks |
+- **`CRAWL_TOKEN`** (required) --
+  Shared secret for stophammer ingest auth.
+- **`INGEST_URL`** --
+  Stophammer ingest endpoint.
+  Default: `http://localhost:8008/ingest/feed`
+- **`CONCURRENCY`** --
+  Worker pool size.
+  Default: `5` (crawl/import) / `3` (podping/gossip)
+- **`FEED_URLS`** --
+  Comma- or newline-separated URLs (crawl mode only).
+- **`PODCASTINDEX_DB_URL`** --
+  Override the PodcastIndex snapshot archive URL for
+  import mode.
+- **`RESOLVER_DB_PATH`** --
+  If set, import mode runs
+  `resolverctl import-active` at start, refreshes that
+  heartbeat while the import is active, and runs
+  `import-idle` on exit.
+- **`RESOLVERCTL_BIN`** --
+  Override the resolver control binary used with
+  `RESOLVER_DB_PATH`. Default: `resolverctl`
+- **`PODPING_WS_URL`** --
+  Podping WebSocket endpoint.
+  Default: `wss://api.livewire.io/ws/podping`
+- **`HIVE_API_URL`** --
+  Hive JSON-RPC endpoint for replay start blocks.
+  Default: `https://api.hive.blog`
 
 ## Architecture
 
-```
+```text
 stophammer-crawler
   src/
     main.rs           CLI dispatcher (clap subcommands)
@@ -305,7 +325,8 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
   --max-backoff-secs 600
 
 # Re-analyze the cached corpus
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_analyzer -- \
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin audit_analyzer -- \
   --input ./analysis/data/feed_audit.ndjson
 
 # Replay cached feeds into a running primary
