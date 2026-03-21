@@ -79,6 +79,13 @@ impl std::fmt::Display for CrawlOutcome {
 }
 
 impl CrawlOutcome {
+    /// Returns `true` when the rejection was caused by `[medium_music]`,
+    /// i.e. the feed's `podcast:medium` is not `"music"`.
+    #[must_use]
+    pub fn is_medium_rejection(&self) -> bool {
+        matches!(self, Self::Rejected { reason, .. } if reason.starts_with("[medium_music]"))
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(

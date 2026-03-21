@@ -5,11 +5,12 @@ V4V music index. Fetches RSS feeds, hashes content, parses with
 [stophammer-parser](https://github.com/dardevelin/stophammer-parser) as a native
 library, and submits results to a stophammer node's `/ingest/feed` endpoint.
 
-Three subcommands cover every discovery path:
+Four subcommands cover every discovery path:
 
 - **crawl** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
 - **podping** — long-running WebSocket listener for real-time discovery
+- **gossip** — long-running gossip-listener SSE consumer with optional archive replay
 
 ## Requirements
 
@@ -25,6 +26,7 @@ From this checkout:
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- import --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- podping --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- gossip --help
 
 # Analysis / replay tools
 cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- --help
@@ -106,6 +108,7 @@ from the last completed batch. A crash mid-batch re-processes that batch — saf
 stophammer deduplicates on content hash.
 
 Operational note:
+
 - initial auto-download only needs space for the extracted `.db`
 - `--refresh-db` temporarily needs room for both the existing `.db` and the new
   replacement `.db` while the importer swaps them safely
@@ -138,6 +141,7 @@ from the beginning of the previous Sunday in UTC, converted to an estimated
 block using the current Hive head block.
 
 Important:
+
 - historical catch-up is done against the Hive APIs, following the upstream
   `podping-hivewatcher` model
 - the Livewire websocket is used only for live tailing after catch-up
@@ -162,13 +166,44 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
 | `--time <rfc3339>` | off | Start replay from a timestamp |
 | `--concurrency <n>` | `3` | Parallel fetch + ingest workers |
 
+### gossip
+
+Listen to a local gossip-listener SSE stream for live podping notifications:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  gossip --sse-url http://127.0.0.1:8089/events --concurrency 3
+```
+
+Optional archive catch-up:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
+  gossip \
+  --archive-db ./archive.db \
+  --since-hours 24 \
+  --concurrency 3
+```
+
+Important:
+
+- `--since-hours` only applies when `--archive-db` is set
+- live SSE mode keeps a cursor for observability, but it does not replay from that
+  cursor without an archive database
+- the SSE connection uses a connect timeout only and stays open for normal
+  long-lived streaming
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `CRAWL_TOKEN` | yes | — | Shared secret for stophammer ingest auth |
 | `INGEST_URL` | no | `http://localhost:8008/ingest/feed` | Stophammer ingest endpoint |
-| `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping) | Worker pool size |
+| `CONCURRENCY` | no | `5` (crawl/import) / `3` (podping/gossip) | Worker pool size |
 | `FEED_URLS` | no | — | Comma or newline-separated URLs (crawl mode) |
 | `PODCASTINDEX_DB_URL` | no | `https://public.podcastindex.org/podcastindex_feeds.db.tgz` | Override the PodcastIndex snapshot archive URL for import mode |
 | `RESOLVER_DB_PATH` | no | — | If set, import mode runs `resolverctl --db <path> import-active` at start, refreshes that heartbeat while the import is active, and runs `import-idle` on exit |
@@ -189,6 +224,7 @@ stophammer-crawler
       crawl.rs        Load URLs from file/env/stdin, run pool
       import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
       podping.rs      WebSocket listener, music filter, dedup, persistent workers
+      gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
 
 The core pipeline in `crawl.rs` calls `stophammer-parser` as a Rust library — no

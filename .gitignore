@@ -4,3 +4,4 @@ podping_state.db
 podcastindex_feeds.db
 analysis/data/*
 analysis/reports/*
+gossip_state.db

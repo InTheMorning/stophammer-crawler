@@ -105,6 +105,33 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
         concurrency: usize,
     },
+
+    /// Listen to gossip-listener SSE stream for real-time podping notifications
+    Gossip {
+        /// Path to gossip state database (latest seen timestamp cursor)
+        #[arg(long, default_value = "./gossip_state.db")]
+        state: String,
+
+        /// SSE endpoint URL (default: http://localhost:8089/events)
+        #[arg(long)]
+        sse_url: Option<String>,
+
+        /// Replay from gossip-listener archive database
+        #[arg(long)]
+        archive_db: Option<String>,
+
+        /// Catch-up starting from N hours ago (requires --archive-db)
+        #[arg(long, requires = "archive_db")]
+        since_hours: Option<u64>,
+
+        /// Parallel fetch+ingest workers
+        #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
+        concurrency: usize,
+
+        /// Quiet mode: hide medium_music rejections (non-music spam)
+        #[arg(short, long)]
+        quiet: bool,
+    },
 }
 
 #[tokio::main]
@@ -152,6 +179,16 @@ async fn main() {
             concurrency,
         } => {
             modes::podping::run(state, block, old, time, concurrency).await;
+        }
+        Mode::Gossip {
+            state,
+            sse_url,
+            archive_db,
+            since_hours,
+            concurrency,
+            quiet,
+        } => {
+            modes::gossip::run(state, sse_url, archive_db, since_hours, concurrency, quiet).await;
         }
     }
 }

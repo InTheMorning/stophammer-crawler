@@ -29,6 +29,7 @@ struct PodpingEntry {
 
 #[derive(serde::Deserialize, Default)]
 struct PodpingMessage {
+    #[allow(dead_code)]
     #[serde(default)]
     medium: Option<String>,
     #[serde(default)]
@@ -60,16 +61,9 @@ impl PodpingMessage {
 }
 
 fn should_accept(msg: &PodpingMessage) -> bool {
-    // Medium: accept "music" or unset (uncategorized worth checking)
-    let medium_ok = match msg.medium.as_deref() {
-        Some("music") | None => true,
-        Some(_) => false,
-    };
-
-    // Reason: drop "newValueBlock" (payment-only events)
-    let reason_ok = msg.reason.as_deref() != Some("newValueBlock");
-
-    medium_ok && reason_ok
+    // Accept all notifications - the parser will verify podcast:medium
+    // Only reject newValueBlock (payment-only events)
+    msg.reason.as_deref() != Some("newValueBlock")
 }
 
 fn allowed_operation_id(operation_id: &str) -> bool {
