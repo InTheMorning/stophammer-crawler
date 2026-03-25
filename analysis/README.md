@@ -60,6 +60,10 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
 `feed_audit` now keeps only successful `200 OK` captures in the NDJSON corpus.
 Retryable and failed feed URLs are written separately to
 `analysis/data/failed_feeds.txt` so they can be requeued later.
+Each retained row also includes a parser-derived `podcast_namespace` snapshot,
+and the same data is embedded under `parsed_feed.podcast_namespace`, preserving
+the complete Podcast Namespace 1.0 tag surface exactly as seen in RSS while
+remaining prefix-agnostic.
 `audit_expand_publishers` reparses cached `raw_xml`, extracts feed-level
 `podcast:remoteItem medium="publisher"` targets, skips feeds already present in
 the corpus by GUID or URL, writes the missing target URLs to

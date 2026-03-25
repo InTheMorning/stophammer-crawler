@@ -15,7 +15,7 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use stophammer_parser::profile;
+use stophammer_parser::{extract_podcast_namespace, profile};
 
 #[path = "../../src/url_queue.rs"]
 mod url_queue;
@@ -94,6 +94,7 @@ struct AuditRecord {
     fetch: FetchRecord,
     raw_xml: Option<String>,
     parsed_feed: Option<stophammer_parser::types::IngestFeedData>,
+    podcast_namespace: Option<stophammer_parser::types::IngestPodcastNamespaceSnapshot>,
     parse_error: Option<String>,
 }
 
@@ -370,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut http_status = None;
         let mut raw_xml = None;
         let mut parsed_feed = None;
+        let mut podcast_namespace = None;
         let mut parse_error = None;
         let mut content_sha256 = None;
         let mut content_bytes = None;
@@ -390,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let xml = String::from_utf8_lossy(&body).to_string();
                         if http_status == Some(200) {
                             let parser = profile::stophammer_with_fallback(feed.feed_guid.clone());
+                            podcast_namespace = extract_podcast_namespace(&xml).ok().flatten();
 
                             match parser.parse(&xml) {
                                 Ok(parsed) => {
@@ -463,6 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             raw_xml,
             parsed_feed,
+            podcast_namespace,
             parse_error,
         };
 
@@ -490,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{is_retryable_status, should_keep_in_audit};
+    use stophammer_parser::extract_podcast_namespace;
 
     #[test]
     fn keeps_only_successful_fetches_in_clean_audit_output() {
@@ -506,5 +511,66 @@ mod tests {
         assert!(is_retryable_status(429));
         assert!(is_retryable_status(503));
         assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn extracts_podcast_namespace_tags_into_snapshot() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>Feed</title>
+    <podcast:guid>feed-guid</podcast:guid>
+    <podcast:person role="artist" href="https://example.com/artist">Artist Name</podcast:person>
+    <podcast:liveItem status="live">
+      <guid>live-guid</guid>
+      <title>Live</title>
+      <podcast:alternateEnclosure type="audio/flac" length="123" />
+    </podcast:liveItem>
+    <item>
+      <guid>track-guid</guid>
+      <title>Track</title>
+      <podcast:txt purpose="npub">npub1example</podcast:txt>
+      <podcast:remoteItem medium="publisher" feedGuid="publisher-guid" feedUrl="https://example.com/publisher.xml" />
+    </item>
+  </channel>
+</rss>"#;
+
+        let snapshot = extract_podcast_namespace(xml)
+            .expect("parser namespace extraction")
+            .expect("snapshot");
+        assert_eq!(snapshot.tags.len(), 6);
+
+        assert_eq!(snapshot.tags[0].path, "rss.channel.podcast:guid");
+        assert_eq!(snapshot.tags[0].entity_scope, "channel");
+        assert_eq!(snapshot.tags[0].text.as_deref(), Some("feed-guid"));
+
+        assert_eq!(snapshot.tags[1].tag, "podcast:person");
+        assert_eq!(
+            snapshot.tags[1].attributes.get("role").map(String::as_str),
+            Some("artist")
+        );
+
+        assert_eq!(snapshot.tags[2].entity_scope, "channel");
+        assert_eq!(snapshot.tags[2].tag, "podcast:liveItem");
+
+        assert_eq!(snapshot.tags[3].entity_scope, "live_item");
+        assert_eq!(snapshot.tags[3].entity_guid.as_deref(), Some("live-guid"));
+        assert_eq!(snapshot.tags[3].tag, "podcast:alternateEnclosure");
+
+        assert_eq!(snapshot.tags[4].entity_scope, "item");
+        assert_eq!(snapshot.tags[4].entity_guid.as_deref(), Some("track-guid"));
+        assert_eq!(snapshot.tags[4].tag, "podcast:txt");
+
+        assert_eq!(snapshot.tags[5].entity_scope, "item");
+        assert_eq!(snapshot.tags[5].entity_guid.as_deref(), Some("track-guid"));
+        assert_eq!(snapshot.tags[5].tag, "podcast:remoteItem");
+        assert_eq!(
+            snapshot.tags[5]
+                .attributes
+                .get("feedGuid")
+                .map(String::as_str),
+            Some("publisher-guid")
+        );
     }
 }
