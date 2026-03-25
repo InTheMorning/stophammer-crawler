@@ -210,6 +210,10 @@ async fn launch_gossip_urls(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "archive replay threads through shared clients, counters, progress, and output policy"
+)]
 async fn replay_from_archive(
     archive_path: &str,
     since: u64,
@@ -242,16 +246,14 @@ async fn replay_from_archive(
 
     let mut counters = GossipCounters::default();
 
-    let since_i64 = since as i64;
+    let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
 
     let payloads: Vec<Vec<u8>> =
         match stmt.query_map(params![since_i64], |row| row.get::<_, String>(0)) {
             Ok(rows) => {
                 let mut collected = Vec::new();
-                for row in rows {
-                    if let Ok(text) = row {
-                        collected.push(text.into_bytes());
-                    }
+                for text in rows.flatten() {
+                    collected.push(text.into_bytes());
                 }
                 collected
             }
@@ -322,6 +324,10 @@ async fn replay_from_archive(
     counters
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "SSE streaming threads through shared clients, counters, progress, and output policy"
+)]
 async fn stream_sse_events(
     sse_url: &str,
     dedup: &Arc<Mutex<Dedup>>,

@@ -104,12 +104,17 @@ for multi-gigabyte snapshots.
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
 | `--dry-run` | off | Log without fetching/ingesting |
+| `--skip-known-non-music` | off | Skip rows already known to publish a non-`music`, non-`publisher` medium |
 | `--reset` | off | Clear cursor, restart from 0 |
 
 Progress is stored in `--state`. If the process is interrupted,
 the next run resumes from the last completed batch. A crash
 mid-batch re-processes that batch -- safe because stophammer
 deduplicates on content hash.
+
+`--state` now stores both the batch cursor and durable per-row importer memory
+in `import_feed_memory`, including the latest fetch status, outcome,
+`raw_medium`, and attempt counter for each attempted PodcastIndex row.
 
 Operational note:
 

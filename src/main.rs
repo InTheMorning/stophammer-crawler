@@ -74,6 +74,10 @@ enum Mode {
         )]
         failed_feeds_output: String,
 
+        /// Skip rows already known to publish a non-music, non-publisher medium
+        #[arg(long)]
+        skip_known_non_music: bool,
+
         /// Log candidates without fetching
         #[arg(long)]
         dry_run: bool,
@@ -112,7 +116,7 @@ enum Mode {
         #[arg(long, default_value = "./gossip_state.db")]
         state: String,
 
-        /// SSE endpoint URL (default: http://localhost:8089/events)
+        /// SSE endpoint URL (default: <http://localhost:8089/events>)
         #[arg(long)]
         sse_url: Option<String>,
 
@@ -128,7 +132,7 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
         concurrency: usize,
 
-        /// Quiet mode: hide medium_music rejections (non-music spam)
+        /// Quiet mode: hide `medium_music` rejections (non-music spam)
         #[arg(short, long)]
         quiet: bool,
     },
@@ -155,6 +159,7 @@ async fn main() {
             batch,
             concurrency,
             failed_feeds_output,
+            skip_known_non_music,
             dry_run,
             reset,
         } => {
@@ -166,6 +171,7 @@ async fn main() {
                 batch,
                 concurrency,
                 failed_feeds_output,
+                skip_known_non_music,
                 dry_run,
                 reset,
             )

@@ -293,12 +293,11 @@ fn discover_missing_publisher_candidates(
     let mut stats = DiscoveryStats::default();
     for (index, line) in reader.lines().enumerate() {
         let line = line.map_err(|err| format!("failed reading NDJSON row {}: {err}", index + 1))?;
-        let row: AuditRow = match serde_json::from_str(&line) {
-            Ok(row) => row,
-            Err(_) => {
-                stats.malformed_rows += 1;
-                continue;
-            }
+        let row: AuditRow = if let Ok(row) = serde_json::from_str(&line) {
+            row
+        } else {
+            stats.malformed_rows += 1;
+            continue;
         };
 
         let normalized_source_url = normalize_url(&row.source_db.feed_url);
@@ -328,12 +327,9 @@ fn discover_missing_publisher_candidates(
         };
         stats.rows_with_raw_xml += 1;
 
-        let reparsed = match parser.parse(raw_xml) {
-            Ok(feed) => feed,
-            Err(_) => {
-                stats.xml_reparse_failures += 1;
-                continue;
-            }
+        let Ok(reparsed) = parser.parse(raw_xml) else {
+            stats.xml_reparse_failures += 1;
+            continue;
         };
 
         for remote in reparsed.remote_items {
@@ -467,8 +463,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (index, feed) in feeds.iter().enumerate() {
         let host = host_key(&feed.feed_url);
         let throttle_wait_ms = if let Some(host) = &host {
-            let state = host_states.entry(host.clone()).or_default();
-            wait_for_host(state).await
+            let host_state = host_states.entry(host.clone()).or_default();
+            wait_for_host(host_state).await
         } else {
             0
         };
@@ -530,11 +526,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(host) = &host {
-            let state = host_states.entry(host.clone()).or_default();
+            let host_state = host_states.entry(host.clone()).or_default();
             if should_keep_in_audit(fetch_error.as_ref(), http_status) {
-                mark_success(state, success_delay);
+                mark_success(host_state, success_delay);
             } else {
-                mark_failure(state, initial_backoff, max_backoff, retry_after_secs);
+                mark_failure(host_state, initial_backoff, max_backoff, retry_after_secs);
             }
         }
 

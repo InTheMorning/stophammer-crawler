@@ -30,7 +30,7 @@ impl CrawlConfig {
 }
 
 /// Outcome of a single feed crawl attempt.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrawlOutcome {
     Accepted {
         warnings: Vec<String>,
@@ -120,6 +120,50 @@ impl CrawlOutcome {
             || Duration::from_secs(1_u64 << (attempt.saturating_sub(1))),
             Duration::from_secs,
         ))
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "accepted",
+            Self::Rejected { .. } => "rejected",
+            Self::NoChange => "no_change",
+            Self::FetchError { .. } => "fetch_error",
+            Self::ParseError(_) => "parse_error",
+            Self::IngestError { .. } => "ingest_error",
+        }
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { reason, .. }
+            | Self::FetchError { reason, .. }
+            | Self::ParseError(reason)
+            | Self::IngestError { reason, .. } => Some(reason.as_str()),
+            Self::Accepted { .. } | Self::NoChange => None,
+        }
+    }
+}
+
+/// Importer-facing details preserved from the shared crawl pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlReport {
+    pub outcome: CrawlOutcome,
+    pub fetch_http_status: Option<u16>,
+    pub raw_medium: Option<String>,
+    pub parsed_feed_guid: Option<String>,
+}
+
+impl CrawlReport {
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        self.outcome.is_retryable()
+    }
+
+    #[must_use]
+    pub fn retry_delay(&self, attempt: u32) -> Option<Duration> {
+        self.outcome.retry_delay(attempt)
     }
 }
 
@@ -238,6 +282,19 @@ fn format_ingest_http_error(status: reqwest::StatusCode, resp_body: &str) -> Str
     )
 }
 
+fn build_crawl_report(
+    outcome: CrawlOutcome,
+    fetch_http_status: Option<u16>,
+    feed_data: Option<&IngestFeedData>,
+) -> CrawlReport {
+    CrawlReport {
+        outcome,
+        fetch_http_status,
+        raw_medium: feed_data.and_then(|data| data.raw_medium.clone()),
+        parsed_feed_guid: feed_data.map(|data| data.feed_guid.clone()),
+    }
+}
+
 async fn post_ingest_payload(
     client: &reqwest::Client,
     canonical_url: &str,
@@ -324,6 +381,51 @@ async fn post_ingest_payload(
     clippy::too_many_arguments,
     reason = "replay/import paths pass through source URL, canonical URL, status, raw XML, optional hash, fallback GUID, and config"
 )]
+pub async fn ingest_cached_feed_report(
+    client: &reqwest::Client,
+    source_url: &str,
+    canonical_url: &str,
+    http_status: u16,
+    raw_xml: &str,
+    content_hash: Option<&str>,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+) -> CrawlReport {
+    let content_hash = content_hash.map_or_else(
+        || hex::encode(Sha256::digest(raw_xml.as_bytes())),
+        ToOwned::to_owned,
+    );
+
+    let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
+        Ok(data) => data,
+        Err(e) => {
+            return build_crawl_report(CrawlOutcome::ParseError(e), Some(http_status), None);
+        }
+    };
+
+    let outcome = post_ingest_payload(
+        client,
+        canonical_url,
+        source_url,
+        http_status,
+        &content_hash,
+        feed_data.clone(),
+        config,
+    )
+    .await;
+
+    build_crawl_report(outcome, Some(http_status), feed_data.as_ref())
+}
+
+/// Parse cached XML and POST it to `/ingest/feed`. Never panics.
+#[allow(
+    dead_code,
+    reason = "analysis binaries import crawl.rs via #[path] and call this shared helper"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "replay/import paths pass through source URL, canonical URL, status, raw XML, optional hash, fallback GUID, and config"
+)]
 pub async fn ingest_cached_feed(
     client: &reqwest::Client,
     source_url: &str,
@@ -334,35 +436,27 @@ pub async fn ingest_cached_feed(
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
 ) -> CrawlOutcome {
-    let content_hash = content_hash.map_or_else(
-        || hex::encode(Sha256::digest(raw_xml.as_bytes())),
-        ToOwned::to_owned,
-    );
-
-    let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
-        Ok(data) => data,
-        Err(e) => return CrawlOutcome::ParseError(e),
-    };
-
-    post_ingest_payload(
+    ingest_cached_feed_report(
         client,
-        canonical_url,
         source_url,
+        canonical_url,
         http_status,
-        &content_hash,
-        feed_data,
+        raw_xml,
+        content_hash,
+        fallback_guid,
         config,
     )
     .await
+    .outcome
 }
 
 /// Fetch → SHA-256 → parse → POST. Never panics.
-pub async fn crawl_feed(
+pub async fn crawl_feed_report(
     client: &reqwest::Client,
     url: &str,
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
-) -> CrawlOutcome {
+) -> CrawlReport {
     // 1. Fetch
     let resp = match client
         .get(url)
@@ -373,11 +467,15 @@ pub async fn crawl_feed(
     {
         Ok(r) => r,
         Err(e) => {
-            return CrawlOutcome::FetchError {
-                reason: e.to_string(),
-                retryable: true,
-                retry_after_secs: None,
-            };
+            return build_crawl_report(
+                CrawlOutcome::FetchError {
+                    reason: e.to_string(),
+                    retryable: true,
+                    retry_after_secs: None,
+                },
+                None,
+                None,
+            );
         }
     };
 
@@ -387,27 +485,35 @@ pub async fn crawl_feed(
     let body = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            return CrawlOutcome::FetchError {
-                reason: e.to_string(),
-                retryable: true,
-                retry_after_secs: None,
-            };
+            return build_crawl_report(
+                CrawlOutcome::FetchError {
+                    reason: e.to_string(),
+                    retryable: true,
+                    retry_after_secs: None,
+                },
+                Some(status),
+                None,
+            );
         }
     };
 
     if status != 200 {
-        return CrawlOutcome::FetchError {
-            reason: format_http_fetch_error(status, &headers, &body),
-            retryable: is_retryable_http_status(status),
-            retry_after_secs: parse_retry_after_secs(&headers),
-        };
+        return build_crawl_report(
+            CrawlOutcome::FetchError {
+                reason: format_http_fetch_error(status, &headers, &body),
+                retryable: is_retryable_http_status(status),
+                retry_after_secs: parse_retry_after_secs(&headers),
+            },
+            Some(status),
+            None,
+        );
     }
 
     // 2. SHA-256 hash of raw bytes
     let hash = hex::encode(Sha256::digest(&body));
     let xml = String::from_utf8_lossy(&body);
 
-    ingest_cached_feed(
+    ingest_cached_feed_report(
         client,
         url,
         url,
@@ -420,15 +526,53 @@ pub async fn crawl_feed(
     .await
 }
 
+/// Fetch → SHA-256 → parse → POST. Never panics.
+pub async fn crawl_feed(
+    client: &reqwest::Client,
+    url: &str,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+) -> CrawlOutcome {
+    crawl_feed_report(client, url, fallback_guid, config)
+        .await
+        .outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CrawlOutcome, body_preview, format_http_fetch_error, format_ingest_http_error,
-        is_retryable_http_status, is_retryable_ingest_status, normalize_rejection_reason,
+        CrawlOutcome, body_preview, build_crawl_report, format_http_fetch_error,
+        format_ingest_http_error, is_retryable_http_status, is_retryable_ingest_status,
+        normalize_rejection_reason,
     };
     use reqwest::StatusCode;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use std::time::Duration;
+    use stophammer_parser::types::IngestFeedData;
+
+    fn sample_feed_data() -> IngestFeedData {
+        IngestFeedData {
+            feed_guid: "feed-guid".to_string(),
+            title: "Feed".to_string(),
+            description: None,
+            image_url: None,
+            language: None,
+            explicit: false,
+            itunes_type: None,
+            raw_medium: Some("music".to_string()),
+            author_name: None,
+            owner_name: None,
+            pub_date: None,
+            remote_items: Vec::new(),
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            podcast_namespace: None,
+            feed_payment_routes: Vec::new(),
+            live_items: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
 
     #[test]
     fn retryable_statuses_cover_429_and_5xx() {
@@ -503,5 +647,52 @@ mod tests {
 
         assert!(reason.contains("429"));
         assert!(reason.contains("rate limit exceeded"));
+    }
+
+    #[test]
+    fn crawl_report_keeps_fetch_status_for_fetch_errors() {
+        let report = build_crawl_report(
+            CrawlOutcome::FetchError {
+                reason: "http 404 Not Found".to_string(),
+                retryable: false,
+                retry_after_secs: None,
+            },
+            Some(404),
+            None,
+        );
+
+        assert_eq!(report.fetch_http_status, Some(404));
+        assert_eq!(report.raw_medium, None);
+        assert_eq!(report.parsed_feed_guid, None);
+        assert_eq!(report.outcome.label(), "fetch_error");
+    }
+
+    #[test]
+    fn crawl_report_keeps_parsed_medium_and_guid() {
+        let feed_data = sample_feed_data();
+        let report = build_crawl_report(
+            CrawlOutcome::Accepted {
+                warnings: Vec::new(),
+            },
+            Some(200),
+            Some(&feed_data),
+        );
+
+        assert_eq!(report.fetch_http_status, Some(200));
+        assert_eq!(report.raw_medium.as_deref(), Some("music"));
+        assert_eq!(report.parsed_feed_guid.as_deref(), Some("feed-guid"));
+    }
+
+    #[test]
+    fn crawl_report_parse_error_keeps_fetch_status() {
+        let report = build_crawl_report(
+            CrawlOutcome::ParseError("invalid xml".to_string()),
+            Some(200),
+            None,
+        );
+
+        assert_eq!(report.fetch_http_status, Some(200));
+        assert_eq!(report.raw_medium, None);
+        assert_eq!(report.outcome.reason(), Some("invalid xml"));
     }
 }
