@@ -304,8 +304,8 @@ By default:
   resume cursor
 - `audit_import` retries transient ingest throttles / failures such as `429`
   before counting the row as an ingest error
-- `crawl` / `import` write retryable feed URLs to `./failed_feeds.txt` unless
-  you override `--failed-feeds-output`
+- `crawl` writes retryable feed URLs to `./failed_feeds.txt` unless you
+  override `--failed-feeds-output`
 - `crawl` also spaces requests per host (`--host-delay-ms`, default `1500`) and
   retries transient fetch / ingest throttles before writing a URL to the failed
   feed dump

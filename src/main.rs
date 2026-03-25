@@ -66,14 +66,6 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 5)]
         concurrency: usize,
 
-        /// Plain-text output file for retryable feed URLs
-        #[arg(
-            long,
-            env = "FAILED_FEEDS_OUTPUT",
-            default_value = "./failed_feeds.txt"
-        )]
-        failed_feeds_output: String,
-
         /// Skip rows already known to publish a non-music, non-publisher medium
         #[arg(long)]
         skip_known_non_music: bool,
@@ -158,7 +150,6 @@ async fn main() {
             state,
             batch,
             concurrency,
-            failed_feeds_output,
             skip_known_non_music,
             dry_run,
             reset,
@@ -170,7 +161,6 @@ async fn main() {
                 state,
                 batch,
                 concurrency,
-                failed_feeds_output,
                 skip_known_non_music,
                 dry_run,
                 reset,

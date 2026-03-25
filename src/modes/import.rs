@@ -2,9 +2,9 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -621,32 +621,6 @@ async fn crawl_feed_with_import_retries(
     }
 }
 
-fn append_failed_feeds(path: &str, urls: &[String]) {
-    if urls.is_empty() {
-        return;
-    }
-
-    let path = Path::new(path);
-    ensure_parent_dir(path).unwrap_or_else(|e| {
-        panic!(
-            "failed to create failed feed output directory {}: {e}",
-            path.display()
-        )
-    });
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .unwrap_or_else(|e| panic!("failed to open failed feed output {}: {e}", path.display()));
-
-    for url in urls {
-        writeln!(file, "{url}").unwrap_or_else(|e| {
-            panic!("failed writing failed feed output {}: {e}", path.display())
-        });
-    }
-}
-
 #[allow(
     clippy::too_many_arguments,
     clippy::fn_params_excessive_bools,
@@ -660,7 +634,6 @@ pub async fn run(
     state_path: String,
     batch_size: usize,
     concurrency: usize,
-    failed_feeds_output: String,
     skip_known_non_music: bool,
     dry_run: bool,
     reset: bool,
@@ -746,7 +719,6 @@ pub async fn run(
             let no_change = Arc::new(AtomicU64::new(0));
             let errors = Arc::new(AtomicU64::new(0));
             let skipped = Arc::new(AtomicU64::new(0));
-            let failed_feeds = Arc::new(Mutex::new(Vec::new()));
             let state_tx = state_writer
                 .as_ref()
                 .expect("import state writer missing")
@@ -764,7 +736,6 @@ pub async fn run(
                     let no_change = Arc::clone(&no_change);
                     let errors = Arc::clone(&errors);
                     let skipped = Arc::clone(&skipped);
-                    let failed_feeds = Arc::clone(&failed_feeds);
                     let state_tx = state_tx.clone();
                     let known_memory = Arc::clone(&known_memory);
                     move || async move {
@@ -810,25 +781,12 @@ pub async fn run(
                             }
                         }
 
-                        if outcome.is_retryable() {
-                            failed_feeds
-                                .lock()
-                                .expect("failed feed retry list mutex poisoned")
-                                .push(row.url.clone());
-                        }
-
                         eprintln!("  {outcome}: id={} {}", row.id, row.url);
                     }
                 })
                 .collect();
 
             run_pool(tasks, concurrency).await;
-            let mut failed_batch = failed_feeds
-                .lock()
-                .expect("failed feed retry list mutex poisoned");
-            failed_batch.sort();
-            failed_batch.dedup();
-            append_failed_feeds(&failed_feeds_output, &failed_batch);
 
             eprintln!(
                 "import: batch done — accepted={} rejected={} no_change={} errors={} skipped={}",
