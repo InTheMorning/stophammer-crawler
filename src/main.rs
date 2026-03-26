@@ -6,6 +6,16 @@ mod url_queue;
 
 use clap::{Parser, Subcommand};
 
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| format!("expected a positive integer: {err}"))?;
+    if value == 0 {
+        return Err("value must be greater than 0".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(Parser)]
 #[command(name = "stophammer-crawler", about = "Unified RSS feed crawler")]
 struct Cli {
@@ -20,7 +30,7 @@ enum Mode {
         /// Feed URLs or path to a file containing URLs
         urls: Vec<String>,
 
-        #[arg(long, env = "CONCURRENCY", default_value_t = 5)]
+        #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
         concurrency: usize,
 
         /// Minimum spacing between fetches to the same host
@@ -59,12 +69,20 @@ enum Mode {
         state: String,
 
         /// Feeds per database query batch
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
         batch: usize,
 
         /// Parallel fetch+ingest workers
-        #[arg(long, env = "CONCURRENCY", default_value_t = 5)]
+        #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
         concurrency: usize,
+
+        /// Optional NDJSON output containing local RSS copies in `feed_audit` format
+        #[arg(long)]
+        audit_output: Option<String>,
+
+        /// Append importer audit rows to `--audit-output` instead of truncating first
+        #[arg(long, requires = "audit_output")]
+        audit_append: bool,
 
         /// Skip rows already known to publish a non-music, non-publisher medium
         #[arg(long)]
@@ -98,7 +116,7 @@ enum Mode {
         time: Option<String>,
 
         /// Parallel fetch+ingest workers
-        #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
+        #[arg(long, env = "CONCURRENCY", default_value_t = 3, value_parser = parse_positive_usize)]
         concurrency: usize,
     },
 
@@ -121,7 +139,7 @@ enum Mode {
         since_hours: Option<u64>,
 
         /// Parallel fetch+ingest workers
-        #[arg(long, env = "CONCURRENCY", default_value_t = 3)]
+        #[arg(long, env = "CONCURRENCY", default_value_t = 3, value_parser = parse_positive_usize)]
         concurrency: usize,
 
         /// Quiet mode: hide `medium_music` rejections (non-music spam)
@@ -150,6 +168,8 @@ async fn main() {
             state,
             batch,
             concurrency,
+            audit_output,
+            audit_append,
             skip_known_non_music,
             dry_run,
             reset,
@@ -161,6 +181,8 @@ async fn main() {
                 state,
                 batch,
                 concurrency,
+                audit_output,
+                audit_append,
                 skip_known_non_music,
                 dry_run,
                 reset,

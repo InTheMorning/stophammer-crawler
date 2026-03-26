@@ -147,12 +147,16 @@ impl CrawlOutcome {
 }
 
 /// Importer-facing details preserved from the shared crawl pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CrawlReport {
     pub outcome: CrawlOutcome,
     pub fetch_http_status: Option<u16>,
     pub raw_medium: Option<String>,
     pub parsed_feed_guid: Option<String>,
+    pub final_url: Option<String>,
+    pub content_sha256: Option<String>,
+    pub raw_xml: Option<String>,
+    pub parsed_feed: Option<IngestFeedData>,
 }
 
 impl CrawlReport {
@@ -286,12 +290,19 @@ fn build_crawl_report(
     outcome: CrawlOutcome,
     fetch_http_status: Option<u16>,
     feed_data: Option<&IngestFeedData>,
+    final_url: Option<String>,
+    content_sha256: Option<String>,
+    raw_xml: Option<String>,
 ) -> CrawlReport {
     CrawlReport {
         outcome,
         fetch_http_status,
         raw_medium: feed_data.and_then(|data| data.raw_medium.clone()),
         parsed_feed_guid: feed_data.map(|data| data.feed_guid.clone()),
+        final_url,
+        content_sha256,
+        raw_xml,
+        parsed_feed: feed_data.cloned(),
     }
 }
 
@@ -399,7 +410,14 @@ pub async fn ingest_cached_feed_report(
     let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
         Ok(data) => data,
         Err(e) => {
-            return build_crawl_report(CrawlOutcome::ParseError(e), Some(http_status), None);
+            return build_crawl_report(
+                CrawlOutcome::ParseError(e),
+                Some(http_status),
+                None,
+                Some(canonical_url.to_string()),
+                Some(content_hash),
+                Some(raw_xml.to_string()),
+            );
         }
     };
 
@@ -414,7 +432,14 @@ pub async fn ingest_cached_feed_report(
     )
     .await;
 
-    build_crawl_report(outcome, Some(http_status), feed_data.as_ref())
+    build_crawl_report(
+        outcome,
+        Some(http_status),
+        feed_data.as_ref(),
+        Some(canonical_url.to_string()),
+        Some(content_hash),
+        Some(raw_xml.to_string()),
+    )
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
@@ -475,11 +500,15 @@ pub async fn crawl_feed_report(
                 },
                 None,
                 None,
+                None,
+                None,
+                None,
             );
         }
     };
 
     let status = resp.status().as_u16();
+    let final_url = Some(resp.url().to_string());
     let headers = resp.headers().clone();
 
     let body = match resp.bytes().await {
@@ -492,6 +521,9 @@ pub async fn crawl_feed_report(
                     retry_after_secs: None,
                 },
                 Some(status),
+                None,
+                final_url,
+                None,
                 None,
             );
         }
@@ -506,6 +538,9 @@ pub async fn crawl_feed_report(
             },
             Some(status),
             None,
+            final_url,
+            None,
+            None,
         );
     }
 
@@ -516,7 +551,7 @@ pub async fn crawl_feed_report(
     ingest_cached_feed_report(
         client,
         url,
-        url,
+        final_url.as_deref().unwrap_or(url),
         status,
         &xml,
         Some(&hash),
@@ -659,6 +694,9 @@ mod tests {
             },
             Some(404),
             None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(report.fetch_http_status, Some(404));
@@ -676,11 +714,20 @@ mod tests {
             },
             Some(200),
             Some(&feed_data),
+            Some("https://example.com/feed.xml".to_string()),
+            Some("abc123".to_string()),
+            Some("<rss/>".to_string()),
         );
 
         assert_eq!(report.fetch_http_status, Some(200));
         assert_eq!(report.raw_medium.as_deref(), Some("music"));
         assert_eq!(report.parsed_feed_guid.as_deref(), Some("feed-guid"));
+        assert_eq!(
+            report.final_url.as_deref(),
+            Some("https://example.com/feed.xml")
+        );
+        assert_eq!(report.content_sha256.as_deref(), Some("abc123"));
+        assert_eq!(report.raw_xml.as_deref(), Some("<rss/>"));
     }
 
     #[test]
@@ -689,6 +736,9 @@ mod tests {
             CrawlOutcome::ParseError("invalid xml".to_string()),
             Some(200),
             None,
+            Some("https://example.com/feed.xml".to_string()),
+            Some("abc123".to_string()),
+            Some("<rss/>".to_string()),
         );
 
         assert_eq!(report.fetch_http_status, Some(200));

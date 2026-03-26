@@ -9,6 +9,8 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send,
 {
+    assert!(concurrency > 0, "concurrency must be greater than 0");
+
     let sem = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::with_capacity(tasks.len());
 
@@ -24,6 +26,6 @@ where
     }
 
     for h in handles {
-        let _: Result<(), _> = h.await;
+        h.await.expect("worker task panicked");
     }
 }

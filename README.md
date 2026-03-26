@@ -103,6 +103,8 @@ for multi-gigabyte snapshots.
 | `--state <path>` | `./import_state.db` | Progress cursor database |
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
+| `--audit-output <path>` | off | Optional NDJSON dump of successfully ingested `200 OK` feeds in `feed_audit` format |
+| `--audit-append` | off | Append to `--audit-output` and skip rows already present with the same `feed_guid` + `content_sha256` |
 | `--dry-run` | off | Log without fetching/ingesting |
 | `--skip-known-non-music` | off | Skip rows already known to publish a non-`music`, non-`publisher` medium |
 | `--reset` | off | Clear cursor, restart from 0 |
@@ -115,6 +117,20 @@ deduplicates on content hash.
 `--state` now stores both the batch cursor and durable per-row importer memory
 in `import_feed_memory`, including the latest fetch status, outcome,
 `raw_medium`, and attempt counter for each attempted PodcastIndex row.
+
+Import mode now also guards each feed crawl with a hard deadline. If a feed
+gets stuck below the normal HTTP timeout layer, the importer logs an explicit
+timeout error for that row, records a retryable failure in `import_feed_memory`,
+and continues. Slow batches emit heartbeat lines with the currently pending row
+IDs and URLs instead of going silent.
+
+If `--audit-output` is set, import mode writes only feeds that were actually
+ingested by stophammer to an NDJSON file compatible with the `feed_audit` /
+`audit_import` tooling. That includes newly accepted feeds and `no_change`
+re-submissions of already-ingested feeds. Rejected feeds, parse errors, and
+non-`200` fetches are not written. When `--audit-append` is enabled, the writer
+de-dupes by `source_db.feed_guid` plus `fetch.content_sha256` so reruns do not
+append the same fetched body again.
 
 Operational note:
 

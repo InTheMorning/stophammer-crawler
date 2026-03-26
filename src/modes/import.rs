@@ -1,18 +1,24 @@
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use stophammer_parser::extract_podcast_namespace;
+use stophammer_parser::types::{IngestFeedData, IngestPodcastNamespaceSnapshot};
 use tar::Archive;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
 use crate::pool::run_pool;
@@ -20,6 +26,9 @@ use crate::url_queue::{host_key, interleave_by_host};
 
 const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
+const IMPORT_TASK_HARD_TIMEOUT_SECS: u64 = 45;
+const IMPORT_BATCH_HEARTBEAT_SECS: u64 = 30;
+const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const RESOLVERCTL_BIN_ENV: &str = "RESOLVERCTL_BIN";
 const RESOLVER_DB_PATH_ENV: &str = "RESOLVER_DB_PATH";
@@ -29,6 +38,99 @@ struct CandidateRow {
     id: i64,
     url: String,
     podcast_guid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveImportTask {
+    url: String,
+    started_at: Instant,
+}
+
+struct ActiveImportTaskGuard {
+    active_tasks: Arc<Mutex<BTreeMap<i64, ActiveImportTask>>>,
+    row_id: i64,
+}
+
+impl Drop for ActiveImportTaskGuard {
+    fn drop(&mut self) {
+        self.active_tasks
+            .lock()
+            .expect("active import task mutex poisoned")
+            .remove(&self.row_id);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportAuditRow {
+    source_db: ImportAuditSourceDb,
+    fetched_at: i64,
+    fetch: ImportAuditFetch,
+    raw_xml: String,
+    parsed_feed: Option<IngestFeedData>,
+    podcast_namespace: Option<IngestPodcastNamespaceSnapshot>,
+    parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImportAuditSourceDb {
+    feed_guid: String,
+    feed_url: String,
+    title: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImportAuditFetch {
+    final_url: Option<String>,
+    http_status: Option<u16>,
+    content_sha256: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ImportAuditRecord {
+    source_db: ImportAuditSourceDb,
+    fetched_at: i64,
+    fetch: ImportAuditFetch,
+    raw_xml: String,
+    parsed_feed: Option<IngestFeedData>,
+    podcast_namespace: Option<IngestPodcastNamespaceSnapshot>,
+    parse_error: Option<String>,
+}
+
+impl From<ImportAuditRow> for ImportAuditRecord {
+    fn from(row: ImportAuditRow) -> Self {
+        Self {
+            source_db: row.source_db,
+            fetched_at: row.fetched_at,
+            fetch: row.fetch,
+            raw_xml: row.raw_xml,
+            parsed_feed: row.parsed_feed,
+            podcast_namespace: row.podcast_namespace,
+            parse_error: row.parse_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportAuditDedupeKey {
+    feed_guid: String,
+    content_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingImportAuditRecord {
+    source_db: ExistingImportAuditSourceDb,
+    fetch: ExistingImportAuditFetch,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingImportAuditSourceDb {
+    feed_guid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingImportAuditFetch {
+    content_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,8 +205,18 @@ enum ImportStateCommand {
     Shutdown { ack: oneshot::Sender<()> },
 }
 
+enum ImportAuditCommand {
+    Write(Box<ImportAuditRow>),
+    Shutdown { ack: oneshot::Sender<()> },
+}
+
 struct ImportStateWriter {
     tx: mpsc::Sender<ImportStateCommand>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct ImportAuditWriter {
+    tx: mpsc::Sender<ImportAuditCommand>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -172,9 +284,284 @@ impl ImportStateWriter {
     }
 }
 
+impl ImportAuditWriter {
+    fn spawn(path: &str, append: bool) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let path = path.to_string();
+        let handle = thread::spawn(move || {
+            let seen_keys = load_existing_audit_keys(&path, append);
+            let writer = open_audit_output(&path, append);
+            run_audit_writer_loop(writer, rx, seen_keys);
+        });
+
+        Self {
+            tx,
+            handle: Some(handle),
+        }
+    }
+
+    async fn shutdown(mut self) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(ImportAuditCommand::Shutdown { ack: ack_tx })
+            .expect("import audit writer channel closed unexpectedly");
+        ack_rx
+            .await
+            .expect("import audit writer did not acknowledge shutdown");
+        if let Some(handle) = self.handle.take() {
+            tokio::task::spawn_blocking(move || {
+                handle.join().expect("import audit writer thread panicked");
+            })
+            .await
+            .expect("failed to join import audit writer thread");
+        }
+    }
+}
+
 fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemoryRow) {
     tx.send(ImportStateCommand::UpsertMemory(row))
         .expect("import state writer channel closed unexpectedly");
+}
+
+fn enqueue_import_audit(tx: &mpsc::Sender<ImportAuditCommand>, row: ImportAuditRow) {
+    tx.send(ImportAuditCommand::Write(Box::new(row)))
+        .expect("import audit writer channel closed unexpectedly");
+}
+
+fn open_audit_output(path: &str, append: bool) -> BufWriter<fs::File> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            panic!(
+                "failed to create import audit output directory {}: {e}",
+                parent.display()
+            )
+        });
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)
+        .unwrap_or_else(|e| panic!("failed to open import audit output {path}: {e}"));
+    BufWriter::new(file)
+}
+
+fn load_existing_audit_keys(path: &str, append: bool) -> HashSet<ImportAuditDedupeKey> {
+    if !append || !Path::new(path).is_file() {
+        return HashSet::new();
+    }
+
+    let file = fs::File::open(path)
+        .unwrap_or_else(|e| panic!("failed to open existing import audit output {path}: {e}"));
+    let reader = BufReader::new(file);
+    let mut keys = HashSet::new();
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<ExistingImportAuditRecord>(&line) else {
+            continue;
+        };
+        let Some(content_sha256) = record.fetch.content_sha256 else {
+            continue;
+        };
+        keys.insert(ImportAuditDedupeKey {
+            feed_guid: record.source_db.feed_guid,
+            content_sha256,
+        });
+    }
+
+    keys
+}
+
+fn audit_dedupe_key(row: &ImportAuditRow) -> Option<ImportAuditDedupeKey> {
+    Some(ImportAuditDedupeKey {
+        feed_guid: row.source_db.feed_guid.clone(),
+        content_sha256: row.fetch.content_sha256.clone()?,
+    })
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the writer thread takes ownership of the receiver for the duration of the loop"
+)]
+fn run_audit_writer_loop(
+    mut writer: BufWriter<fs::File>,
+    rx: mpsc::Receiver<ImportAuditCommand>,
+    mut seen_keys: HashSet<ImportAuditDedupeKey>,
+) {
+    while let Ok(command) = rx.recv() {
+        match command {
+            ImportAuditCommand::Write(row) => {
+                if let Some(key) = audit_dedupe_key(&row)
+                    && !seen_keys.insert(key)
+                {
+                    continue;
+                }
+                let record = ImportAuditRecord::from(*row);
+                serde_json::to_writer(&mut writer, &record)
+                    .expect("failed to serialize import audit row");
+                writer
+                    .write_all(b"\n")
+                    .expect("failed to terminate import audit row");
+                writer.flush().expect("failed to flush import audit row");
+            }
+            ImportAuditCommand::Shutdown { ack } => {
+                writer.flush().expect("failed to flush import audit writer");
+                let _ = ack.send(());
+                break;
+            }
+        }
+    }
+}
+
+fn build_import_audit_row(
+    candidate: &CandidateRow,
+    report: &CrawlReport,
+    fetched_at: i64,
+) -> Option<ImportAuditRow> {
+    let raw_xml = report.raw_xml.clone()?;
+    if report.fetch_http_status != Some(200) {
+        return None;
+    }
+
+    if !matches!(
+        report.outcome,
+        CrawlOutcome::Accepted { .. } | CrawlOutcome::NoChange
+    ) {
+        return None;
+    }
+
+    let parsed_feed = report.parsed_feed.clone();
+    let podcast_namespace = extract_podcast_namespace(&raw_xml).ok().flatten();
+    let source_feed_guid = parsed_feed
+        .as_ref()
+        .map(|feed| feed.feed_guid.clone())
+        .or_else(|| candidate.podcast_guid.clone())
+        .unwrap_or_else(|| candidate.url.clone());
+    let title = parsed_feed
+        .as_ref()
+        .map_or_else(|| candidate.url.clone(), |feed| feed.title.clone());
+
+    Some(ImportAuditRow {
+        source_db: ImportAuditSourceDb {
+            feed_guid: source_feed_guid,
+            feed_url: candidate.url.clone(),
+            title,
+        },
+        fetched_at,
+        fetch: ImportAuditFetch {
+            final_url: report.final_url.clone(),
+            http_status: report.fetch_http_status,
+            content_sha256: report.content_sha256.clone(),
+            error: None,
+        },
+        raw_xml,
+        parsed_feed,
+        podcast_namespace,
+        parse_error: None,
+    })
+}
+
+fn begin_active_import_task(
+    active_tasks: &Arc<Mutex<BTreeMap<i64, ActiveImportTask>>>,
+    row: &CandidateRow,
+) -> ActiveImportTaskGuard {
+    active_tasks
+        .lock()
+        .expect("active import task mutex poisoned")
+        .insert(
+            row.id,
+            ActiveImportTask {
+                url: row.url.clone(),
+                started_at: Instant::now(),
+            },
+        );
+
+    ActiveImportTaskGuard {
+        active_tasks: Arc::clone(active_tasks),
+        row_id: row.id,
+    }
+}
+
+fn build_import_timeout_report(timeout_secs: u64) -> CrawlReport {
+    CrawlReport {
+        outcome: CrawlOutcome::FetchError {
+            reason: format!(
+                "import crawl exceeded hard deadline of {timeout_secs}s; marking row as failed"
+            ),
+            retryable: true,
+            retry_after_secs: None,
+        },
+        fetch_http_status: None,
+        raw_medium: None,
+        parsed_feed_guid: None,
+        final_url: None,
+        content_sha256: None,
+        raw_xml: None,
+        parsed_feed: None,
+    }
+}
+
+async fn run_import_batch_heartbeat(
+    batch_start_cursor: i64,
+    batch_max_id: i64,
+    batch_len: usize,
+    active_tasks: Arc<Mutex<BTreeMap<i64, ActiveImportTask>>>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                match changed {
+                    Ok(()) if *stop_rx.borrow() => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            () = tokio::time::sleep(Duration::from_secs(IMPORT_BATCH_HEARTBEAT_SECS)) => {
+                let snapshot = {
+                    let active = active_tasks
+                        .lock()
+                        .expect("active import task mutex poisoned");
+                    active
+                        .iter()
+                        .map(|(id, task)| {
+                            (
+                                *id,
+                                task.url.clone(),
+                                task.started_at.elapsed().as_secs(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                if snapshot.is_empty() {
+                    continue;
+                }
+
+                let oldest_pending_secs = snapshot
+                    .iter()
+                    .map(|(_, _, elapsed_secs)| *elapsed_secs)
+                    .max()
+                    .unwrap_or(0);
+                let pending_sample = snapshot
+                    .iter()
+                    .take(IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE)
+                    .map(|(id, url, elapsed_secs)| format!("id={id} age={elapsed_secs}s {url}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                eprintln!(
+                    "import: batch heartbeat start_cursor={batch_start_cursor} batch_max_id={batch_max_id} batch_len={batch_len} pending={} oldest_pending={}s sample={pending_sample}",
+                    snapshot.len(),
+                    oldest_pending_secs,
+                );
+            }
+        }
+    }
 }
 
 struct ResolverImportGuard {
@@ -634,12 +1021,21 @@ pub async fn run(
     state_path: String,
     batch_size: usize,
     concurrency: usize,
+    audit_output: Option<String>,
+    audit_append: bool,
     skip_known_non_music: bool,
     dry_run: bool,
     reset: bool,
 ) {
     let progress = ProgressStore::open(&state_path);
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
+    let audit_writer = if dry_run {
+        None
+    } else {
+        audit_output
+            .as_deref()
+            .map(|path| ImportAuditWriter::spawn(path, audit_append))
+    };
 
     ensure_snapshot_db(&db_path, &db_url, refresh_db).await;
 
@@ -650,7 +1046,8 @@ pub async fn run(
 
     let mut cursor = progress.get_last_id();
     eprintln!(
-        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s, skip_known_non_music={skip_known_non_music}"
+        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s, skip_known_non_music={skip_known_non_music}, audit_output={}",
+        audit_output.as_deref().unwrap_or("(off)")
     );
 
     let pi_db = Connection::open_with_flags(
@@ -719,11 +1116,21 @@ pub async fn run(
             let no_change = Arc::new(AtomicU64::new(0));
             let errors = Arc::new(AtomicU64::new(0));
             let skipped = Arc::new(AtomicU64::new(0));
+            let active_tasks = Arc::new(Mutex::new(BTreeMap::new()));
+            let (heartbeat_stop_tx, heartbeat_stop_rx) = watch::channel(false);
+            let heartbeat_handle = tokio::spawn(run_import_batch_heartbeat(
+                cursor,
+                batch_max_id,
+                batch_len,
+                Arc::clone(&active_tasks),
+                heartbeat_stop_rx,
+            ));
             let state_tx = state_writer
                 .as_ref()
                 .expect("import state writer missing")
                 .tx
                 .clone();
+            let audit_tx = audit_writer.as_ref().map(|writer| writer.tx.clone());
             let known_memory = Arc::new(known_memory);
 
             let tasks: Vec<_> = batch
@@ -737,6 +1144,8 @@ pub async fn run(
                     let errors = Arc::clone(&errors);
                     let skipped = Arc::clone(&skipped);
                     let state_tx = state_tx.clone();
+                    let audit_tx = audit_tx.clone();
+                    let active_tasks = Arc::clone(&active_tasks);
                     let known_memory = Arc::clone(&known_memory);
                     move || async move {
                         let attempted_at = Utc::now().timestamp();
@@ -754,15 +1163,34 @@ pub async fn run(
                             return;
                         }
 
+                        let _active_guard = begin_active_import_task(&active_tasks, &row);
                         let fallback = row.podcast_guid.as_deref();
-                        let report = crawl_feed_with_import_retries(
-                            &client, &row.url, fallback, &config, row.id,
+                        let report = if let Ok(report) = tokio::time::timeout(
+                            Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
+                            crawl_feed_with_import_retries(
+                                &client, &row.url, fallback, &config, row.id,
+                            ),
                         )
-                        .await;
+                        .await
+                        {
+                            report
+                        } else {
+                            eprintln!(
+                                "  import: ERROR hard timeout after {}s for id={} {}",
+                                IMPORT_TASK_HARD_TIMEOUT_SECS, row.id, row.url,
+                            );
+                            build_import_timeout_report(IMPORT_TASK_HARD_TIMEOUT_SECS)
+                        };
                         let outcome = &report.outcome;
                         let memory_row =
                             ImportMemoryRow::from_crawl_report(&row, &report, attempted_at);
                         enqueue_import_memory(&state_tx, memory_row);
+                        if let Some(audit_tx) = &audit_tx
+                            && let Some(audit_row) =
+                                build_import_audit_row(&row, &report, attempted_at)
+                        {
+                            enqueue_import_audit(audit_tx, audit_row);
+                        }
 
                         match outcome {
                             CrawlOutcome::Accepted { .. } => {
@@ -787,6 +1215,10 @@ pub async fn run(
                 .collect();
 
             run_pool(tasks, concurrency).await;
+            let _ = heartbeat_stop_tx.send(true);
+            heartbeat_handle
+                .await
+                .expect("import batch heartbeat task panicked");
 
             eprintln!(
                 "import: batch done — accepted={} rejected={} no_change={} errors={} skipped={}",
@@ -809,6 +1241,9 @@ pub async fn run(
     if let Some(writer) = state_writer {
         writer.shutdown().await;
     }
+    if let Some(writer) = audit_writer {
+        writer.shutdown().await;
+    }
 
     eprintln!("import: complete — {total_processed} feeds processed");
 }
@@ -816,14 +1251,18 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportMemoryRow, ImportStateWriter, ProgressStore, enqueue_import_memory,
-        extract_snapshot_archive, is_skip_known_non_music, load_known_import_memory,
-        open_state_connection, should_skip_known_row, upsert_import_memory,
+        ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter, ImportMemoryRow,
+        ImportStateWriter, ProgressStore, build_import_audit_row, build_import_timeout_report,
+        enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
+        is_skip_known_non_music, load_known_import_memory, open_state_connection,
+        should_skip_known_row, upsert_import_memory,
     };
+    use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::fs;
     use std::io::{self, Cursor};
+    use stophammer_parser::types::IngestFeedData;
     use tar::{Builder, Header};
     use tempfile::tempdir;
 
@@ -864,6 +1303,53 @@ mod tests {
             raw_medium: raw_medium.map(ToOwned::to_owned),
             parsed_feed_guid: Some(format!("feed-guid-{podcastindex_id}")),
             attempted_at: 1_700_000_000 + podcastindex_id,
+        }
+    }
+
+    fn sample_candidate_row() -> super::CandidateRow {
+        super::CandidateRow {
+            id: 4630863,
+            url: "https://example.com/feed.xml".to_string(),
+            podcast_guid: Some("pi-guid".to_string()),
+        }
+    }
+
+    fn sample_parsed_feed() -> IngestFeedData {
+        IngestFeedData {
+            feed_guid: "feed-guid".to_string(),
+            title: "Feed Title".to_string(),
+            description: None,
+            image_url: None,
+            language: None,
+            explicit: false,
+            itunes_type: None,
+            raw_medium: Some("music".to_string()),
+            author_name: None,
+            owner_name: None,
+            pub_date: None,
+            remote_items: Vec::new(),
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            podcast_namespace: None,
+            feed_payment_routes: Vec::new(),
+            live_items: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
+
+    fn sample_audit_report() -> CrawlReport {
+        CrawlReport {
+            outcome: CrawlOutcome::Accepted {
+                warnings: Vec::new(),
+            },
+            fetch_http_status: Some(200),
+            raw_medium: Some("music".to_string()),
+            parsed_feed_guid: Some("feed-guid".to_string()),
+            final_url: Some("https://cdn.example.com/final.xml".to_string()),
+            content_sha256: Some("abc123".to_string()),
+            raw_xml: Some("<rss/>".to_string()),
+            parsed_feed: Some(sample_parsed_feed()),
         }
     }
 
@@ -1033,5 +1519,182 @@ mod tests {
 
         assert_eq!(stored_attempts, 1);
         assert_eq!(cursor, "99");
+    }
+
+    #[test]
+    fn build_import_audit_row_uses_feed_audit_shape_for_200_fetches() {
+        let candidate = sample_candidate_row();
+        let report = sample_audit_report();
+
+        let row = build_import_audit_row(&candidate, &report, 1_700_000_000)
+            .expect("expected audit row for 200 fetch");
+
+        assert_eq!(row.source_db.feed_guid, "feed-guid");
+        assert_eq!(row.source_db.feed_url, "https://example.com/feed.xml");
+        assert_eq!(row.source_db.title, "Feed Title");
+        assert_eq!(
+            row.fetch.final_url.as_deref(),
+            Some("https://cdn.example.com/final.xml")
+        );
+        assert_eq!(row.fetch.http_status, Some(200));
+        assert_eq!(row.fetch.content_sha256.as_deref(), Some("abc123"));
+        assert_eq!(row.raw_xml, "<rss/>");
+        assert!(row.parsed_feed.is_some());
+        assert_eq!(row.parse_error, None);
+    }
+
+    #[test]
+    fn build_import_audit_row_skips_parse_errors_for_200_bodies() {
+        let candidate = sample_candidate_row();
+        let report = CrawlReport {
+            outcome: CrawlOutcome::ParseError("invalid xml".to_string()),
+            fetch_http_status: Some(200),
+            raw_medium: None,
+            parsed_feed_guid: None,
+            final_url: Some("https://example.com/feed.xml".to_string()),
+            content_sha256: Some("abc123".to_string()),
+            raw_xml: Some("<rss/>".to_string()),
+            parsed_feed: None,
+        };
+
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn build_import_audit_row_skips_non_200_fetches() {
+        let candidate = sample_candidate_row();
+        let report = CrawlReport {
+            outcome: CrawlOutcome::FetchError {
+                reason: "http 404 Not Found".to_string(),
+                retryable: false,
+                retry_after_secs: None,
+            },
+            fetch_http_status: Some(404),
+            raw_medium: None,
+            parsed_feed_guid: None,
+            final_url: Some("https://example.com/feed.xml".to_string()),
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+        };
+
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn build_import_audit_row_keeps_no_change_feeds() {
+        let candidate = sample_candidate_row();
+        let mut report = sample_audit_report();
+        report.outcome = CrawlOutcome::NoChange;
+
+        let row = build_import_audit_row(&candidate, &report, 1_700_000_000)
+            .expect("expected audit row for no_change");
+
+        assert_eq!(row.fetch.error, None);
+        assert_eq!(row.parse_error, None);
+    }
+
+    #[tokio::test]
+    async fn audit_writer_persists_ndjson_rows() {
+        let tempdir = tempdir().expect("tempdir");
+        let output_path = tempdir.path().join("feed_audit.ndjson");
+        let writer = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), false);
+        let row = ImportAuditRow {
+            source_db: ImportAuditSourceDb {
+                feed_guid: "feed-guid".to_string(),
+                feed_url: "https://example.com/feed.xml".to_string(),
+                title: "Feed Title".to_string(),
+            },
+            fetched_at: 1_700_000_000,
+            fetch: ImportAuditFetch {
+                final_url: Some("https://example.com/feed.xml".to_string()),
+                http_status: Some(200),
+                content_sha256: Some("abc123".to_string()),
+                error: None,
+            },
+            raw_xml: "<rss/>".to_string(),
+            parsed_feed: None,
+            podcast_namespace: None,
+            parse_error: None,
+        };
+
+        enqueue_import_audit(&writer.tx, row);
+        writer.shutdown().await;
+
+        let written = fs::read_to_string(output_path).expect("read audit output");
+        assert!(written.contains("\"raw_xml\":\"<rss/>\""));
+        assert!(written.contains("\"feed_guid\":\"feed-guid\""));
+    }
+
+    #[tokio::test]
+    async fn audit_writer_append_dedupes_existing_rows_by_feed_guid_and_hash() {
+        let tempdir = tempdir().expect("tempdir");
+        let output_path = tempdir.path().join("feed_audit.ndjson");
+        fs::write(
+            &output_path,
+            "{\"source_db\":{\"feed_guid\":\"feed-guid\"},\"fetch\":{\"content_sha256\":\"abc123\"}}\n",
+        )
+        .expect("seed existing audit file");
+
+        let writer = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), true);
+        let duplicate_row = ImportAuditRow {
+            source_db: ImportAuditSourceDb {
+                feed_guid: "feed-guid".to_string(),
+                feed_url: "https://example.com/feed.xml".to_string(),
+                title: "Feed Title".to_string(),
+            },
+            fetched_at: 1_700_000_000,
+            fetch: ImportAuditFetch {
+                final_url: Some("https://example.com/feed.xml".to_string()),
+                http_status: Some(200),
+                content_sha256: Some("abc123".to_string()),
+                error: None,
+            },
+            raw_xml: "<rss/>".to_string(),
+            parsed_feed: None,
+            podcast_namespace: None,
+            parse_error: None,
+        };
+        let distinct_row = ImportAuditRow {
+            source_db: ImportAuditSourceDb {
+                feed_guid: "feed-guid".to_string(),
+                feed_url: "https://example.com/feed.xml".to_string(),
+                title: "Feed Title".to_string(),
+            },
+            fetched_at: 1_700_000_001,
+            fetch: ImportAuditFetch {
+                final_url: Some("https://example.com/feed.xml".to_string()),
+                http_status: Some(200),
+                content_sha256: Some("def456".to_string()),
+                error: None,
+            },
+            raw_xml: "<rss version=\"2.0\"/>".to_string(),
+            parsed_feed: None,
+            podcast_namespace: None,
+            parse_error: None,
+        };
+
+        enqueue_import_audit(&writer.tx, duplicate_row);
+        enqueue_import_audit(&writer.tx, distinct_row);
+        writer.shutdown().await;
+
+        let written = fs::read_to_string(output_path).expect("read audit output");
+        assert_eq!(written.lines().count(), 2);
+        assert!(written.contains("\"content_sha256\":\"abc123\""));
+        assert!(written.contains("\"content_sha256\":\"def456\""));
+    }
+
+    #[test]
+    fn build_import_timeout_report_marks_row_retryable() {
+        let report = build_import_timeout_report(45);
+
+        assert_eq!(report.fetch_http_status, None);
+        assert_eq!(report.raw_medium, None);
+        assert!(report.is_retryable());
+        assert_eq!(report.outcome.label(), "fetch_error");
+        assert_eq!(
+            report.outcome.reason(),
+            Some("import crawl exceeded hard deadline of 45s; marking row as failed")
+        );
     }
 }
