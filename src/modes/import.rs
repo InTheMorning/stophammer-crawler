@@ -24,9 +24,8 @@ use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
 
-const IMPORT_FETCH_ATTEMPTS: u32 = 2;
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
-const IMPORT_TASK_HARD_TIMEOUT_SECS: u64 = 45;
+const IMPORT_TASK_HARD_TIMEOUT_SECS: u64 = 15;
 const IMPORT_BATCH_HEARTBEAT_SECS: u64 = 30;
 const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -136,6 +135,8 @@ struct ExistingImportAuditFetch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KnownImportMemory {
     fetch_http_status: Option<u16>,
+    fetch_outcome: String,
+    outcome_reason: Option<String>,
     raw_medium: Option<String>,
     parsed_feed_guid: Option<String>,
 }
@@ -152,6 +153,7 @@ struct ImportMemoryRow {
     raw_medium: Option<String>,
     parsed_feed_guid: Option<String>,
     attempted_at: i64,
+    attempt_duration_ms: i64,
 }
 
 impl ImportMemoryRow {
@@ -159,6 +161,7 @@ impl ImportMemoryRow {
         candidate: &CandidateRow,
         report: &CrawlReport,
         attempted_at: i64,
+        attempt_duration_ms: i64,
     ) -> Self {
         Self {
             podcastindex_id: candidate.id,
@@ -171,6 +174,7 @@ impl ImportMemoryRow {
             raw_medium: report.raw_medium.clone(),
             parsed_feed_guid: report.parsed_feed_guid.clone(),
             attempted_at,
+            attempt_duration_ms,
         }
     }
 
@@ -178,9 +182,15 @@ impl ImportMemoryRow {
         candidate: &CandidateRow,
         known: &KnownImportMemory,
         attempted_at: i64,
+        attempt_duration_ms: i64,
     ) -> Self {
         let outcome_reason = known.raw_medium.as_ref().map_or_else(
-            || Some("known irrelevant medium".to_string()),
+            || {
+                known
+                    .outcome_reason
+                    .clone()
+                    .or_else(|| Some("known medium-gate rejection".to_string()))
+            },
             |raw_medium| Some(format!("known raw_medium={raw_medium}")),
         );
 
@@ -195,6 +205,7 @@ impl ImportMemoryRow {
             raw_medium: known.raw_medium.clone(),
             parsed_feed_guid: known.parsed_feed_guid.clone(),
             attempted_at,
+            attempt_duration_ms,
         }
     }
 }
@@ -635,13 +646,8 @@ impl ProgressStore {
             .unwrap_or(0)
     }
 
-    fn reset(&self) {
-        self.conn
-            .execute(
-                "DELETE FROM import_progress WHERE key = 'last_processed_id'",
-                [],
-            )
-            .expect("failed to reset cursor");
+    fn set_last_id(&self, id: i64) {
+        set_last_processed_id(&self.conn, id).expect("failed to override import cursor");
     }
 
     fn known_memory_for_ids(
@@ -670,6 +676,7 @@ fn initialize_state_schema(conn: &Connection) {
             parsed_feed_guid   TEXT,
             first_attempted_at INTEGER NOT NULL,
             last_attempted_at  INTEGER NOT NULL,
+            attempt_duration_ms INTEGER NOT NULL DEFAULT 0,
             attempt_count      INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_import_feed_memory_status
@@ -678,6 +685,21 @@ fn initialize_state_schema(conn: &Connection) {
             ON import_feed_memory(raw_medium);",
     )
     .expect("failed to initialize import state schema");
+
+    let has_attempt_duration_ms = conn
+        .prepare("PRAGMA table_info(import_feed_memory)")
+        .expect("failed to prepare import_feed_memory table_info pragma")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("failed to inspect import_feed_memory schema")
+        .filter_map(Result::ok)
+        .any(|column| column == "attempt_duration_ms");
+    if !has_attempt_duration_ms {
+        conn.execute(
+            "ALTER TABLE import_feed_memory ADD COLUMN attempt_duration_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .expect("failed to add attempt_duration_ms to import_feed_memory");
+    }
 }
 
 fn open_state_connection(path: &str) -> Connection {
@@ -723,8 +745,9 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             parsed_feed_guid,
             first_attempted_at,
             last_attempted_at,
+            attempt_duration_ms,
             attempt_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 1)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1)
         ON CONFLICT(podcastindex_id) DO UPDATE SET
             feed_url = excluded.feed_url,
             podcastindex_guid = excluded.podcastindex_guid,
@@ -735,6 +758,7 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             raw_medium = excluded.raw_medium,
             parsed_feed_guid = excluded.parsed_feed_guid,
             last_attempted_at = excluded.last_attempted_at,
+            attempt_duration_ms = excluded.attempt_duration_ms,
             attempt_count = import_feed_memory.attempt_count + 1",
         params![
             row.podcastindex_id,
@@ -747,6 +771,7 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             row.raw_medium,
             row.parsed_feed_guid,
             row.attempted_at,
+            row.attempt_duration_ms,
         ],
     )
 }
@@ -763,7 +788,7 @@ fn load_known_import_memory(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT podcastindex_id, fetch_http_status, raw_medium, parsed_feed_guid
+        "SELECT podcastindex_id, fetch_http_status, fetch_outcome, outcome_reason, raw_medium, parsed_feed_guid
          FROM import_feed_memory
          WHERE podcastindex_id IN ({placeholders})"
     );
@@ -776,8 +801,10 @@ fn load_known_import_memory(
                 row.get::<_, i64>(0)?,
                 KnownImportMemory {
                     fetch_http_status: row.get(1)?,
-                    raw_medium: row.get(2)?,
-                    parsed_feed_guid: row.get(3)?,
+                    fetch_outcome: row.get(2)?,
+                    outcome_reason: row.get(3)?,
+                    raw_medium: row.get(4)?,
+                    parsed_feed_guid: row.get(5)?,
                 },
             ))
         })
@@ -790,13 +817,24 @@ fn is_skip_known_non_music(raw_medium: &str) -> bool {
     !raw_medium.eq_ignore_ascii_case("music") && !raw_medium.eq_ignore_ascii_case("publisher")
 }
 
+fn is_known_medium_gate_rejection(known: &KnownImportMemory) -> bool {
+    matches!(
+        known.fetch_outcome.as_str(),
+        "rejected" | "skipped_known_irrelevant"
+    ) && known
+        .outcome_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("[medium_music]"))
+}
+
 fn should_skip_known_row(known: Option<&KnownImportMemory>) -> bool {
     known.is_some_and(|memory| {
         memory.fetch_http_status == Some(200)
-            && memory
+            && (memory
                 .raw_medium
                 .as_deref()
                 .is_some_and(is_skip_known_non_music)
+                || is_known_medium_gate_rejection(memory))
     })
 }
 
@@ -980,34 +1018,6 @@ async fn ensure_snapshot_db(db_path: &str, db_url: &str, refresh_db: bool) {
     });
 }
 
-async fn crawl_feed_with_import_retries(
-    client: &reqwest::Client,
-    url: &str,
-    fallback_guid: Option<&str>,
-    config: &CrawlConfig,
-    row_id: i64,
-) -> CrawlReport {
-    let mut attempt = 1;
-
-    loop {
-        let report = crawl_feed_report(client, url, fallback_guid, config).await;
-        match &report {
-            report if report.is_retryable() && attempt < IMPORT_FETCH_ATTEMPTS => {
-                let backoff = report
-                    .retry_delay(attempt)
-                    .unwrap_or_else(|| Duration::from_secs(1_u64 << (attempt - 1)));
-                eprintln!(
-                    "  import: retrying crawl after attempt {attempt}/{IMPORT_FETCH_ATTEMPTS} for id={row_id} {url}: {}",
-                    report.outcome
-                );
-                tokio::time::sleep(backoff).await;
-                attempt += 1;
-            }
-            _ => return report,
-        }
-    }
-}
-
 #[allow(
     clippy::too_many_arguments,
     clippy::fn_params_excessive_bools,
@@ -1025,7 +1035,7 @@ pub async fn run(
     audit_append: bool,
     skip_known_non_music: bool,
     dry_run: bool,
-    reset: bool,
+    cursor_override: Option<i64>,
 ) {
     let progress = ProgressStore::open(&state_path);
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
@@ -1039,12 +1049,16 @@ pub async fn run(
 
     ensure_snapshot_db(&db_path, &db_url, refresh_db).await;
 
-    if reset {
-        progress.reset();
-        eprintln!("import: cursor reset to 0");
+    let mut cursor = cursor_override.unwrap_or_else(|| progress.get_last_id());
+    if let Some(override_cursor) = cursor_override {
+        eprintln!("import: cursor override to {override_cursor}");
+        if dry_run {
+            eprintln!("import: dry-run leaves stored cursor unchanged");
+        } else {
+            progress.set_last_id(override_cursor);
+        }
     }
 
-    let mut cursor = progress.get_last_id();
     eprintln!(
         "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s, skip_known_non_music={skip_known_non_music}, audit_output={}",
         audit_output.as_deref().unwrap_or("(off)")
@@ -1149,6 +1163,7 @@ pub async fn run(
                     let known_memory = Arc::clone(&known_memory);
                     move || async move {
                         let attempted_at = Utc::now().timestamp();
+                        let task_started_at = Instant::now();
                         if should_skip_known_row(known_memory.get(&row.id)) {
                             skipped.fetch_add(1, Ordering::Relaxed);
                             let memory_row = ImportMemoryRow::skipped_known_irrelevant(
@@ -1157,6 +1172,8 @@ pub async fn run(
                                     .get(&row.id)
                                     .expect("known memory missing for skipped row"),
                                 attempted_at,
+                                i64::try_from(task_started_at.elapsed().as_millis())
+                                    .expect("skip attempt duration exceeded i64"),
                             );
                             enqueue_import_memory(&state_tx, memory_row);
                             eprintln!("  skipped_known_irrelevant: id={} {}", row.id, row.url);
@@ -1167,9 +1184,7 @@ pub async fn run(
                         let fallback = row.podcast_guid.as_deref();
                         let report = if let Ok(report) = tokio::time::timeout(
                             Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
-                            crawl_feed_with_import_retries(
-                                &client, &row.url, fallback, &config, row.id,
-                            ),
+                            crawl_feed_report(&client, &row.url, fallback, &config),
                         )
                         .await
                         {
@@ -1182,8 +1197,13 @@ pub async fn run(
                             build_import_timeout_report(IMPORT_TASK_HARD_TIMEOUT_SECS)
                         };
                         let outcome = &report.outcome;
-                        let memory_row =
-                            ImportMemoryRow::from_crawl_report(&row, &report, attempted_at);
+                        let memory_row = ImportMemoryRow::from_crawl_report(
+                            &row,
+                            &report,
+                            attempted_at,
+                            i64::try_from(task_started_at.elapsed().as_millis())
+                                .expect("attempt duration exceeded i64"),
+                        );
                         enqueue_import_memory(&state_tx, memory_row);
                         if let Some(audit_tx) = &audit_tx
                             && let Some(audit_row) =
@@ -1289,6 +1309,7 @@ mod tests {
         podcastindex_id: i64,
         fetch_http_status: Option<u16>,
         fetch_outcome: &str,
+        outcome_reason: Option<&str>,
         retryable: bool,
         raw_medium: Option<&str>,
     ) -> ImportMemoryRow {
@@ -1298,11 +1319,12 @@ mod tests {
             podcastindex_guid: Some(format!("pi-guid-{podcastindex_id}")),
             fetch_http_status,
             fetch_outcome: fetch_outcome.to_string(),
-            outcome_reason: None,
+            outcome_reason: outcome_reason.map(ToOwned::to_owned),
             retryable,
             raw_medium: raw_medium.map(ToOwned::to_owned),
             parsed_feed_guid: Some(format!("feed-guid-{podcastindex_id}")),
             attempted_at: 1_700_000_000 + podcastindex_id,
+            attempt_duration_ms: 1_000 + podcastindex_id,
         }
     }
 
@@ -1416,27 +1438,56 @@ mod tests {
     }
 
     #[test]
+    fn progress_store_adds_attempt_duration_column() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let store = ProgressStore::open(state_path.to_str().expect("utf-8 path"));
+
+        let has_attempt_duration_ms = store
+            .conn
+            .prepare("PRAGMA table_info(import_feed_memory)")
+            .expect("prepare pragma")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query pragma")
+            .filter_map(Result::ok)
+            .any(|column| column == "attempt_duration_ms");
+
+        assert!(
+            has_attempt_duration_ms,
+            "expected import_feed_memory to expose attempt_duration_ms"
+        );
+    }
+
+    #[test]
     fn upsert_import_memory_stores_status_and_medium() {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
-        let row = sample_memory_row(4630863, Some(200), "accepted", false, Some("music"));
+        let row = sample_memory_row(4630863, Some(200), "accepted", None, false, Some("music"));
 
         upsert_import_memory(&conn, &row).expect("upsert import memory");
 
-        let stored: (Option<u16>, String, Option<String>) = conn
+        let stored: (Option<u16>, String, Option<String>, i64) = conn
             .query_row(
-                "SELECT fetch_http_status, fetch_outcome, raw_medium
+                "SELECT fetch_http_status, fetch_outcome, raw_medium, attempt_duration_ms
                  FROM import_feed_memory
                  WHERE podcastindex_id = ?1",
                 [row.podcastindex_id],
-                |db_row| Ok((db_row.get(0)?, db_row.get(1)?, db_row.get(2)?)),
+                |db_row| {
+                    Ok((
+                        db_row.get(0)?,
+                        db_row.get(1)?,
+                        db_row.get(2)?,
+                        db_row.get(3)?,
+                    ))
+                },
             )
             .expect("query stored import memory");
 
         assert_eq!(stored.0, Some(200));
         assert_eq!(stored.1, "accepted");
         assert_eq!(stored.2.as_deref(), Some("music"));
+        assert_eq!(stored.3, row.attempt_duration_ms);
     }
 
     #[test]
@@ -1444,24 +1495,25 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
-        let first = sample_memory_row(4630863, Some(404), "fetch_error", false, None);
-        let second = sample_memory_row(4630863, Some(429), "fetch_error", true, None);
+        let first = sample_memory_row(4630863, Some(404), "fetch_error", None, false, None);
+        let second = sample_memory_row(4630863, Some(429), "fetch_error", None, true, None);
 
         upsert_import_memory(&conn, &first).expect("first upsert");
         upsert_import_memory(&conn, &second).expect("second upsert");
 
-        let stored: (Option<u16>, i64) = conn
+        let stored: (Option<u16>, i64, i64) = conn
             .query_row(
-                "SELECT fetch_http_status, attempt_count
+                "SELECT fetch_http_status, attempt_count, attempt_duration_ms
                  FROM import_feed_memory
                  WHERE podcastindex_id = ?1",
                 [first.podcastindex_id],
-                |db_row| Ok((db_row.get(0)?, db_row.get(1)?)),
+                |db_row| Ok((db_row.get(0)?, db_row.get(1)?, db_row.get(2)?)),
             )
             .expect("query attempt count");
 
         assert_eq!(stored.0, Some(429));
         assert_eq!(stored.1, 2, "expected retry to increment attempt_count");
+        assert_eq!(stored.2, second.attempt_duration_ms);
     }
 
     #[test]
@@ -1469,18 +1521,81 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
-        let known_non_music = sample_memory_row(10, Some(200), "accepted", false, Some("podcast"));
+        let known_non_music =
+            sample_memory_row(10, Some(200), "accepted", None, false, Some("podcast"));
         let known_publisher =
-            sample_memory_row(11, Some(200), "accepted", false, Some("publisher"));
+            sample_memory_row(11, Some(200), "accepted", None, false, Some("publisher"));
+        let known_medium_absent = sample_memory_row(
+            12,
+            Some(200),
+            "rejected",
+            Some("[medium_music] podcast:medium absent — must be 'music' or 'publisher'"),
+            false,
+            None,
+        );
+        let unrelated_rejection = sample_memory_row(
+            13,
+            Some(200),
+            "rejected",
+            Some("[other_gate] some other reason"),
+            false,
+            None,
+        );
 
         upsert_import_memory(&conn, &known_non_music).expect("upsert non-music row");
         upsert_import_memory(&conn, &known_publisher).expect("upsert publisher row");
+        upsert_import_memory(&conn, &known_medium_absent).expect("upsert medium-absent row");
+        upsert_import_memory(&conn, &unrelated_rejection).expect("upsert unrelated rejection");
 
-        let lookup = load_known_import_memory(&conn, &[10, 11, 12]);
+        let lookup = load_known_import_memory(&conn, &[10, 11, 12, 13, 14]);
 
         assert!(should_skip_known_row(lookup.get(&10)));
         assert!(!should_skip_known_row(lookup.get(&11)));
-        assert!(!should_skip_known_row(lookup.get(&12)));
+        assert!(should_skip_known_row(lookup.get(&12)));
+        assert!(!should_skip_known_row(lookup.get(&13)));
+        assert!(!should_skip_known_row(lookup.get(&14)));
+    }
+
+    #[test]
+    fn medium_gate_rejections_with_absent_medium_are_skipped() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let known_medium_absent = sample_memory_row(
+            22,
+            Some(200),
+            "rejected",
+            Some("[medium_music] podcast:medium absent — must be 'music' or 'publisher'"),
+            false,
+            None,
+        );
+
+        upsert_import_memory(&conn, &known_medium_absent).expect("upsert medium-absent row");
+
+        let lookup = load_known_import_memory(&conn, &[22]);
+
+        assert!(should_skip_known_row(lookup.get(&22)));
+    }
+
+    #[test]
+    fn skipped_medium_gate_rows_remain_skippable_on_future_runs() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let skipped_medium_absent = sample_memory_row(
+            23,
+            Some(200),
+            "skipped_known_irrelevant",
+            Some("[medium_music] podcast:medium absent — must be 'music' or 'publisher'"),
+            false,
+            None,
+        );
+
+        upsert_import_memory(&conn, &skipped_medium_absent).expect("upsert skipped row");
+
+        let lookup = load_known_import_memory(&conn, &[23]);
+
+        assert!(should_skip_known_row(lookup.get(&23)));
     }
 
     #[test]
@@ -1495,7 +1610,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let writer = ImportStateWriter::spawn(state_path.to_str().expect("utf-8 path"));
-        let row = sample_memory_row(99, Some(429), "fetch_error", true, None);
+        let row = sample_memory_row(99, Some(429), "fetch_error", None, true, None);
 
         enqueue_import_memory(&writer.tx, row.clone());
         writer.set_last_id(99).await;
@@ -1686,7 +1801,7 @@ mod tests {
 
     #[test]
     fn build_import_timeout_report_marks_row_retryable() {
-        let report = build_import_timeout_report(45);
+        let report = build_import_timeout_report(15);
 
         assert_eq!(report.fetch_http_status, None);
         assert_eq!(report.raw_medium, None);
@@ -1694,7 +1809,7 @@ mod tests {
         assert_eq!(report.outcome.label(), "fetch_error");
         assert_eq!(
             report.outcome.reason(),
-            Some("import crawl exceeded hard deadline of 45s; marking row as failed")
+            Some("import crawl exceeded hard deadline of 15s; marking row as failed")
         );
     }
 }

@@ -164,11 +164,6 @@ impl CrawlReport {
     pub fn is_retryable(&self) -> bool {
         self.outcome.is_retryable()
     }
-
-    #[must_use]
-    pub fn retry_delay(&self, attempt: u32) -> Option<Duration> {
-        self.outcome.retry_delay(attempt)
-    }
 }
 
 #[derive(serde::Deserialize)]

@@ -86,6 +86,16 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
   --batch 100 --concurrency 5
 ```
 
+Restart or resume from an explicit `PodcastIndex` id:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
+  --cursor 5000000 \
+  --batch 100 --concurrency 5
+```
+
 If `--db` does not exist yet, the importer downloads the latest PodcastIndex
 snapshot archive from `https://public.podcastindex.org/podcastindex_feeds.db.tgz`,
 extracts the `.db` directly into place, and does not keep the `.tgz` on disk.
@@ -106,23 +116,27 @@ for multi-gigabyte snapshots.
 | `--audit-output <path>` | off | Optional NDJSON dump of successfully ingested `200 OK` feeds in `feed_audit` format |
 | `--audit-append` | off | Append to `--audit-output` and skip rows already present with the same `feed_guid` + `content_sha256` |
 | `--dry-run` | off | Log without fetching/ingesting |
-| `--skip-known-non-music` | off | Skip rows already known to publish a non-`music`, non-`publisher` medium |
-| `--reset` | off | Clear cursor, restart from 0 |
+| `--skip-known-non-music` | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
+| `--cursor <id>` | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
 
 Progress is stored in `--state`. If the process is interrupted,
 the next run resumes from the last completed batch. A crash
 mid-batch re-processes that batch -- safe because stophammer
-deduplicates on content hash.
+deduplicates on content hash. `--cursor <id>` overrides the stored
+starting point for that run; in non-dry runs the override is also
+persisted to the state DB before the batch loop starts.
 
 `--state` now stores both the batch cursor and durable per-row importer memory
 in `import_feed_memory`, including the latest fetch status, outcome,
-`raw_medium`, and attempt counter for each attempted PodcastIndex row.
+`raw_medium`, `attempt_duration_ms`, and attempt counter for each attempted
+PodcastIndex row.
 
 Import mode now also guards each feed crawl with a hard deadline. If a feed
 gets stuck below the normal HTTP timeout layer, the importer logs an explicit
 timeout error for that row, records a retryable failure in `import_feed_memory`,
-and continues. Slow batches emit heartbeat lines with the currently pending row
-IDs and URLs instead of going silent.
+and continues. Import mode does not retry failed rows within the same run; the
+state DB is the retry/memory mechanism. Slow batches emit heartbeat lines with
+the currently pending row IDs and URLs instead of going silent.
 
 If `--audit-output` is set, import mode writes only feeds that were actually
 ingested by stophammer to an NDJSON file compatible with the `feed_audit` /

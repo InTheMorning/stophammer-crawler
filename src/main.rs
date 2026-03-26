@@ -16,6 +16,16 @@ fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+fn parse_non_negative_i64(raw: &str) -> Result<i64, String> {
+    let value = raw
+        .parse::<i64>()
+        .map_err(|err| format!("expected a non-negative integer: {err}"))?;
+    if value < 0 {
+        return Err("value must be greater than or equal to 0".to_string());
+    }
+    Ok(value)
+}
+
 #[derive(Parser)]
 #[command(name = "stophammer-crawler", about = "Unified RSS feed crawler")]
 struct Cli {
@@ -92,9 +102,9 @@ enum Mode {
         #[arg(long)]
         dry_run: bool,
 
-        /// Clear resume cursor and start from id=0
-        #[arg(long)]
-        reset: bool,
+        /// Start from an explicit `PodcastIndex` id instead of the stored cursor
+        #[arg(long, value_parser = parse_non_negative_i64)]
+        cursor: Option<i64>,
     },
 
     /// Listen to Podping WebSocket stream for music feeds
@@ -172,7 +182,7 @@ async fn main() {
             audit_append,
             skip_known_non_music,
             dry_run,
-            reset,
+            cursor,
         } => {
             modes::import::run(
                 db,
@@ -185,7 +195,7 @@ async fn main() {
                 audit_append,
                 skip_known_non_music,
                 dry_run,
-                reset,
+                cursor,
             )
             .await;
         }
