@@ -35,6 +35,8 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml \
   --bin audit_analyzer -- --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml \
   --bin audit_import -- --help
+cargo run --manifest-path stophammer-crawler/Cargo.toml \
+  --bin musicl_backfill -- --help
 ```
 
 Or build binaries once:
@@ -348,6 +350,7 @@ Available binaries:
 - `cargo run --bin feed_audit -- ...`
 - `cargo run --bin audit_analyzer -- ...`
 - `cargo run --bin audit_import -- ...`
+- `cargo run --bin musicl_backfill -- ...`
 
 By default:
 
@@ -364,6 +367,9 @@ By default:
   resume cursor
 - `audit_import` retries transient ingest throttles / failures such as `429`
   before counting the row as an ingest error
+- `musicl_backfill` scans crawler import state DBs for successful `musicL`
+  discoveries, compares them against `stophammer.db`, and re-fetches only the
+  missing feeds through the normal ingest path
 - `crawl` writes retryable feed URLs to `./failed_feeds.txt` unless you
   override `--failed-feeds-output`
 - `crawl` also spaces requests per host (`--host-delay-ms`, default `1500`) and
@@ -401,6 +407,20 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
   --input ./analysis/data/feed_audit.ndjson \
   --reset
 
+# Dry-run musicL backfill from crawler state DBs
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin musicl_backfill -- \
+  --stophammer-db ./stophammer.db \
+  --dry-run
+
+# Real musicL backfill
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml --bin musicl_backfill -- \
+  --stophammer-db ./stophammer.db \
+  --concurrency 5
+
 # Live crawl with per-host spacing and retry dumps
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
@@ -409,6 +429,47 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl \
   --host-delay-ms 1500 \
   --failed-feeds-output ./failed_feeds.txt \
   ./feeds.txt
+```
+
+If `--state-db` is omitted, `musicl_backfill` scans:
+
+- `./import_state.db`
+- `./import_state_wavlake.db`
+
+Candidate selection is intentionally narrow:
+
+- `fetch_http_status = 200`
+- `lower(raw_medium) = 'musicl'`
+- `parsed_feed_guid IS NOT NULL`
+- feed GUID not already present in `stophammer.db`
+
+`musicl_backfill` reads crawler state DBs only; it does not mutate importer
+progress. It dedupes candidates by parsed feed GUID across state DBs, re-fetches
+only missing candidate URLs through the normal crawl+ingest path, and uses a
+short fetch timeout plus a hard per-feed deadline so bad hosts do not stall the
+run indefinitely.
+
+Useful verification queries:
+
+```bash
+sqlite3 ./import_state.db "
+SELECT COUNT(*)
+FROM import_feed_memory
+WHERE fetch_http_status = 200
+  AND lower(raw_medium) = 'musicl'
+  AND parsed_feed_guid IS NOT NULL;"
+```
+
+```bash
+sqlite3 ./stophammer.db "SELECT COUNT(*) FROM feeds WHERE lower(raw_medium) = 'musicl';"
+```
+
+```bash
+sqlite3 ./stophammer.db "
+SELECT COUNT(*)
+FROM resolver_queue rq
+JOIN feeds f ON f.feed_guid = rq.feed_guid
+WHERE lower(f.raw_medium) = 'musicl';"
 ```
 
 ## Docker

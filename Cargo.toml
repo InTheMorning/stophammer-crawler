@@ -21,6 +21,10 @@ path = "analysis/bin/audit_import.rs"
 name = "audit_expand_publishers"
 path = "analysis/bin/audit_expand_publishers.rs"
 
+[[bin]]
+name = "musicl_backfill"
+path = "analysis/bin/musicl_backfill.rs"
+
 [dependencies]
 stophammer-parser = { path = "../stophammer-parser" }
 tokio       = { version = "1", features = ["full"] }
