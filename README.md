@@ -5,11 +5,10 @@ V4V music index. Fetches RSS feeds, hashes content, parses with
 [stophammer-parser](https://github.com/dardevelin/stophammer-parser) as a native
 library, and submits results to a stophammer node's `/ingest/feed` endpoint.
 
-Four subcommands cover every discovery path:
+Three subcommands cover every discovery path:
 
 - **crawl** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
-- **podping** — long-running WebSocket listener for real-time discovery
 - **gossip** — long-running gossip-listener SSE consumer with optional archive replay
 
 ## Requirements
@@ -25,7 +24,6 @@ From this checkout:
 # Operational crawler modes
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- import --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- podping --help
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- gossip --help
 
 # Analysis / replay tools
@@ -184,59 +182,6 @@ Operational note:
 - `--refresh-db` temporarily needs room for both the existing `.db` and the new
   replacement `.db` while the importer swaps them safely
 
-### podping
-
-Listen to the Podping WebSocket stream for music feed updates:
-
-```bash
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  podping --concurrency 3
-```
-
-Filters: accepts `medium=music` or absent medium; drops `reason=newValueBlock`.
-Includes in-memory dedup with cooldown to avoid re-crawling the same URL within
-5 minutes (30 minutes for spammy feeds). Reconnects with exponential backoff
-(1s to 60s) on disconnect.
-
-Replay support:
-
-- `--block <n>` starts catch-up from an explicit Hive block number
-- `--old <hours>` computes a Hive catch-up start block from the current head
-- `--time <rfc3339>` computes a Hive catch-up start block from a timestamp
-- `--state <path>` stores the latest seen Podping block cursor
-
-If no replay flag is provided and there is no stored cursor yet, Podping starts
-from the beginning of the previous Sunday in UTC, converted to an estimated
-block using the current Hive head block.
-
-Important:
-
-- historical catch-up is done against the Hive APIs, following the upstream
-  `podping-hivewatcher` model
-- the Livewire websocket is used only for live tailing after catch-up
-- the crawler no longer assumes undocumented websocket replay query parameters
-
-Example:
-
-```bash
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  podping --old 24 --state ./podping_state.db
-```
-
-#### Podping options
-
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--state <path>` | `./podping_state.db` | Block cursor database |
-| `--block <n>` | off | Replay from a Hive block |
-| `--old <hours>` | off | Replay from N hours ago |
-| `--time <rfc3339>` | off | Replay from a timestamp |
-| `--concurrency <n>` | `3` | Parallel fetch+ingest workers |
-
 ### gossip
 
 Listen to a local gossip-listener SSE stream for live podping notifications:
@@ -277,7 +222,7 @@ Important:
   Default: `http://localhost:8008/ingest/feed`
 - **`CONCURRENCY`** --
   Worker pool size.
-  Default: `5` (crawl/import) / `3` (podping/gossip)
+  Default: `5` (crawl/import) / `3` (gossip)
 - **`FEED_URLS`** --
   Comma- or newline-separated URLs (crawl mode only).
 - **`PODCASTINDEX_DB_URL`** --
@@ -291,13 +236,6 @@ Important:
 - **`RESOLVERCTL_BIN`** --
   Override the resolver control binary used with
   `RESOLVER_DB_PATH`. Default: `resolverctl`
-- **`PODPING_WS_URL`** --
-  Podping WebSocket endpoint.
-  Default: `wss://api.livewire.io/ws/podping`
-- **`HIVE_API_URL`** --
-  Hive JSON-RPC endpoint for replay start blocks.
-  Default: `https://api.hive.blog`
-
 ## Architecture
 
 ```text
@@ -306,11 +244,10 @@ stophammer-crawler
     main.rs           CLI dispatcher (clap subcommands)
     crawl.rs          Shared pipeline: fetch → SHA-256 → parse → POST
     pool.rs           Bounded concurrency pool (tokio semaphore)
-    dedup.rs          In-memory cooldown map (podping mode)
+    dedup.rs          In-memory cooldown map (gossip mode)
     modes/
       crawl.rs        Load URLs from file/env/stdin, run pool
       import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
-      podping.rs      WebSocket listener, music filter, dedup, persistent workers
       gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
 
@@ -324,7 +261,7 @@ subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function
 4. **POST** the result as JSON to the stophammer `/ingest/feed` endpoint
 
 Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
-fixed task list; podping mode runs an unbounded stream with a permit-based cap.
+fixed task list; gossip mode runs an unbounded stream with a permit-based cap.
 
 When `RESOLVER_DB_PATH` is set, import mode also brackets the run with
 `resolverctl import-active` / `import-idle` and refreshes that import heartbeat

@@ -6,7 +6,7 @@ struct PingEntry {
     ping_count: u32,
 }
 
-/// In-memory cooldown deduplication for podping mode.
+/// In-memory cooldown deduplication for gossip mode.
 pub struct Dedup {
     seen: HashMap<String, PingEntry>,
     cooldown: Duration,

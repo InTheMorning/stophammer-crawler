@@ -370,12 +370,12 @@ impl ImportStateWriter {
             while let Ok(command) = rx.recv() {
                 match command {
                     ImportStateCommand::UpsertMemory(row) => {
-                        upsert_import_memory(&conn, &row).unwrap_or_else(|e| {
-                            panic!(
-                                "failed to upsert import memory for podcastindex_id={}: {e}",
+                        if let Err(e) = upsert_import_memory(&conn, &row) {
+                            eprintln!(
+                                "import: WARNING: failed to upsert memory for podcastindex_id={}: {e} (skipping)",
                                 row.podcastindex_id
-                            )
-                        });
+                            );
+                        }
                     }
                     ImportStateCommand::SetLastId { scope, id, ack } => {
                         set_last_processed_id(&conn, scope, id).unwrap_or_else(|e| {
@@ -486,27 +486,66 @@ fn acquire_audit_lock(path: &str) -> PathBuf {
             )
         });
     }
-    OpenOptions::new()
+    match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock_path)
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to acquire import audit lock {}: {err}; another importer may already be writing this audit file",
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{}", std::process::id());
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if let Ok(contents) = fs::read_to_string(&lock_path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                assert!(
+                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    "import audit lock {} held by live process pid={pid}",
+                    lock_path.display()
+                );
+            }
+            eprintln!(
+                "import: WARNING: reclaiming stale audit lock {}",
                 lock_path.display()
-            )
-        });
+            );
+            let mut f = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&lock_path)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to reclaim import audit lock {}: {err}",
+                        lock_path.display()
+                    )
+                });
+            let _ = write!(f, "{}", std::process::id());
+        }
+        Err(err) => {
+            panic!(
+                "failed to acquire import audit lock {}: {err}",
+                lock_path.display()
+            );
+        }
+    }
     lock_path
 }
 
 fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemoryRow) {
-    tx.send(ImportStateCommand::UpsertMemory(row))
-        .expect("import state writer channel closed unexpectedly");
+    if let Err(e) = tx.send(ImportStateCommand::UpsertMemory(row)) {
+        let ImportStateCommand::UpsertMemory(row) = e.0 else {
+            return;
+        };
+        eprintln!(
+            "import: WARNING: state writer channel closed, dropping memory for podcastindex_id={}",
+            row.podcastindex_id
+        );
+    }
 }
 
 fn enqueue_import_audit(tx: &mpsc::Sender<ImportAuditCommand>, row: ImportAuditRow) {
-    tx.send(ImportAuditCommand::Write(Box::new(row)))
-        .expect("import audit writer channel closed unexpectedly");
+    if tx.send(ImportAuditCommand::Write(Box::new(row))).is_err() {
+        eprintln!("import: WARNING: audit writer channel closed, dropping audit row");
+    }
 }
 
 fn open_audit_output(path: &str, append: bool) -> BufWriter<fs::File> {
@@ -2050,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "failed to acquire import audit lock")]
+    #[should_panic(expected = "held by live process")]
     fn audit_writer_refuses_second_writer_for_same_path() {
         let tempdir = tempdir().expect("tempdir");
         let output_path = tempdir.path().join("feed_audit.ndjson");

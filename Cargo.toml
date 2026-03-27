@@ -3,7 +3,7 @@ name = "stophammer-crawler"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Unified RSS feed crawler with crawl, import, podping, and gossip modes"
+description = "Unified RSS feed crawler with crawl, import, and gossip modes"
 
 [[bin]]
 name = "feed_audit"
@@ -36,7 +36,6 @@ sha2        = "0.10"
 hex         = "0.4"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 clap        = { version = "4", features = ["derive", "env"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 roxmltree = "0.21"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
