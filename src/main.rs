@@ -90,13 +90,21 @@ enum Mode {
         #[arg(long)]
         audit_output: Option<String>,
 
-        /// Append importer audit rows to `--audit-output` instead of truncating first
+        /// Replace `--audit-output` instead of appending to it
         #[arg(long, requires = "audit_output")]
-        audit_append: bool,
+        audit_replace: bool,
 
         /// Skip rows already known to publish a non-music, non-publisher medium
         #[arg(long)]
         skip_known_non_music: bool,
+
+        /// Skip rows already known to have been ingested successfully
+        #[arg(long)]
+        skip_known_success: bool,
+
+        /// Restrict snapshot import to Wavlake-hosted feeds and apply conservative 429 backoff
+        #[arg(long)]
+        wavlake_only: bool,
 
         /// Log candidates without fetching
         #[arg(long)]
@@ -179,8 +187,10 @@ async fn main() {
             batch,
             concurrency,
             audit_output,
-            audit_append,
+            audit_replace,
             skip_known_non_music,
+            skip_known_success,
+            wavlake_only,
             dry_run,
             cursor,
         } => {
@@ -192,8 +202,10 @@ async fn main() {
                 batch,
                 concurrency,
                 audit_output,
-                audit_append,
+                audit_replace,
                 skip_known_non_music,
+                skip_known_success,
+                wavlake_only,
                 dry_run,
                 cursor,
             )

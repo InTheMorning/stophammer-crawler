@@ -86,6 +86,9 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
   --batch 100 --concurrency 5
 ```
 
+Normal snapshot import excludes Wavlake-hosted rows. Use `--wavlake-only` for
+the Wavlake-specific pass.
+
 Restart or resume from an explicit `PodcastIndex` id:
 
 ```bash
@@ -94,6 +97,16 @@ INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
   --cursor 5000000 \
   --batch 100 --concurrency 5
+```
+
+Wavlake-only import from the same snapshot:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
+  --wavlake-only \
+  --cursor 0
 ```
 
 If `--db` does not exist yet, the importer downloads the latest PodcastIndex
@@ -114,9 +127,11 @@ for multi-gigabyte snapshots.
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
 | `--audit-output <path>` | off | Optional NDJSON dump of successfully ingested `200 OK` feeds in `feed_audit` format |
-| `--audit-append` | off | Append to `--audit-output` and skip rows already present with the same `feed_guid` + `content_sha256` |
+| `--audit-replace` | off | Replace `--audit-output` instead of appending to it |
 | `--dry-run` | off | Log without fetching/ingesting |
 | `--skip-known-non-music` | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
+| `--skip-known-success` | off | Skip rows already known to have reached `accepted`, `no_change`, or `skipped_known_success` in importer memory |
+| `--wavlake-only` | off | Restrict snapshot import to `wavlake.com` / `www.wavlake.com` feeds; without this flag, normal import excludes Wavlake rows |
 | `--cursor <id>` | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
 
 Progress is stored in `--state`. If the process is interrupted,
@@ -124,7 +139,9 @@ the next run resumes from the last completed batch. A crash
 mid-batch re-processes that batch -- safe because stophammer
 deduplicates on content hash. `--cursor <id>` overrides the stored
 starting point for that run; in non-dry runs the override is also
-persisted to the state DB before the batch loop starts.
+persisted to the state DB before the batch loop starts. Cursor state is
+scoped by import mode inside the state DB, so normal import and
+`--wavlake-only` do not overwrite each other's resume positions.
 
 `--state` now stores both the batch cursor and durable per-row importer memory
 in `import_feed_memory`, including the latest fetch status, outcome,
@@ -138,13 +155,26 @@ and continues. Import mode does not retry failed rows within the same run; the
 state DB is the retry/memory mechanism. Slow batches emit heartbeat lines with
 the currently pending row IDs and URLs instead of going silent.
 
+`--wavlake-only` is intentionally slower than normal import mode. Normal import
+skips Wavlake-hosted snapshot rows entirely. The Wavlake-specific mode queries
+only those rows, forces single-flight fetches, applies a small delay between
+requests, and if Wavlake returns `429 Too Many Requests` it backs off using the
+server's `Retry-After` value before attempting the next feed. Each Wavlake
+`429` also increases the ongoing inter-fetch delay by 1 second for the rest of
+that run. Wavlake scope does not imply any skip policy; use
+`--skip-known-success` and/or `--skip-known-non-music` if you want to trade
+freshness for speed on reruns.
+
 If `--audit-output` is set, import mode writes only feeds that were actually
 ingested by stophammer to an NDJSON file compatible with the `feed_audit` /
 `audit_import` tooling. That includes newly accepted feeds and `no_change`
 re-submissions of already-ingested feeds. Rejected feeds, parse errors, and
-non-`200` fetches are not written. When `--audit-append` is enabled, the writer
-de-dupes by `source_db.feed_guid` plus `fetch.content_sha256` so reruns do not
-append the same fetched body again.
+non-`200` fetches are not written. By default, `--audit-output` appends and the
+writer de-dupes by `source_db.feed_guid` plus `fetch.content_sha256` so reruns
+do not append the same fetched body again. Use `--audit-replace` to truncate
+and rewrite the file instead. Import mode also creates an adjacent lock file
+while writing the audit NDJSON, so only one importer can target a given audit
+path at a time.
 
 Operational note:
 

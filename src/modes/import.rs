@@ -3,7 +3,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::io::{BufRead, BufReader, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use stophammer_parser::extract_podcast_namespace;
 use stophammer_parser::types::{IngestFeedData, IngestPodcastNamespaceSnapshot};
 use tar::Archive;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
 use crate::pool::run_pool;
@@ -28,15 +28,131 @@ const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 const IMPORT_TASK_HARD_TIMEOUT_SECS: u64 = 15;
 const IMPORT_BATCH_HEARTBEAT_SECS: u64 = 30;
 const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
+const WAVLAKE_IMPORT_MIN_DELAY_MS: u64 = 2_000;
+const WAVLAKE_IMPORT_FALLBACK_429_BACKOFF_SECS: u64 = 300;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const RESOLVERCTL_BIN_ENV: &str = "RESOLVERCTL_BIN";
 const RESOLVER_DB_PATH_ENV: &str = "RESOLVER_DB_PATH";
 const RESOLVER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const WAVLAKE_HOSTS: [&str; 2] = ["wavlake.com", "www.wavlake.com"];
 
 struct CandidateRow {
     id: i64,
     url: String,
     podcast_guid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportScope {
+    AllFeeds,
+    WavlakeOnly,
+}
+
+impl ImportScope {
+    fn from_wavlake_only(wavlake_only: bool) -> Self {
+        if wavlake_only {
+            Self::WavlakeOnly
+        } else {
+            Self::AllFeeds
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AllFeeds => "all_feeds",
+            Self::WavlakeOnly => "wavlake_only",
+        }
+    }
+
+    fn cursor_key(self) -> &'static str {
+        match self {
+            Self::AllFeeds => "last_processed_id:all_feeds",
+            Self::WavlakeOnly => "last_processed_id:wavlake_only",
+        }
+    }
+
+    fn effective_concurrency(self, requested: usize) -> usize {
+        match self {
+            Self::AllFeeds => requested,
+            Self::WavlakeOnly => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownSkipKind {
+    Irrelevant,
+    Success,
+}
+
+impl KnownSkipKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Irrelevant => "skipped_known_irrelevant",
+            Self::Success => "skipped_known_success",
+        }
+    }
+}
+
+fn effective_audit_append(requested_replace: bool, audit_output: Option<&str>) -> bool {
+    audit_output.is_some() && !requested_replace
+}
+
+#[derive(Debug, Default)]
+struct WavlakeThrottle {
+    state: AsyncMutex<WavlakeThrottleState>,
+}
+
+#[derive(Debug, Default)]
+struct WavlakeThrottleState {
+    next_allowed_at: Option<Instant>,
+    extra_delay_secs: u64,
+}
+
+impl WavlakeThrottle {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn wait_for_turn(&self, candidate: &CandidateRow) {
+        loop {
+            let sleep_for = {
+                let guard = self.state.lock().await;
+                guard
+                    .next_allowed_at
+                    .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            };
+
+            let Some(delay) = sleep_for else {
+                break;
+            };
+            if delay.is_zero() {
+                break;
+            }
+
+            eprintln!(
+                "  import: wavlake throttle sleeping {:?} before id={} {}",
+                delay, candidate.id, candidate.url,
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    async fn record_attempt(&self, candidate: &CandidateRow, report: &CrawlReport) {
+        let mut guard = self.state.lock().await;
+        if report.fetch_http_status == Some(429) {
+            guard.extra_delay_secs = guard.extra_delay_secs.saturating_add(1);
+        }
+        let delay = wavlake_throttle_delay(report, guard.extra_delay_secs);
+        guard.next_allowed_at = Some(Instant::now() + delay);
+
+        if report.fetch_http_status == Some(429) {
+            eprintln!(
+                "  import: wavlake 429 backoff {:?} after id={} {} (extra_inter_fetch_delay={}s)",
+                delay, candidate.id, candidate.url, guard.extra_delay_secs,
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,28 +294,35 @@ impl ImportMemoryRow {
         }
     }
 
-    fn skipped_known_irrelevant(
+    fn skipped_known(
         candidate: &CandidateRow,
         known: &KnownImportMemory,
         attempted_at: i64,
         attempt_duration_ms: i64,
+        skip_kind: KnownSkipKind,
     ) -> Self {
-        let outcome_reason = known.raw_medium.as_ref().map_or_else(
-            || {
-                known
-                    .outcome_reason
-                    .clone()
-                    .or_else(|| Some("known medium-gate rejection".to_string()))
-            },
-            |raw_medium| Some(format!("known raw_medium={raw_medium}")),
-        );
+        let outcome_reason = match skip_kind {
+            KnownSkipKind::Irrelevant => known.raw_medium.as_ref().map_or_else(
+                || {
+                    known
+                        .outcome_reason
+                        .clone()
+                        .or_else(|| Some("known medium-gate rejection".to_string()))
+                },
+                |raw_medium| Some(format!("known raw_medium={raw_medium}")),
+            ),
+            KnownSkipKind::Success => Some(format!(
+                "known prior successful ingest outcome={}",
+                known.fetch_outcome
+            )),
+        };
 
         Self {
             podcastindex_id: candidate.id,
             feed_url: candidate.url.clone(),
             podcastindex_guid: candidate.podcast_guid.clone(),
             fetch_http_status: known.fetch_http_status,
-            fetch_outcome: "skipped_known_irrelevant".to_string(),
+            fetch_outcome: skip_kind.label().to_string(),
             outcome_reason,
             retryable: false,
             raw_medium: known.raw_medium.clone(),
@@ -212,8 +335,14 @@ impl ImportMemoryRow {
 
 enum ImportStateCommand {
     UpsertMemory(ImportMemoryRow),
-    SetLastId { id: i64, ack: oneshot::Sender<()> },
-    Shutdown { ack: oneshot::Sender<()> },
+    SetLastId {
+        scope: ImportScope,
+        id: i64,
+        ack: oneshot::Sender<()>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 enum ImportAuditCommand {
@@ -229,6 +358,7 @@ struct ImportStateWriter {
 struct ImportAuditWriter {
     tx: mpsc::Sender<ImportAuditCommand>,
     handle: Option<thread::JoinHandle<()>>,
+    lock_path: PathBuf,
 }
 
 impl ImportStateWriter {
@@ -247,9 +377,12 @@ impl ImportStateWriter {
                             )
                         });
                     }
-                    ImportStateCommand::SetLastId { id, ack } => {
-                        set_last_processed_id(&conn, id).unwrap_or_else(|e| {
-                            panic!("failed to persist import cursor at id={id}: {e}");
+                    ImportStateCommand::SetLastId { scope, id, ack } => {
+                        set_last_processed_id(&conn, scope, id).unwrap_or_else(|e| {
+                            panic!(
+                                "failed to persist import cursor key={} at id={id}: {e}",
+                                scope.cursor_key()
+                            );
                         });
                         let _ = ack.send(());
                     }
@@ -267,10 +400,14 @@ impl ImportStateWriter {
         }
     }
 
-    async fn set_last_id(&self, id: i64) {
+    async fn set_last_id(&self, scope: ImportScope, id: i64) {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
-            .send(ImportStateCommand::SetLastId { id, ack: ack_tx })
+            .send(ImportStateCommand::SetLastId {
+                scope,
+                id,
+                ack: ack_tx,
+            })
             .expect("import state writer channel closed unexpectedly");
         ack_rx
             .await
@@ -299,6 +436,7 @@ impl ImportAuditWriter {
     fn spawn(path: &str, append: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let path = path.to_string();
+        let lock_path = acquire_audit_lock(&path);
         let handle = thread::spawn(move || {
             let seen_keys = load_existing_audit_keys(&path, append);
             let writer = open_audit_output(&path, append);
@@ -308,6 +446,7 @@ impl ImportAuditWriter {
         Self {
             tx,
             handle: Some(handle),
+            lock_path,
         }
     }
 
@@ -326,7 +465,38 @@ impl ImportAuditWriter {
             .await
             .expect("failed to join import audit writer thread");
         }
+        fs::remove_file(&self.lock_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to remove import audit lock {}: {err}",
+                self.lock_path.display()
+            )
+        });
     }
+}
+
+fn acquire_audit_lock(path: &str) -> PathBuf {
+    let lock_path = PathBuf::from(format!("{path}.lock"));
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "failed to create import audit lock directory {}: {err}",
+                parent.display()
+            )
+        });
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to acquire import audit lock {}: {err}; another importer may already be writing this audit file",
+                lock_path.display()
+            )
+        });
+    lock_path
 }
 
 fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemoryRow) {
@@ -634,20 +804,38 @@ impl ProgressStore {
         Self { conn }
     }
 
-    fn get_last_id(&self) -> i64 {
-        self.conn
+    fn get_last_id(&self, scope: ImportScope) -> i64 {
+        let scoped_value = self
+            .conn
             .query_row(
-                "SELECT value FROM import_progress WHERE key = 'last_processed_id'",
-                [],
+                "SELECT value FROM import_progress WHERE key = ?1",
+                [scope.cursor_key()],
                 |row| row.get::<_, String>(0),
             )
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+            .and_then(|v| v.parse().ok());
+        if let Some(value) = scoped_value {
+            return value;
+        }
+
+        if scope == ImportScope::AllFeeds {
+            return self
+                .conn
+                .query_row(
+                    "SELECT value FROM import_progress WHERE key = 'last_processed_id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+        }
+
+        0
     }
 
-    fn set_last_id(&self, id: i64) {
-        set_last_processed_id(&self.conn, id).expect("failed to override import cursor");
+    fn set_last_id(&self, scope: ImportScope, id: i64) {
+        set_last_processed_id(&self.conn, scope, id).expect("failed to override import cursor");
     }
 
     fn known_memory_for_ids(
@@ -723,11 +911,15 @@ fn open_state_connection(path: &str) -> Connection {
     conn
 }
 
-fn set_last_processed_id(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
+fn set_last_processed_id(
+    conn: &Connection,
+    scope: ImportScope,
+    id: i64,
+) -> rusqlite::Result<usize> {
     conn.execute(
-        "INSERT INTO import_progress (key, value) VALUES ('last_processed_id', ?1)
+        "INSERT INTO import_progress (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [id.to_string()],
+        params![scope.cursor_key(), id.to_string()],
     )
 }
 
@@ -827,27 +1019,79 @@ fn is_known_medium_gate_rejection(known: &KnownImportMemory) -> bool {
         .is_some_and(|reason| reason.starts_with("[medium_music]"))
 }
 
-fn should_skip_known_row(known: Option<&KnownImportMemory>) -> bool {
-    known.is_some_and(|memory| {
-        memory.fetch_http_status == Some(200)
+fn is_known_successful_ingest(known: &KnownImportMemory) -> bool {
+    known.fetch_http_status == Some(200)
+        && matches!(
+            known.fetch_outcome.as_str(),
+            "accepted" | "no_change" | "skipped_known_success"
+        )
+}
+
+fn known_skip_kind(
+    known: Option<&KnownImportMemory>,
+    skip_known_non_music: bool,
+    skip_known_success: bool,
+) -> Option<KnownSkipKind> {
+    known.and_then(|memory| {
+        if skip_known_success && is_known_successful_ingest(memory) {
+            return Some(KnownSkipKind::Success);
+        }
+
+        if skip_known_non_music
+            && memory.fetch_http_status == Some(200)
             && (memory
                 .raw_medium
                 .as_deref()
                 .is_some_and(is_skip_known_non_music)
                 || is_known_medium_gate_rejection(memory))
+        {
+            return Some(KnownSkipKind::Irrelevant);
+        }
+
+        None
     })
 }
 
-fn query_batch(db: &Connection, start_id: i64, batch_size: usize) -> Vec<CandidateRow> {
-    let mut stmt = db
-        .prepare_cached(
+fn wavlake_host_filter_sql() -> String {
+    let hosts = WAVLAKE_HOSTS
+        .iter()
+        .map(|host| format!("'{host}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("host IN ({hosts})")
+}
+
+fn non_wavlake_host_filter_sql() -> String {
+    format!("NOT ({})", wavlake_host_filter_sql())
+}
+
+fn query_batch(
+    db: &Connection,
+    start_id: i64,
+    batch_size: usize,
+    scope: ImportScope,
+) -> Vec<CandidateRow> {
+    let sql = match scope {
+        ImportScope::AllFeeds => format!(
             "SELECT id, url, podcastGuid
              FROM   podcasts
              WHERE  id > ?1
+               AND  {}
              ORDER BY id ASC
              LIMIT ?2",
-        )
-        .expect("failed to prepare query");
+            non_wavlake_host_filter_sql()
+        ),
+        ImportScope::WavlakeOnly => format!(
+            "SELECT id, url, podcastGuid
+             FROM   podcasts
+             WHERE  id > ?1
+               AND  {}
+             ORDER BY id ASC
+             LIMIT ?2",
+            wavlake_host_filter_sql()
+        ),
+    };
+    let mut stmt = db.prepare_cached(&sql).expect("failed to prepare query");
 
     let rows: Vec<CandidateRow> = stmt
         .query_map(rusqlite::params![start_id, batch_size], |row| {
@@ -871,6 +1115,20 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn wavlake_throttle_delay(report: &CrawlReport, extra_delay_secs: u64) -> Duration {
+    let base_delay = if report.fetch_http_status == Some(429)
+        && let CrawlOutcome::FetchError {
+            retry_after_secs, ..
+        } = &report.outcome
+    {
+        Duration::from_secs(retry_after_secs.unwrap_or(WAVLAKE_IMPORT_FALLBACK_429_BACKOFF_SECS))
+    } else {
+        Duration::from_millis(WAVLAKE_IMPORT_MIN_DELAY_MS)
+    };
+
+    base_delay.saturating_add(Duration::from_secs(extra_delay_secs))
 }
 
 fn set_import_active(resolverctl_bin: &str, resolver_db_path: &str, active: bool) {
@@ -1032,11 +1290,15 @@ pub async fn run(
     batch_size: usize,
     concurrency: usize,
     audit_output: Option<String>,
-    audit_append: bool,
+    audit_replace: bool,
     skip_known_non_music: bool,
+    skip_known_success: bool,
+    wavlake_only: bool,
     dry_run: bool,
     cursor_override: Option<i64>,
 ) {
+    let scope = ImportScope::from_wavlake_only(wavlake_only);
+    let audit_append = effective_audit_append(audit_replace, audit_output.as_deref());
     let progress = ProgressStore::open(&state_path);
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
     let audit_writer = if dry_run {
@@ -1049,18 +1311,30 @@ pub async fn run(
 
     ensure_snapshot_db(&db_path, &db_url, refresh_db).await;
 
-    let mut cursor = cursor_override.unwrap_or_else(|| progress.get_last_id());
+    let mut cursor = cursor_override.unwrap_or_else(|| progress.get_last_id(scope));
     if let Some(override_cursor) = cursor_override {
         eprintln!("import: cursor override to {override_cursor}");
         if dry_run {
             eprintln!("import: dry-run leaves stored cursor unchanged");
         } else {
-            progress.set_last_id(override_cursor);
+            progress.set_last_id(scope, override_cursor);
         }
     }
 
+    let effective_concurrency = scope.effective_concurrency(concurrency);
+    if scope == ImportScope::WavlakeOnly && !dry_run && concurrency != effective_concurrency {
+        eprintln!(
+            "import: wavlake_only forces single-flight fetches; requested concurrency={concurrency}, effective_concurrency={effective_concurrency}"
+        );
+    }
+    if !dry_run && audit_output.is_some() && audit_append {
+        eprintln!("import: audit_output will append with feed_guid+content_sha256 dedupe");
+    }
+
     eprintln!(
-        "import: starting from id={cursor}, batch={batch_size}, concurrency={concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s, skip_known_non_music={skip_known_non_music}, audit_output={}",
+        "import: starting from id={cursor}, batch={batch_size}, concurrency={effective_concurrency}, fetch_timeout={IMPORT_FETCH_TIMEOUT_SECS}s, skip_known_non_music={skip_known_non_music}, skip_known_success={skip_known_success}, scope={}, cursor_key={}, audit_output={}, audit_append={audit_append}",
+        scope.label(),
+        scope.cursor_key(),
         audit_output.as_deref().unwrap_or("(off)")
     );
 
@@ -1095,10 +1369,12 @@ pub async fn run(
     };
 
     let client = Arc::new(reqwest::Client::new());
+    let wavlake_throttle =
+        (scope == ImportScope::WavlakeOnly && !dry_run).then(|| Arc::new(WavlakeThrottle::new()));
     let mut total_processed: u64 = 0;
 
     loop {
-        let batch = query_batch(&pi_db, cursor, batch_size);
+        let batch = query_batch(&pi_db, cursor, batch_size, scope);
         if batch.is_empty() {
             eprintln!("import: no more candidates after id={cursor}");
             break;
@@ -1106,7 +1382,7 @@ pub async fn run(
 
         let batch_max_id = batch.last().map_or(cursor, |r| r.id);
         let batch_len = batch.len();
-        let known_memory = if skip_known_non_music {
+        let known_memory = if skip_known_non_music || skip_known_success {
             progress.known_memory_for_ids(&batch.iter().map(|row| row.id).collect::<Vec<_>>())
         } else {
             std::collections::HashMap::default()
@@ -1115,10 +1391,16 @@ pub async fn run(
         if dry_run {
             for row in &batch {
                 let guid_display = row.podcast_guid.as_deref().unwrap_or("(none)");
-                if should_skip_known_row(known_memory.get(&row.id)) {
+                if let Some(skip_kind) = known_skip_kind(
+                    known_memory.get(&row.id),
+                    skip_known_non_music,
+                    skip_known_success,
+                ) {
                     eprintln!(
-                        "  [dry-run] would_skip_known_irrelevant id={} guid={guid_display} {}",
-                        row.id, row.url
+                        "  [dry-run] would_{} id={} guid={guid_display} {}",
+                        skip_kind.label(),
+                        row.id,
+                        row.url
                     );
                 } else {
                     eprintln!("  [dry-run] id={} guid={guid_display} {}", row.id, row.url);
@@ -1161,12 +1443,17 @@ pub async fn run(
                     let audit_tx = audit_tx.clone();
                     let active_tasks = Arc::clone(&active_tasks);
                     let known_memory = Arc::clone(&known_memory);
+                    let wavlake_throttle = wavlake_throttle.as_ref().map(Arc::clone);
                     move || async move {
                         let attempted_at = Utc::now().timestamp();
                         let task_started_at = Instant::now();
-                        if should_skip_known_row(known_memory.get(&row.id)) {
+                        if let Some(skip_kind) = known_skip_kind(
+                            known_memory.get(&row.id),
+                            skip_known_non_music,
+                            skip_known_success,
+                        ) {
                             skipped.fetch_add(1, Ordering::Relaxed);
-                            let memory_row = ImportMemoryRow::skipped_known_irrelevant(
+                            let memory_row = ImportMemoryRow::skipped_known(
                                 &row,
                                 known_memory
                                     .get(&row.id)
@@ -1174,13 +1461,17 @@ pub async fn run(
                                 attempted_at,
                                 i64::try_from(task_started_at.elapsed().as_millis())
                                     .expect("skip attempt duration exceeded i64"),
+                                skip_kind,
                             );
                             enqueue_import_memory(&state_tx, memory_row);
-                            eprintln!("  skipped_known_irrelevant: id={} {}", row.id, row.url);
+                            eprintln!("  {}: id={} {}", skip_kind.label(), row.id, row.url);
                             return;
                         }
 
                         let _active_guard = begin_active_import_task(&active_tasks, &row);
+                        if let Some(throttle) = &wavlake_throttle {
+                            throttle.wait_for_turn(&row).await;
+                        }
                         let fallback = row.podcast_guid.as_deref();
                         let report = if let Ok(report) = tokio::time::timeout(
                             Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
@@ -1196,6 +1487,9 @@ pub async fn run(
                             );
                             build_import_timeout_report(IMPORT_TASK_HARD_TIMEOUT_SECS)
                         };
+                        if let Some(throttle) = &wavlake_throttle {
+                            throttle.record_attempt(&row, &report).await;
+                        }
                         let outcome = &report.outcome;
                         let memory_row = ImportMemoryRow::from_crawl_report(
                             &row,
@@ -1234,7 +1528,7 @@ pub async fn run(
                 })
                 .collect();
 
-            run_pool(tasks, concurrency).await;
+            run_pool(tasks, effective_concurrency).await;
             let _ = heartbeat_stop_tx.send(true);
             heartbeat_handle
                 .await
@@ -1252,7 +1546,7 @@ pub async fn run(
 
         cursor = batch_max_id;
         if let Some(writer) = &state_writer {
-            writer.set_last_id(cursor).await;
+            writer.set_last_id(scope, cursor).await;
         }
         total_processed += batch_len as u64;
         eprintln!("import: cursor={cursor} total_processed={total_processed}");
@@ -1272,16 +1566,19 @@ pub async fn run(
 mod tests {
     use super::{
         ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter, ImportMemoryRow,
-        ImportStateWriter, ProgressStore, build_import_audit_row, build_import_timeout_report,
+        ImportScope, ImportStateWriter, KnownSkipKind, ProgressStore, WAVLAKE_HOSTS,
+        build_import_audit_row, build_import_timeout_report, effective_audit_append,
         enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
-        is_skip_known_non_music, load_known_import_memory, open_state_connection,
-        should_skip_known_row, upsert_import_memory,
+        is_skip_known_non_music, known_skip_kind, load_known_import_memory, open_state_connection,
+        query_batch, upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use rusqlite::Connection;
     use std::fs;
     use std::io::{self, Cursor};
+    use std::time::Duration;
     use stophammer_parser::types::IngestFeedData;
     use tar::{Builder, Header};
     use tempfile::tempdir;
@@ -1549,11 +1846,11 @@ mod tests {
 
         let lookup = load_known_import_memory(&conn, &[10, 11, 12, 13, 14]);
 
-        assert!(should_skip_known_row(lookup.get(&10)));
-        assert!(!should_skip_known_row(lookup.get(&11)));
-        assert!(should_skip_known_row(lookup.get(&12)));
-        assert!(!should_skip_known_row(lookup.get(&13)));
-        assert!(!should_skip_known_row(lookup.get(&14)));
+        assert!(known_skip_kind(lookup.get(&10), true, false).is_some());
+        assert!(known_skip_kind(lookup.get(&11), true, false).is_none());
+        assert!(known_skip_kind(lookup.get(&12), true, false).is_some());
+        assert!(known_skip_kind(lookup.get(&13), true, false).is_none());
+        assert!(known_skip_kind(lookup.get(&14), true, false).is_none());
     }
 
     #[test]
@@ -1574,7 +1871,7 @@ mod tests {
 
         let lookup = load_known_import_memory(&conn, &[22]);
 
-        assert!(should_skip_known_row(lookup.get(&22)));
+        assert!(known_skip_kind(lookup.get(&22), true, false).is_some());
     }
 
     #[test]
@@ -1595,7 +1892,11 @@ mod tests {
 
         let lookup = load_known_import_memory(&conn, &[23]);
 
-        assert!(should_skip_known_row(lookup.get(&23)));
+        assert!(known_skip_kind(lookup.get(&23), true, false).is_some());
+        assert_eq!(
+            known_skip_kind(lookup.get(&23), true, false),
+            Some(KnownSkipKind::Irrelevant)
+        );
     }
 
     #[test]
@@ -1613,7 +1914,7 @@ mod tests {
         let row = sample_memory_row(99, Some(429), "fetch_error", None, true, None);
 
         enqueue_import_memory(&writer.tx, row.clone());
-        writer.set_last_id(99).await;
+        writer.set_last_id(ImportScope::AllFeeds, 99).await;
         writer.shutdown().await;
 
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
@@ -1630,6 +1931,13 @@ mod tests {
                 [],
                 |db_row| db_row.get(0),
             )
+            .or_else(|_| {
+                conn.query_row(
+                    "SELECT value FROM import_progress WHERE key = ?1",
+                    [ImportScope::AllFeeds.cursor_key()],
+                    |db_row| db_row.get(0),
+                )
+            })
             .expect("query persisted cursor");
 
         assert_eq!(stored_attempts, 1);
@@ -1741,6 +2049,15 @@ mod tests {
         assert!(written.contains("\"feed_guid\":\"feed-guid\""));
     }
 
+    #[test]
+    #[should_panic(expected = "failed to acquire import audit lock")]
+    fn audit_writer_refuses_second_writer_for_same_path() {
+        let tempdir = tempdir().expect("tempdir");
+        let output_path = tempdir.path().join("feed_audit.ndjson");
+        let _first = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), true);
+        let _second = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), true);
+    }
+
     #[tokio::test]
     async fn audit_writer_append_dedupes_existing_rows_by_feed_guid_and_hash() {
         let tempdir = tempdir().expect("tempdir");
@@ -1810,6 +2127,162 @@ mod tests {
         assert_eq!(
             report.outcome.reason(),
             Some("import crawl exceeded hard deadline of 15s; marking row as failed")
+        );
+    }
+
+    #[test]
+    fn query_batch_wavlake_only_filters_snapshot_hosts() {
+        let conn = Connection::open_in_memory().expect("open memory db");
+        conn.execute_batch(
+            "CREATE TABLE podcasts (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                host TEXT NOT NULL,
+                podcastGuid TEXT NOT NULL
+            );
+            INSERT INTO podcasts (id, url, host, podcastGuid) VALUES
+                (1, 'https://example.com/feed.xml', 'example.com', 'guid-1'),
+                (2, 'https://wavlake.com/feed/music/abc', 'wavlake.com', 'guid-2'),
+                (3, 'https://www.wavlake.com/feed/music/def', 'www.wavlake.com', 'guid-3'),
+                (4, 'https://other.example/feed.xml', 'other.example', 'guid-4');",
+        )
+        .expect("seed podcasts");
+
+        let wavlake_rows = query_batch(&conn, 0, 10, ImportScope::WavlakeOnly);
+        let all_rows = query_batch(&conn, 0, 10, ImportScope::AllFeeds);
+
+        assert_eq!(all_rows.len(), 2);
+        assert_eq!(wavlake_rows.len(), 2);
+        assert!(
+            wavlake_rows
+                .iter()
+                .all(|row| { WAVLAKE_HOSTS.iter().any(|host| row.url.contains(host)) })
+        );
+        assert!(
+            all_rows
+                .iter()
+                .all(|row| { WAVLAKE_HOSTS.iter().all(|host| !row.url.contains(host)) })
+        );
+    }
+
+    #[test]
+    fn wavlake_scope_forces_single_flight_fetches() {
+        assert_eq!(ImportScope::AllFeeds.effective_concurrency(5), 5);
+        assert_eq!(ImportScope::WavlakeOnly.effective_concurrency(5), 1);
+    }
+
+    #[test]
+    fn wavlake_scope_skips_prior_successful_ingests() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let accepted = sample_memory_row(50, Some(200), "accepted", None, false, Some("music"));
+        let no_change = sample_memory_row(51, Some(200), "no_change", None, false, Some("music"));
+        let fetch_error = sample_memory_row(52, Some(429), "fetch_error", None, true, None);
+
+        upsert_import_memory(&conn, &accepted).expect("upsert accepted row");
+        upsert_import_memory(&conn, &no_change).expect("upsert no_change row");
+        upsert_import_memory(&conn, &fetch_error).expect("upsert fetch_error row");
+
+        let lookup = load_known_import_memory(&conn, &[50, 51, 52]);
+
+        assert_eq!(
+            known_skip_kind(lookup.get(&50), false, true),
+            Some(KnownSkipKind::Success)
+        );
+        assert_eq!(
+            known_skip_kind(lookup.get(&51), false, true),
+            Some(KnownSkipKind::Success)
+        );
+        assert!(known_skip_kind(lookup.get(&52), false, true).is_none());
+    }
+
+    #[test]
+    fn skipped_success_rows_remain_skippable_when_success_skipping_is_enabled() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let skipped_success = sample_memory_row(
+            60,
+            Some(200),
+            "skipped_known_success",
+            None,
+            false,
+            Some("music"),
+        );
+
+        upsert_import_memory(&conn, &skipped_success).expect("upsert skipped success row");
+
+        let lookup = load_known_import_memory(&conn, &[60]);
+
+        assert_eq!(
+            known_skip_kind(lookup.get(&60), false, true),
+            Some(KnownSkipKind::Success)
+        );
+        assert!(known_skip_kind(lookup.get(&60), false, false).is_none());
+    }
+
+    #[test]
+    fn progress_store_scopes_cursors_by_import_scope() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let progress = ProgressStore::open(state_path.to_str().expect("utf-8 path"));
+
+        progress.set_last_id(ImportScope::AllFeeds, 111);
+        progress.set_last_id(ImportScope::WavlakeOnly, 222);
+
+        assert_eq!(progress.get_last_id(ImportScope::AllFeeds), 111);
+        assert_eq!(progress.get_last_id(ImportScope::WavlakeOnly), 222);
+    }
+
+    #[test]
+    fn audit_output_appends_by_default_unless_replaced() {
+        assert!(effective_audit_append(
+            false,
+            Some("./feed_audit_wavlake.ndjson")
+        ));
+        assert!(effective_audit_append(false, Some("./feed_audit.ndjson")));
+        assert!(!effective_audit_append(true, Some("./feed_audit.ndjson")));
+        assert!(!effective_audit_append(false, None));
+    }
+
+    #[test]
+    fn wavlake_throttle_respects_retry_after_for_429s() {
+        let report = CrawlReport {
+            outcome: CrawlOutcome::FetchError {
+                reason: "http 429 Too Many Requests".to_string(),
+                retryable: true,
+                retry_after_secs: Some(300),
+            },
+            fetch_http_status: Some(429),
+            raw_medium: None,
+            parsed_feed_guid: None,
+            final_url: None,
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+        };
+
+        assert_eq!(wavlake_throttle_delay(&report, 1), Duration::from_secs(301));
+    }
+
+    #[test]
+    fn wavlake_throttle_uses_floor_delay_for_non_429_rows() {
+        let report = CrawlReport {
+            outcome: CrawlOutcome::NoChange,
+            fetch_http_status: Some(200),
+            raw_medium: None,
+            parsed_feed_guid: None,
+            final_url: None,
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+        };
+
+        assert_eq!(
+            wavlake_throttle_delay(&report, 2),
+            Duration::from_millis(super::WAVLAKE_IMPORT_MIN_DELAY_MS)
+                .saturating_add(Duration::from_secs(2))
         );
     }
 }
