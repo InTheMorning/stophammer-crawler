@@ -65,6 +65,14 @@ fn should_accept(msg: &GossipNotification) -> bool {
     msg.reason.as_deref() != Some("newValueBlock")
 }
 
+/// Archive cursor stored as a `(created_at, hash)` pair for stable replay
+/// ordering even when multiple messages share the same `created_at` value.
+#[derive(Debug, Clone)]
+struct ArchiveCursor {
+    created_at: i64,
+    hash: String,
+}
+
 struct ProgressStore {
     conn: Connection,
 }
@@ -89,9 +97,21 @@ impl ProgressStore {
             "CREATE TABLE IF NOT EXISTS gossip_progress (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS gossip_feed_memory (
+                feed_url           TEXT PRIMARY KEY,
+                fetch_http_status  INTEGER,
+                fetch_outcome      TEXT NOT NULL,
+                outcome_reason     TEXT,
+                raw_medium         TEXT,
+                parsed_feed_guid   TEXT,
+                attempt_duration_ms INTEGER NOT NULL DEFAULT 0,
+                first_attempted_at INTEGER NOT NULL,
+                last_attempted_at  INTEGER NOT NULL,
+                attempt_count      INTEGER NOT NULL DEFAULT 1
             )",
         )
-        .expect("failed to create gossip progress table");
+        .expect("failed to create gossip state tables");
 
         ProgressStore { conn }
     }
@@ -115,6 +135,76 @@ impl ProgressStore {
         if let Err(e) = result {
             eprintln!("gossip: WARNING: failed to persist cursor at timestamp={timestamp}: {e}");
         }
+    }
+
+    fn get_archive_cursor(&self) -> Option<ArchiveCursor> {
+        let created_at: i64 = self
+            .conn
+            .query_row(
+                "SELECT value FROM gossip_progress WHERE key = 'archive_cursor_created_at'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())?;
+        let hash: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM gossip_progress WHERE key = 'archive_cursor_hash'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()?;
+        Some(ArchiveCursor { created_at, hash })
+    }
+
+    fn set_archive_cursor(&self, cursor: &ArchiveCursor) {
+        let result = self.conn.execute_batch(&format!(
+            "INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_created_at', '{}');
+             INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_hash', '{}');",
+            cursor.created_at, cursor.hash
+        ));
+        if let Err(e) = result {
+            eprintln!(
+                "gossip: WARNING: failed to persist archive cursor at ({}, {}): {e}",
+                cursor.created_at, cursor.hash
+            );
+        }
+    }
+
+    /// Migrate legacy `last_seen_timestamp` to an archive cursor by looking up
+    /// the first matching row in `archive.db`. Returns the migrated cursor if
+    /// successful, or `None` if migration is not applicable.
+    fn migrate_legacy_cursor(&self, archive_conn: &Connection) -> Option<ArchiveCursor> {
+        let timestamp = self.get_last_timestamp()?;
+        if self.get_archive_cursor().is_some() {
+            return None;
+        }
+
+        let ts_i64 = i64::try_from(timestamp).unwrap_or(i64::MAX);
+        let cursor = archive_conn
+            .query_row(
+                "SELECT created_at, hash FROM messages WHERE created_at >= ?1 ORDER BY created_at ASC, hash ASC LIMIT 1",
+                params![ts_i64],
+                |row| {
+                    Ok(ArchiveCursor {
+                        created_at: row.get(0)?,
+                        hash: row.get(1)?,
+                    })
+                },
+            )
+            .ok()?;
+
+        self.set_archive_cursor(&cursor);
+        let _ = self.conn.execute(
+            "DELETE FROM gossip_progress WHERE key = 'last_seen_timestamp'",
+            [],
+        );
+        eprintln!(
+            "gossip: migrated legacy cursor timestamp={timestamp} to archive cursor ({}, {})",
+            cursor.created_at, cursor.hash
+        );
+        Some(cursor)
     }
 }
 
@@ -210,12 +300,55 @@ async fn launch_gossip_urls(
     }
 }
 
+/// Validate that `archive.db` has the expected `messages(hash, payload, created_at)` schema.
+fn validate_archive_schema(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(messages)")
+        .map_err(|e| format!("failed to query archive schema: {e}"))?;
+
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("failed to read archive schema: {e}"))?
+        .filter_map(Result::ok)
+        .collect();
+
+    if columns.is_empty() {
+        return Err("archive.db has no 'messages' table".to_string());
+    }
+
+    for required in ["hash", "payload", "created_at"] {
+        if !columns.iter().any(|c| c == required) {
+            return Err(format!(
+                "archive.db 'messages' table missing required column '{required}'"
+            ));
+        }
+    }
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .map_err(|e| format!("failed to count archive messages: {e}"))?;
+    if count == 0 {
+        return Err("archive.db 'messages' table is empty".to_string());
+    }
+
+    Ok(())
+}
+
+/// A single row from the archive replay query, carrying the cursor position.
+struct ArchiveMessage {
+    created_at: i64,
+    hash: String,
+    payload: Vec<u8>,
+}
+
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "archive replay threads through shared clients, counters, progress, and output policy"
 )]
 async fn replay_from_archive(
     archive_path: &str,
+    cursor: Option<&ArchiveCursor>,
     since: u64,
     dedup: &Arc<Mutex<Dedup>>,
     client: &Arc<Client>,
@@ -224,9 +357,10 @@ async fn replay_from_archive(
     progress: &ProgressStore,
     quiet: bool,
 ) -> GossipCounters {
-    eprintln!("gossip: replay from archive db={archive_path} since={since}");
-
-    let conn = match Connection::open(archive_path) {
+    let conn = match Connection::open_with_flags(
+        archive_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gossip: ERROR: failed to open archive db: {e}");
@@ -234,52 +368,85 @@ async fn replay_from_archive(
         }
     };
 
-    let mut stmt = match conn
-        .prepare("SELECT payload FROM messages WHERE created_at >= ?1 ORDER BY created_at ASC")
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("gossip: ERROR: failed to prepare query: {e}");
-            return GossipCounters::default();
-        }
-    };
+    if let Err(e) = validate_archive_schema(&conn) {
+        eprintln!("gossip: ERROR: archive schema validation failed: {e}");
+        return GossipCounters::default();
+    }
 
-    let mut counters = GossipCounters::default();
-
-    let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
-
-    let payloads: Vec<Vec<u8>> =
-        match stmt.query_map(params![since_i64], |row| row.get::<_, String>(0)) {
-            Ok(rows) => {
-                let mut collected = Vec::new();
-                for text in rows.flatten() {
-                    collected.push(text.into_bytes());
-                }
-                collected
-            }
+    let messages: Vec<ArchiveMessage> = if let Some(cur) = cursor {
+        eprintln!(
+            "gossip: replay from archive cursor ({}, {}) db={archive_path}",
+            cur.created_at, cur.hash
+        );
+        let mut stmt = match conn.prepare(
+            "SELECT hash, payload, created_at FROM messages
+             WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
+             ORDER BY created_at ASC, hash ASC",
+        ) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("gossip: ERROR: failed to query messages: {e}");
+                eprintln!("gossip: ERROR: failed to prepare cursor query: {e}");
                 return GossipCounters::default();
             }
         };
+        match stmt.query_map(params![cur.created_at, cur.hash], |row| {
+            Ok(ArchiveMessage {
+                hash: row.get(0)?,
+                payload: row.get::<_, String>(1)?.into_bytes(),
+                created_at: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(e) => {
+                eprintln!("gossip: ERROR: failed to query archive: {e}");
+                return GossipCounters::default();
+            }
+        }
+    } else {
+        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
+        eprintln!("gossip: replay from archive since={since} db={archive_path}");
+        let mut stmt = match conn.prepare(
+            "SELECT hash, payload, created_at FROM messages
+             WHERE created_at >= ?1
+             ORDER BY created_at ASC, hash ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gossip: ERROR: failed to prepare since query: {e}");
+                return GossipCounters::default();
+            }
+        };
+        match stmt.query_map(params![since_i64], |row| {
+            Ok(ArchiveMessage {
+                hash: row.get(0)?,
+                payload: row.get::<_, String>(1)?.into_bytes(),
+                created_at: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(e) => {
+                eprintln!("gossip: ERROR: failed to query archive: {e}");
+                return GossipCounters::default();
+            }
+        }
+    };
 
-    eprintln!("gossip: found {} messages in archive", payloads.len());
+    eprintln!("gossip: found {} messages in archive", messages.len());
 
-    let mut last_ts = since;
+    let mut counters = GossipCounters::default();
+    let mut last_cursor: Option<ArchiveCursor> = None;
 
-    for payload in payloads {
-        let notif: GossipNotification = match serde_json::from_slice(&payload) {
+    for msg in &messages {
+        let notif: GossipNotification = match serde_json::from_slice(&msg.payload) {
             Ok(n) => n,
             Err(_) => continue,
         };
 
         counters.notifications_seen += 1;
-
-        let ts = notif.effective_timestamp();
-        if ts > last_ts {
-            last_ts = ts;
-            progress.set_last_timestamp(ts);
-        }
+        last_cursor = Some(ArchiveCursor {
+            created_at: msg.created_at,
+            hash: msg.hash.clone(),
+        });
 
         if should_accept(&notif) {
             counters.notifications_accepted += 1;
@@ -309,6 +476,10 @@ async fn replay_from_archive(
         } else {
             counters.notifications_filtered += 1;
         }
+    }
+
+    if let Some(ref cur) = last_cursor {
+        progress.set_archive_cursor(cur);
     }
 
     eprintln!(
@@ -378,6 +549,7 @@ async fn stream_sse_events(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(
     state_path: String,
     sse_url: Option<String>,
@@ -394,14 +566,17 @@ pub async fn run(
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress = ProgressStore::open(&state_path);
 
-    let last_timestamp = progress.get_last_timestamp();
+    // Resolve the archive cursor: stored cursor > legacy migration > --since-hours > default
+    let archive_cursor = progress.get_archive_cursor();
     let since = if let Some(hours) = since_hours {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .saturating_sub(hours * 3600)
-    } else if let Some(ts) = last_timestamp {
+    } else if archive_cursor.is_some() {
+        0 // cursor-based replay, since is unused
+    } else if let Some(ts) = progress.get_last_timestamp() {
         ts
     } else {
         SystemTime::now()
@@ -411,11 +586,18 @@ pub async fn run(
             .saturating_sub(86400)
     };
 
-    if archive_db.is_some() {
-        eprintln!(
-            "gossip: starting replay from timestamp={since}, state={state_path}, concurrency={concurrency}"
-        );
-    } else if let Some(ts) = last_timestamp {
+    if let Some(ref _archive) = archive_db {
+        if let Some(ref cur) = archive_cursor {
+            eprintln!(
+                "gossip: archive-backed mode, cursor=({}, {}), state={state_path}, concurrency={concurrency}",
+                cur.created_at, cur.hash
+            );
+        } else {
+            eprintln!(
+                "gossip: archive-backed mode, since={since}, state={state_path}, concurrency={concurrency}"
+            );
+        }
+    } else if let Some(ts) = progress.get_last_timestamp() {
         eprintln!(
             "gossip: live-only mode, state={state_path}, last_seen_timestamp={ts}, concurrency={concurrency}"
         );
@@ -425,8 +607,31 @@ pub async fn run(
     eprintln!("gossip: SSE endpoint={sse_url}");
 
     if let Some(ref archive) = archive_db {
+        // Try legacy migration if no archive cursor exists yet
+        let effective_cursor = if archive_cursor.is_some() {
+            archive_cursor
+        } else if progress.get_last_timestamp().is_some() {
+            let archive_conn = Connection::open_with_flags(
+                archive,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .ok();
+            archive_conn.and_then(|c| progress.migrate_legacy_cursor(&c))
+        } else {
+            None
+        };
+
         let archive_counters = replay_from_archive(
-            archive, since, &dedup, &client, &config, &sem, &progress, quiet,
+            archive,
+            effective_cursor.as_ref(),
+            since,
+            &dedup,
+            &client,
+            &config,
+            &sem,
+            &progress,
+            quiet,
         )
         .await;
 
@@ -492,7 +697,28 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::SseParser;
+    use super::*;
+    use rusqlite::Connection;
+
+    fn create_test_archive(messages: &[(&str, &str, i64)]) -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                hash       TEXT PRIMARY KEY,
+                payload    BLOB,
+                created_at INTEGER
+            )",
+        )
+        .expect("create messages table");
+        for (hash, payload, created_at) in messages {
+            conn.execute(
+                "INSERT INTO messages (hash, payload, created_at) VALUES (?1, ?2, ?3)",
+                params![hash, payload.as_bytes(), created_at],
+            )
+            .expect("insert message");
+        }
+        conn
+    }
 
     #[test]
     fn sse_parser_handles_data_line_split_across_chunks() {
@@ -518,5 +744,216 @@ mod tests {
         let events = parser.push_chunk("event: podping\ndata: {\"a\":1,\ndata: \"b\":2}\n\n");
 
         assert_eq!(events, vec!["{\"a\":1,\n\"b\":2}".to_string()]);
+    }
+
+    #[test]
+    fn progress_store_creates_feed_memory_table() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM gossip_feed_memory", [], |row| {
+                row.get(0)
+            })
+            .expect("feed memory table should exist");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn archive_cursor_round_trips() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        assert!(store.get_archive_cursor().is_none());
+
+        let cursor = ArchiveCursor {
+            created_at: 1700000000,
+            hash: "abc123def456".to_string(),
+        };
+        store.set_archive_cursor(&cursor);
+
+        let loaded = store.get_archive_cursor().expect("cursor should exist");
+        assert_eq!(loaded.created_at, 1700000000);
+        assert_eq!(loaded.hash, "abc123def456");
+    }
+
+    #[test]
+    fn legacy_migration_converts_timestamp_to_archive_cursor() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+        store.set_last_timestamp(1000);
+
+        let archive_conn = create_test_archive(&[
+            ("hash_a", "{}", 999),
+            ("hash_b", "{}", 1000),
+            ("hash_c", "{}", 1001),
+        ]);
+
+        let migrated = store
+            .migrate_legacy_cursor(&archive_conn)
+            .expect("migration should succeed");
+        assert_eq!(migrated.created_at, 1000);
+        assert_eq!(migrated.hash, "hash_b");
+
+        // Legacy key should be removed
+        assert!(store.get_last_timestamp().is_none());
+
+        // Archive cursor should be persisted
+        let stored = store.get_archive_cursor().expect("cursor should exist");
+        assert_eq!(stored.created_at, 1000);
+        assert_eq!(stored.hash, "hash_b");
+    }
+
+    #[test]
+    fn legacy_migration_skips_when_archive_cursor_exists() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+        store.set_last_timestamp(1000);
+        store.set_archive_cursor(&ArchiveCursor {
+            created_at: 999,
+            hash: "existing".to_string(),
+        });
+
+        let archive_conn = create_test_archive(&[("hash_a", "{}", 1000)]);
+
+        assert!(store.migrate_legacy_cursor(&archive_conn).is_none());
+    }
+
+    #[test]
+    fn validate_archive_schema_accepts_valid_db() {
+        let conn = create_test_archive(&[("hash_a", "{}", 1000)]);
+        assert!(validate_archive_schema(&conn).is_ok());
+    }
+
+    #[test]
+    fn validate_archive_schema_rejects_empty_db() {
+        let conn = create_test_archive(&[]);
+        let result = validate_archive_schema(&conn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn validate_archive_schema_rejects_missing_table() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        let result = validate_archive_schema(&conn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no 'messages' table"));
+    }
+
+    #[test]
+    fn validate_archive_schema_rejects_missing_column() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE messages (hash TEXT PRIMARY KEY, payload BLOB)",
+        )
+        .expect("create table");
+        conn.execute(
+            "INSERT INTO messages (hash, payload) VALUES ('h', 'p')",
+            [],
+        )
+        .expect("insert");
+        let result = validate_archive_schema(&conn);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("created_at"));
+    }
+
+    #[test]
+    fn cursor_based_replay_orders_by_created_at_then_hash() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let archive_path = tempdir.path().join("archive.db");
+        let conn = Connection::open(&archive_path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                hash TEXT PRIMARY KEY,
+                payload BLOB,
+                created_at INTEGER
+            )",
+        )
+        .expect("create");
+
+        // Three messages at the same created_at, hashes out of alphabetical order
+        let payload = r#"{"version":"1.1","sender":"abc","iris":["https://example.com"],"timestamp":100}"#;
+        conn.execute(
+            "INSERT INTO messages VALUES ('zzz', ?1, 1000)",
+            params![payload],
+        )
+        .expect("insert zzz");
+        conn.execute(
+            "INSERT INTO messages VALUES ('aaa', ?1, 1000)",
+            params![payload],
+        )
+        .expect("insert aaa");
+        conn.execute(
+            "INSERT INTO messages VALUES ('mmm', ?1, 1000)",
+            params![payload],
+        )
+        .expect("insert mmm");
+        drop(conn);
+
+        // Replay from cursor at (1000, "aaa") should skip "aaa" and return "mmm" then "zzz"
+        let conn = Connection::open_with_flags(
+            &archive_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open read-only");
+
+        let cursor = ArchiveCursor {
+            created_at: 1000,
+            hash: "aaa".to_string(),
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT hash, payload, created_at FROM messages
+                 WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
+                 ORDER BY created_at ASC, hash ASC",
+            )
+            .expect("prepare");
+        let results: Vec<String> = stmt
+            .query_map(params![cursor.created_at, cursor.hash], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("query")
+            .filter_map(Result::ok)
+            .collect();
+
+        assert_eq!(results, vec!["mmm", "zzz"]);
+    }
+
+    #[test]
+    fn gossip_state_migration_preserves_existing_db() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+
+        // Create a legacy-style DB with only gossip_progress
+        let conn = Connection::open(&db_path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE gossip_progress (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .expect("create legacy table");
+        conn.execute(
+            "INSERT INTO gossip_progress (key, value) VALUES ('last_seen_timestamp', '1700000000')",
+            [],
+        )
+        .expect("insert legacy cursor");
+        drop(conn);
+
+        // Opening with ProgressStore should add feed_memory table without breaking
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+        assert_eq!(store.get_last_timestamp(), Some(1_700_000_000));
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM gossip_feed_memory", [], |row| {
+                row.get(0)
+            })
+            .expect("feed memory table should be created");
+        assert_eq!(count, 0);
     }
 }
