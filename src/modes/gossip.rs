@@ -1,12 +1,12 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use reqwest::Client;
 use rusqlite::{Connection, params};
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::crawl::{CrawlConfig, crawl_feed};
+use crate::crawl::{CrawlConfig, CrawlReport, crawl_feed_report};
 use crate::dedup::Dedup;
 
 fn create_async_client() -> reqwest::Client {
@@ -206,6 +206,103 @@ impl ProgressStore {
         );
         Some(cursor)
     }
+
+    fn upsert_feed_memory(&self, url: &str, report: &CrawlReport, duration_ms: i64) {
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX);
+        let result = self.conn.execute(
+            "INSERT INTO gossip_feed_memory (
+                feed_url, fetch_http_status, fetch_outcome, outcome_reason,
+                raw_medium, parsed_feed_guid, attempt_duration_ms,
+                first_attempted_at, last_attempted_at, attempt_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)
+            ON CONFLICT(feed_url) DO UPDATE SET
+                fetch_http_status = excluded.fetch_http_status,
+                fetch_outcome = excluded.fetch_outcome,
+                outcome_reason = excluded.outcome_reason,
+                raw_medium = excluded.raw_medium,
+                parsed_feed_guid = excluded.parsed_feed_guid,
+                attempt_duration_ms = excluded.attempt_duration_ms,
+                last_attempted_at = excluded.last_attempted_at,
+                attempt_count = attempt_count + 1",
+            params![
+                url,
+                report.fetch_http_status.map(i64::from),
+                report.outcome.label(),
+                report.outcome.reason(),
+                report.raw_medium.as_deref(),
+                report.parsed_feed_guid.as_deref(),
+                duration_ms,
+                now,
+            ],
+        );
+        if let Err(e) = result {
+            eprintln!("gossip: WARNING: failed to upsert feed memory for {url}: {e}");
+        }
+    }
+
+    /// Check if a feed should be skipped based on prior crawl results.
+    /// Returns the skip reason if the feed is known irrelevant, or `None` to proceed.
+    fn should_skip_feed(&self, url: &str, skip_ttl_days: Option<u64>) -> Option<String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT fetch_http_status, fetch_outcome, outcome_reason, raw_medium, last_attempted_at
+                 FROM gossip_feed_memory WHERE feed_url = ?1",
+                params![url],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .ok()?;
+
+        let (http_status, outcome, reason, medium, last_attempted) = row;
+
+        // Check TTL expiry — if set and expired, re-evaluate
+        if let Some(ttl_days) = skip_ttl_days {
+            let now = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            )
+            .unwrap_or(i64::MAX);
+            let ttl_secs = i64::try_from(ttl_days).unwrap_or(i64::MAX).saturating_mul(86400);
+            if now - last_attempted > ttl_secs {
+                return None;
+            }
+        }
+
+        // Skip if HTTP 200 and medium is not music/publisher
+        if http_status == Some(200)
+            && let Some(ref m) = medium
+            && m != "music"
+            && m != "publisher"
+        {
+            return Some(format!("known non-music medium: {m}"));
+        }
+
+        // Skip if medium-gate rejection (includes absent podcast:medium)
+        if outcome == "rejected"
+            && let Some(ref r) = reason
+            && r.starts_with("[medium_music]")
+        {
+            return Some(format!("prior medium-gate rejection: {r}"));
+        }
+
+        None
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +313,7 @@ struct GossipCounters {
     urls_seen: u64,
     urls_launched: u64,
     urls_dedup_skipped: u64,
+    urls_feed_memory_skipped: u64,
 }
 
 #[derive(Default)]
@@ -261,13 +359,20 @@ impl SseParser {
     }
 }
 
-async fn launch_gossip_urls(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared handler threads through dedup, crawl infra, progress, and skip policy"
+)]
+async fn process_notification_urls(
     notification: &GossipNotification,
     counters: &mut GossipCounters,
     dedup: &Arc<Mutex<Dedup>>,
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
     quiet: bool,
 ) {
     if !should_accept(notification) {
@@ -283,19 +388,36 @@ async fn launch_gossip_urls(
             counters.urls_dedup_skipped += 1;
             continue;
         }
+
+        if skip_known_non_music
+            && let Some(reason) = progress.lock().unwrap().should_skip_feed(url, skip_ttl_days)
+        {
+            counters.urls_feed_memory_skipped += 1;
+            if !quiet {
+                eprintln!("  skipped ({reason}): {url}");
+            }
+            continue;
+        }
+
         counters.urls_launched += 1;
 
         let url = url.to_string();
         let client = Arc::clone(client);
         let config = Arc::clone(config);
         let sem = Arc::clone(sem);
+        let progress = Arc::clone(progress);
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            let outcome = crawl_feed(&client, &url, None, &config).await;
-            if !(quiet && outcome.is_medium_rejection()) {
-                eprintln!("  {outcome}: {url}");
+            let start = Instant::now();
+            let report = crawl_feed_report(&client, &url, None, &config).await;
+            let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+            if !(quiet && report.outcome.is_medium_rejection()) {
+                eprintln!("  {}: {url}", report.outcome);
             }
+
+            progress.lock().unwrap().upsert_feed_memory(&url, &report, duration_ms);
         });
     }
 }
@@ -354,7 +476,9 @@ async fn replay_from_archive(
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
-    progress: &ProgressStore,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
     quiet: bool,
 ) -> GossipCounters {
     let conn = match Connection::open_with_flags(
@@ -448,48 +572,34 @@ async fn replay_from_archive(
             hash: msg.hash.clone(),
         });
 
-        if should_accept(&notif) {
-            counters.notifications_accepted += 1;
-
-            for url in notif.all_urls() {
-                counters.urls_seen += 1;
-                let should_crawl = dedup.lock().await.should_process(url);
-                if !should_crawl {
-                    counters.urls_dedup_skipped += 1;
-                    continue;
-                }
-                counters.urls_launched += 1;
-
-                let url = url.to_string();
-                let client = Arc::clone(client);
-                let config = Arc::clone(config);
-                let sem = Arc::clone(sem);
-
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.expect("semaphore closed");
-                    let outcome = crawl_feed(&client, &url, None, &config).await;
-                    if !(quiet && outcome.is_medium_rejection()) {
-                        eprintln!("  {outcome}: {url}");
-                    }
-                });
-            }
-        } else {
-            counters.notifications_filtered += 1;
-        }
+        process_notification_urls(
+            &notif,
+            &mut counters,
+            dedup,
+            client,
+            config,
+            sem,
+            progress,
+            skip_known_non_music,
+            skip_ttl_days,
+            quiet,
+        )
+        .await;
     }
 
     if let Some(ref cur) = last_cursor {
-        progress.set_archive_cursor(cur);
+        progress.lock().unwrap().set_archive_cursor(cur);
     }
 
     eprintln!(
-        "gossip: replay complete: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={}",
+        "gossip: replay complete: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
         counters.notifications_seen,
         counters.notifications_accepted,
         counters.notifications_filtered,
         counters.urls_seen,
         counters.urls_launched,
-        counters.urls_dedup_skipped
+        counters.urls_dedup_skipped,
+        counters.urls_feed_memory_skipped
     );
 
     counters
@@ -506,7 +616,9 @@ async fn stream_sse_events(
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
     counters: &mut GossipCounters,
-    progress: &ProgressStore,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
     quiet: bool,
 ) -> Result<(), String> {
     eprintln!("gossip: connecting to SSE at {sse_url}");
@@ -539,9 +651,21 @@ async fn stream_sse_events(
                 counters.notifications_seen += 1;
 
                 let ts = notif.effective_timestamp();
-                progress.set_last_timestamp(ts);
+                progress.lock().unwrap().set_last_timestamp(ts);
 
-                launch_gossip_urls(&notif, counters, dedup, client, config, sem, quiet).await;
+                process_notification_urls(
+                    &notif,
+                    counters,
+                    dedup,
+                    client,
+                    config,
+                    sem,
+                    progress,
+                    skip_known_non_music,
+                    skip_ttl_days,
+                    quiet,
+                )
+                .await;
             }
         }
     }
@@ -549,13 +673,15 @@ async fn stream_sse_events(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     state_path: String,
     sse_url: Option<String>,
     archive_db: Option<String>,
     since_hours: Option<u64>,
     concurrency: usize,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
     quiet: bool,
 ) {
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
@@ -564,10 +690,10 @@ pub async fn run(
     let client = Arc::new(reqwest::Client::new());
     let sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));
-    let progress = ProgressStore::open(&state_path);
+    let progress_store = ProgressStore::open(&state_path);
 
     // Resolve the archive cursor: stored cursor > legacy migration > --since-hours > default
-    let archive_cursor = progress.get_archive_cursor();
+    let archive_cursor = progress_store.get_archive_cursor();
     let since = if let Some(hours) = since_hours {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -576,7 +702,7 @@ pub async fn run(
             .saturating_sub(hours * 3600)
     } else if archive_cursor.is_some() {
         0 // cursor-based replay, since is unused
-    } else if let Some(ts) = progress.get_last_timestamp() {
+    } else if let Some(ts) = progress_store.get_last_timestamp() {
         ts
     } else {
         SystemTime::now()
@@ -597,31 +723,43 @@ pub async fn run(
                 "gossip: archive-backed mode, since={since}, state={state_path}, concurrency={concurrency}"
             );
         }
-    } else if let Some(ts) = progress.get_last_timestamp() {
+    } else if let Some(ts) = progress_store.get_last_timestamp() {
         eprintln!(
             "gossip: live-only mode, state={state_path}, last_seen_timestamp={ts}, concurrency={concurrency}"
         );
     } else {
         eprintln!("gossip: live-only mode, state={state_path}, concurrency={concurrency}");
     }
+    if skip_known_non_music {
+        eprintln!(
+            "gossip: skip-known-non-music enabled{}",
+            skip_ttl_days.map_or(String::new(), |d| format!(", ttl={d}d"))
+        );
+    }
     eprintln!("gossip: SSE endpoint={sse_url}");
 
-    if let Some(ref archive) = archive_db {
-        // Try legacy migration if no archive cursor exists yet
-        let effective_cursor = if archive_cursor.is_some() {
+    // Legacy migration needs mutable access before wrapping in Arc<Mutex>
+    let effective_cursor = if let Some(ref archive) = archive_db {
+        if archive_cursor.is_some() {
             archive_cursor
-        } else if progress.get_last_timestamp().is_some() {
+        } else if progress_store.get_last_timestamp().is_some() {
             let archive_conn = Connection::open_with_flags(
                 archive,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .ok();
-            archive_conn.and_then(|c| progress.migrate_legacy_cursor(&c))
+            archive_conn.and_then(|c| progress_store.migrate_legacy_cursor(&c))
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
+    let progress = Arc::new(std::sync::Mutex::new(progress_store));
+
+    if let Some(ref archive) = archive_db {
         let archive_counters = replay_from_archive(
             archive,
             effective_cursor.as_ref(),
@@ -631,19 +769,22 @@ pub async fn run(
             &config,
             &sem,
             &progress,
+            skip_known_non_music,
+            skip_ttl_days,
             quiet,
         )
         .await;
 
-        if archive_counters.urls_launched > 0 {
+        if archive_counters.urls_launched > 0 || archive_counters.urls_feed_memory_skipped > 0 {
             eprintln!(
-                "gossip: replay stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={}",
+                "gossip: replay stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
                 archive_counters.notifications_seen,
                 archive_counters.notifications_accepted,
                 archive_counters.notifications_filtered,
                 archive_counters.urls_seen,
                 archive_counters.urls_launched,
-                archive_counters.urls_dedup_skipped
+                archive_counters.urls_dedup_skipped,
+                archive_counters.urls_feed_memory_skipped
             );
         }
     }
@@ -668,6 +809,8 @@ pub async fn run(
             &sem,
             &mut session_counters,
             &progress,
+            skip_known_non_music,
+            skip_ttl_days,
             quiet,
         )
         .await
@@ -683,13 +826,14 @@ pub async fn run(
 
         if session_counters.notifications_seen > 0 || session_counters.urls_launched > 0 {
             eprintln!(
-                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={}",
+                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
                 session_counters.notifications_seen,
                 session_counters.notifications_accepted,
                 session_counters.notifications_filtered,
                 session_counters.urls_seen,
                 session_counters.urls_launched,
-                session_counters.urls_dedup_skipped
+                session_counters.urls_dedup_skipped,
+                session_counters.urls_feed_memory_skipped
             );
         }
     }
@@ -955,5 +1099,221 @@ mod tests {
             })
             .expect("feed memory table should be created");
         assert_eq!(count, 0);
+    }
+
+    fn make_report(
+        outcome_label: &str,
+        reason: Option<&str>,
+        http_status: Option<u16>,
+        medium: Option<&str>,
+        guid: Option<&str>,
+    ) -> CrawlReport {
+        use crate::crawl::CrawlOutcome;
+        let outcome = match outcome_label {
+            "accepted" => CrawlOutcome::Accepted {
+                warnings: Vec::new(),
+            },
+            "rejected" => CrawlOutcome::Rejected {
+                reason: reason.unwrap_or("unknown").to_string(),
+                warnings: Vec::new(),
+            },
+            "no_change" => CrawlOutcome::NoChange,
+            "fetch_error" => CrawlOutcome::FetchError {
+                reason: reason.unwrap_or("timeout").to_string(),
+                retryable: true,
+                retry_after_secs: None,
+            },
+            _ => CrawlOutcome::ParseError(reason.unwrap_or("bad xml").to_string()),
+        };
+        CrawlReport {
+            outcome,
+            fetch_http_status: http_status,
+            raw_medium: medium.map(ToString::to_string),
+            parsed_feed_guid: guid.map(ToString::to_string),
+            final_url: None,
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+        }
+    }
+
+    #[test]
+    fn upsert_feed_memory_stores_and_updates() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("music"), Some("guid-1"));
+        store.upsert_feed_memory("https://example.com/feed.xml", &report, 150);
+
+        // Verify stored values
+        let (outcome, medium, count): (String, Option<String>, i64) = store
+            .conn
+            .query_row(
+                "SELECT fetch_outcome, raw_medium, attempt_count FROM gossip_feed_memory WHERE feed_url = ?1",
+                params!["https://example.com/feed.xml"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row should exist");
+        assert_eq!(outcome, "accepted");
+        assert_eq!(medium.as_deref(), Some("music"));
+        assert_eq!(count, 1);
+
+        // Second upsert increments attempt_count
+        let report2 = make_report("rejected", Some("[medium_music] not music"), Some(200), Some("podcast"), None);
+        store.upsert_feed_memory("https://example.com/feed.xml", &report2, 200);
+
+        let (outcome, medium, count): (String, Option<String>, i64) = store
+            .conn
+            .query_row(
+                "SELECT fetch_outcome, raw_medium, attempt_count FROM gossip_feed_memory WHERE feed_url = ?1",
+                params!["https://example.com/feed.xml"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row should exist");
+        assert_eq!(outcome, "rejected");
+        assert_eq!(medium.as_deref(), Some("podcast"));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn should_skip_non_music_medium() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("podcast"), None);
+        store.upsert_feed_memory("https://example.com/podcast.xml", &report, 100);
+
+        let skip = store.should_skip_feed("https://example.com/podcast.xml", None);
+        assert!(skip.is_some());
+        assert!(skip.unwrap().contains("non-music medium"));
+    }
+
+    #[test]
+    fn should_skip_medium_gate_rejection() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report(
+            "rejected",
+            Some("[medium_music] medium is absent"),
+            Some(200),
+            None,
+            None,
+        );
+        store.upsert_feed_memory("https://example.com/no-medium.xml", &report, 100);
+
+        let skip = store.should_skip_feed("https://example.com/no-medium.xml", None);
+        assert!(skip.is_some());
+        assert!(skip.unwrap().contains("medium-gate rejection"));
+    }
+
+    #[test]
+    fn should_not_skip_music_feed() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("music"), Some("guid-1"));
+        store.upsert_feed_memory("https://example.com/music.xml", &report, 100);
+
+        assert!(
+            store
+                .should_skip_feed("https://example.com/music.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_skip_publisher_feed() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("publisher"), Some("guid-2"));
+        store.upsert_feed_memory("https://example.com/pub.xml", &report, 100);
+
+        assert!(
+            store
+                .should_skip_feed("https://example.com/pub.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_skip_fetch_errors() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("fetch_error", Some("http 404 Not Found"), Some(404), None, None);
+        store.upsert_feed_memory("https://example.com/gone.xml", &report, 100);
+
+        assert!(
+            store
+                .should_skip_feed("https://example.com/gone.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_skip_unknown_feed() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        // Feed not in memory at all
+        assert!(
+            store
+                .should_skip_feed("https://example.com/new.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn skip_ttl_expires_old_decisions() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("podcast"), None);
+        store.upsert_feed_memory("https://example.com/old.xml", &report, 100);
+
+        // Manually backdate last_attempted_at to 60 days ago
+        let old_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - (60 * 86400);
+        store
+            .conn
+            .execute(
+                "UPDATE gossip_feed_memory SET last_attempted_at = ?1 WHERE feed_url = ?2",
+                params![old_ts, "https://example.com/old.xml"],
+            )
+            .expect("backdate");
+
+        // Without TTL: still skipped
+        assert!(
+            store
+                .should_skip_feed("https://example.com/old.xml", None)
+                .is_some()
+        );
+
+        // With 30-day TTL: expired, should re-evaluate
+        assert!(
+            store
+                .should_skip_feed("https://example.com/old.xml", Some(30))
+                .is_none()
+        );
+
+        // With 90-day TTL: not yet expired, still skipped
+        assert!(
+            store
+                .should_skip_feed("https://example.com/old.xml", Some(90))
+                .is_some()
+        );
     }
 }

@@ -137,6 +137,14 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 3, value_parser = parse_positive_usize)]
         concurrency: usize,
 
+        /// Skip feeds already known to be non-music based on prior crawl results
+        #[arg(long)]
+        skip_known_non_music: bool,
+
+        /// Re-evaluate skip decisions after N days (default: off, skips persist indefinitely)
+        #[arg(long)]
+        skip_ttl_days: Option<u64>,
+
         /// Quiet mode: hide `medium_music` rejections (non-music spam)
         #[arg(short, long)]
         quiet: bool,
@@ -194,9 +202,21 @@ async fn main() {
             archive_db,
             since_hours,
             concurrency,
+            skip_known_non_music,
+            skip_ttl_days,
             quiet,
         } => {
-            modes::gossip::run(state, sse_url, archive_db, since_hours, concurrency, quiet).await;
+            modes::gossip::run(
+                state,
+                sse_url,
+                archive_db,
+                since_hours,
+                concurrency,
+                skip_known_non_music,
+                skip_ttl_days,
+                quiet,
+            )
+            .await;
         }
     }
 }
