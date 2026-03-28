@@ -778,8 +778,12 @@ async fn stream_sse_events(
 
     let mut parser = SseParser::default();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("SSE stream error: {e}"))?;
+    loop {
+        let chunk = match tokio::time::timeout(Duration::from_secs(120), stream.next()).await {
+            Ok(Some(result)) => result.map_err(|e| format!("SSE stream error: {e}"))?,
+            Ok(None) => break,
+            Err(_) => return Err("SSE stream stalled: no data for 120s".to_string()),
+        };
         let text = String::from_utf8_lossy(&chunk);
 
         for event_data in parser.push_chunk(&text) {
