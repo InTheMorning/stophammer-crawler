@@ -20,6 +20,8 @@ pub struct FeedSkipDb {
     conn: Connection,
 }
 
+type SkipLookupRow = (Option<i64>, String, Option<String>, Option<String>, i64);
+
 impl FeedSkipDb {
     /// Open (or create) the shared skip database at `path`.
     /// Uses WAL journal mode and a 5-second busy timeout for safe concurrent
@@ -64,13 +66,21 @@ impl FeedSkipDb {
     /// Returns `Some(reason)` if the feed should be skipped, `None` to proceed.
     /// When `ttl_days` is set, entries older than that are ignored (re-evaluated).
     pub fn should_skip(&self, feed_url: &str, ttl_days: Option<u64>) -> Option<String> {
-        let row: Option<(Option<i64>, String, Option<String>, Option<String>, i64)> = self
+        let row: Option<SkipLookupRow> = self
             .conn
             .query_row(
                 "SELECT fetch_http_status, fetch_outcome, outcome_reason, raw_medium, last_seen_at
                  FROM feed_outcomes WHERE feed_url = ?1",
                 params![feed_url],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .ok();
 
@@ -84,12 +94,12 @@ impl FeedSkipDb {
         }
 
         // HTTP 200 with a known non-music, non-publisher medium
-        if http_status == Some(200) {
-            if let Some(ref m) = medium {
-                if !m.eq_ignore_ascii_case("music") && !m.eq_ignore_ascii_case("publisher") {
-                    return Some(format!("known non-music medium: {m}"));
-                }
-            }
+        if http_status == Some(200)
+            && let Some(ref m) = medium
+            && !m.eq_ignore_ascii_case("music")
+            && !m.eq_ignore_ascii_case("publisher")
+        {
+            return Some(format!("known non-music medium: {m}"));
         }
 
         // Prior medium-gate rejection
@@ -323,9 +333,10 @@ mod tests {
         );
 
         // TTL of 30 days — should still skip
-        assert!(db
-            .should_skip("https://example.com/feed.xml", Some(30))
-            .is_some());
+        assert!(
+            db.should_skip("https://example.com/feed.xml", Some(30))
+                .is_some()
+        );
     }
 
     #[test]

@@ -1398,9 +1398,9 @@ pub async fn run(
         Some(PidLockGuard { path: lock })
     };
     let progress = ProgressStore::open(&state_path);
-    let skip_db = Arc::new(std::sync::Mutex::new(
-        crate::feed_skip::FeedSkipDb::open(&skip_db_path),
-    ));
+    let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+        &skip_db_path,
+    )));
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
     let audit_writer = if dry_run {
         None
@@ -1547,17 +1547,16 @@ pub async fn run(
                         let task_started_at = Instant::now();
 
                         // Check shared cross-mode skip DB before mode-specific checks
-                        if skip_known_non_music {
-                            if let Some(reason) =
+                        if skip_known_non_music
+                            && let Some(reason) =
                                 skip_db.lock().unwrap().should_skip(&row.url, None)
-                            {
-                                skipped.fetch_add(1, Ordering::Relaxed);
-                                eprintln!(
-                                    "  skipped_shared_irrelevant: id={} {} ({reason})",
-                                    row.id, row.url
-                                );
-                                return;
-                            }
+                        {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "  skipped_shared_irrelevant: id={} {} ({reason})",
+                                row.id, row.url
+                            );
+                            return;
                         }
 
                         if let Some(skip_kind) = known_skip_kind(

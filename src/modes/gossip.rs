@@ -563,6 +563,24 @@ struct ArchiveMessage {
     payload: Vec<u8>,
 }
 
+fn collect_archive_messages(
+    rows: rusqlite::MappedRows<
+        '_,
+        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ArchiveMessage>,
+    >,
+) -> Vec<ArchiveMessage> {
+    let mut messages = Vec::new();
+    for row in rows {
+        match row {
+            Ok(message) => messages.push(message),
+            Err(e) => {
+                eprintln!("gossip: WARNING: failed to decode archive row: {e}");
+            }
+        }
+    }
+    messages
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -638,12 +656,12 @@ async fn replay_from_archive(
                 |row| {
                     Ok(ArchiveMessage {
                         hash: row.get(0)?,
-                        payload: row.get::<_, String>(1)?.into_bytes(),
+                        payload: row.get::<_, Vec<u8>>(1)?,
                         created_at: row.get(2)?,
                     })
                 },
             ) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Ok(rows) => collect_archive_messages(rows),
                 Err(e) => {
                     eprintln!("gossip: ERROR: failed to query archive batch: {e}");
                     break;
@@ -668,12 +686,12 @@ async fn replay_from_archive(
                 |row| {
                     Ok(ArchiveMessage {
                         hash: row.get(0)?,
-                        payload: row.get::<_, String>(1)?.into_bytes(),
+                        payload: row.get::<_, Vec<u8>>(1)?,
                         created_at: row.get(2)?,
                     })
                 },
             ) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Ok(rows) => collect_archive_messages(rows),
                 Err(e) => {
                     eprintln!("gossip: ERROR: failed to query archive batch: {e}");
                     break;
@@ -711,7 +729,7 @@ async fn replay_from_archive(
                 config,
                 sem,
                 progress,
-                &skip_db,
+                skip_db,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -1012,9 +1030,9 @@ pub async fn run(
     let sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress_store = ProgressStore::open(&state_path);
-    let skip_db = Arc::new(std::sync::Mutex::new(
-        crate::feed_skip::FeedSkipDb::open(&skip_db_path),
-    ));
+    let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+        &skip_db_path,
+    )));
 
     let archive_cursor = progress_store.get_archive_cursor();
 
@@ -1442,6 +1460,72 @@ mod tests {
             .collect();
 
         assert_eq!(results, vec!["mmm", "zzz"]);
+    }
+
+    #[tokio::test]
+    async fn replay_from_archive_accepts_blob_payload_rows() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let archive_path = tempdir.path().join("archive.db");
+        let archive_conn = Connection::open(&archive_path).expect("open archive");
+        archive_conn
+            .execute_batch(
+                "CREATE TABLE messages (
+                    hash TEXT PRIMARY KEY,
+                    payload BLOB,
+                    created_at INTEGER
+                )",
+            )
+            .expect("create messages table");
+        let payload = r#"{"version":"1.1","sender":"abc","iris":[],"timestamp":100}"#;
+        archive_conn
+            .execute(
+                "INSERT INTO messages (hash, payload, created_at) VALUES (?1, ?2, ?3)",
+                params!["hash_a", payload.as_bytes(), 1000i64],
+            )
+            .expect("insert message");
+        drop(archive_conn);
+
+        let progress_path = tempdir.path().join("gossip_state.db");
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            progress_path.to_str().expect("utf-8 path"),
+        )));
+        let skip_db_path = tempdir.path().join("feed_skip.db");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            skip_db_path.to_str().expect("utf-8 path"),
+        )));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let client = Arc::new(create_async_client());
+        let config = Arc::new(CrawlConfig::dry_run(
+            "stophammer-crawler/test",
+            Duration::from_secs(1),
+        ));
+        let sem = Arc::new(Semaphore::new(1));
+        let high_water = ArchiveCursor {
+            created_at: 1000,
+            hash: "hash_a".to_string(),
+        };
+
+        let counters = replay_from_archive(
+            archive_path.to_str().expect("utf-8 path"),
+            None,
+            0,
+            &high_water,
+            &dedup,
+            &client,
+            &config,
+            &sem,
+            1,
+            &progress,
+            &skip_db,
+            false,
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(counters.notifications_seen, 1);
+        assert_eq!(counters.notifications_accepted, 1);
+        assert_eq!(counters.urls_seen, 0);
     }
 
     #[test]

@@ -200,6 +200,10 @@ fn query_batch(path: &str, start_row: usize, batch_size: usize) -> Vec<AuditCand
     batch
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cached ingest replay carries source row details plus retry bookkeeping together"
+)]
 async fn ingest_cached_feed_with_retries(
     source_url: &str,
     canonical_url: &str,
