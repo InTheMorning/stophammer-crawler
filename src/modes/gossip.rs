@@ -163,11 +163,18 @@ impl ProgressStore {
     }
 
     fn set_archive_cursor(&self, cursor: &ArchiveCursor) {
-        let result = self.conn.execute_batch(&format!(
-            "INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_created_at', '{}');
-             INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_hash', '{}');",
-            cursor.created_at, cursor.hash
-        ));
+        let result = self
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_created_at', ?1)",
+                rusqlite::params![cursor.created_at],
+            )
+            .and_then(|_| {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO gossip_progress (key, value) VALUES ('archive_cursor_hash', ?1)",
+                    rusqlite::params![cursor.hash],
+                )
+            });
         if let Err(e) = result {
             eprintln!(
                 "gossip: WARNING: failed to persist archive cursor at ({}, {}): {e}",
@@ -282,7 +289,9 @@ impl ProgressStore {
                     .as_secs(),
             )
             .unwrap_or(i64::MAX);
-            let ttl_secs = i64::try_from(ttl_days).unwrap_or(i64::MAX).saturating_mul(86400);
+            let ttl_secs = i64::try_from(ttl_days)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(86400);
             if now - last_attempted > ttl_secs {
                 return None;
             }
@@ -320,6 +329,10 @@ struct GossipCounters {
     urls_feed_memory_skipped: u64,
 }
 
+/// Maximum bytes buffered in a single SSE line before it is discarded.
+/// Protects against a misbehaving source that never emits newlines.
+const SSE_MAX_LINE_BYTES: usize = 1024 * 1024; // 1 MiB
+
 #[derive(Default)]
 struct SseParser {
     line_buffer: String,
@@ -330,6 +343,17 @@ struct SseParser {
 impl SseParser {
     fn push_chunk(&mut self, text: &str) -> Vec<String> {
         self.line_buffer.push_str(text);
+
+        // Guard against unbounded growth when the source sends no newlines.
+        if self.line_buffer.len() > SSE_MAX_LINE_BYTES {
+            eprintln!(
+                "gossip: WARNING: SSE line buffer exceeded {SSE_MAX_LINE_BYTES} bytes without a newline; discarding buffer",
+            );
+            self.line_buffer.clear();
+            self.event_data.clear();
+            self.in_event = false;
+            return Vec::new();
+        }
 
         let mut completed_events = Vec::new();
 
@@ -394,7 +418,10 @@ async fn process_notification_urls(
         }
 
         if skip_known_non_music
-            && let Some(reason) = progress.lock().unwrap().should_skip_feed(url, skip_ttl_days)
+            && let Some(reason) = progress
+                .lock()
+                .unwrap()
+                .should_skip_feed(url, skip_ttl_days)
         {
             counters.urls_feed_memory_skipped += 1;
             if !quiet {
@@ -421,7 +448,10 @@ async fn process_notification_urls(
                 eprintln!("  {}: {url}", report.outcome);
             }
 
-            progress.lock().unwrap().upsert_feed_memory(&url, &report, duration_ms);
+            progress
+                .lock()
+                .unwrap()
+                .upsert_feed_memory(&url, &report, duration_ms);
         });
     }
 }
@@ -798,8 +828,7 @@ async fn reconcile_archive_batch(
     let messages: Vec<ArchiveMessage> = {
         let conn = match Connection::open_with_flags(
             archive_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -949,7 +978,7 @@ pub async fn run(
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
 
     let config = Arc::new(CrawlConfig::from_env());
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(create_async_client());
     let sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress_store = ProgressStore::open(&state_path);
@@ -987,8 +1016,8 @@ pub async fn run(
             None
         };
 
-        let high_water = get_archive_high_water_mark(&archive_conn)
-            .expect("archive validated non-empty above");
+        let high_water =
+            get_archive_high_water_mark(&archive_conn).expect("archive validated non-empty above");
 
         // Resolve since: --since-hours > cursor (unused) > oldest archive row
         let since = if let Some(hours) = since_hours {
@@ -1306,15 +1335,10 @@ mod tests {
     #[test]
     fn validate_archive_schema_rejects_missing_column() {
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE messages (hash TEXT PRIMARY KEY, payload BLOB)",
-        )
-        .expect("create table");
-        conn.execute(
-            "INSERT INTO messages (hash, payload) VALUES ('h', 'p')",
-            [],
-        )
-        .expect("insert");
+        conn.execute_batch("CREATE TABLE messages (hash TEXT PRIMARY KEY, payload BLOB)")
+            .expect("create table");
+        conn.execute("INSERT INTO messages (hash, payload) VALUES ('h', 'p')", [])
+            .expect("insert");
         let result = validate_archive_schema(&conn);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("created_at"));
@@ -1335,7 +1359,8 @@ mod tests {
         .expect("create");
 
         // Three messages at the same created_at, hashes out of alphabetical order
-        let payload = r#"{"version":"1.1","sender":"abc","iris":["https://example.com"],"timestamp":100}"#;
+        let payload =
+            r#"{"version":"1.1","sender":"abc","iris":["https://example.com"],"timestamp":100}"#;
         conn.execute(
             "INSERT INTO messages VALUES ('zzz', ?1, 1000)",
             params![payload],
@@ -1356,8 +1381,7 @@ mod tests {
         // Replay from cursor at (1000, "aaa") should skip "aaa" and return "mmm" then "zzz"
         let conn = Connection::open_with_flags(
             &archive_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .expect("open read-only");
 
@@ -1473,7 +1497,13 @@ mod tests {
         assert_eq!(count, 1);
 
         // Second upsert increments attempt_count
-        let report2 = make_report("rejected", Some("[medium_music] not music"), Some(200), Some("podcast"), None);
+        let report2 = make_report(
+            "rejected",
+            Some("[medium_music] not music"),
+            Some(200),
+            Some("podcast"),
+            None,
+        );
         store.upsert_feed_memory("https://example.com/feed.xml", &report2, 200);
 
         let (outcome, medium, count): (String, Option<String>, i64) = store
@@ -1545,7 +1575,13 @@ mod tests {
         let db_path = tempdir.path().join("gossip_state.db");
         let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
 
-        let report = make_report("accepted", None, Some(200), Some("publisher"), Some("guid-2"));
+        let report = make_report(
+            "accepted",
+            None,
+            Some(200),
+            Some("publisher"),
+            Some("guid-2"),
+        );
         store.upsert_feed_memory("https://example.com/pub.xml", &report, 100);
 
         assert!(
@@ -1561,7 +1597,13 @@ mod tests {
         let db_path = tempdir.path().join("gossip_state.db");
         let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
 
-        let report = make_report("fetch_error", Some("http 404 Not Found"), Some(404), None, None);
+        let report = make_report(
+            "fetch_error",
+            Some("http 404 Not Found"),
+            Some(404),
+            None,
+            None,
+        );
         store.upsert_feed_memory("https://example.com/gone.xml", &report, 100);
 
         assert!(
@@ -1668,10 +1710,7 @@ mod tests {
 
     #[test]
     fn continuity_check_accepts_valid_cursor() {
-        let conn = create_test_archive(&[
-            ("hash_a", "{}", 1000),
-            ("hash_b", "{}", 2000),
-        ]);
+        let conn = create_test_archive(&[("hash_a", "{}", 1000), ("hash_b", "{}", 2000)]);
         let cursor = ArchiveCursor {
             created_at: 1000,
             hash: "hash_a".to_string(),
@@ -1681,10 +1720,7 @@ mod tests {
 
     #[test]
     fn continuity_check_accepts_cursor_between_rows() {
-        let conn = create_test_archive(&[
-            ("hash_a", "{}", 1000),
-            ("hash_b", "{}", 2000),
-        ]);
+        let conn = create_test_archive(&[("hash_a", "{}", 1000), ("hash_b", "{}", 2000)]);
         let cursor = ArchiveCursor {
             created_at: 1500,
             hash: "hash_x".to_string(),
@@ -1694,10 +1730,7 @@ mod tests {
 
     #[test]
     fn continuity_check_rejects_stale_cursor() {
-        let conn = create_test_archive(&[
-            ("hash_a", "{}", 1000),
-            ("hash_b", "{}", 2000),
-        ]);
+        let conn = create_test_archive(&[("hash_a", "{}", 1000), ("hash_b", "{}", 2000)]);
         let cursor = ArchiveCursor {
             created_at: 500,
             hash: "old".to_string(),
