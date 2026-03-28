@@ -184,34 +184,90 @@ Operational note:
 
 ### gossip
 
-Listen to a local gossip-listener SSE stream for live podping notifications:
+Listen to a local gossip-listener SSE stream for live podping notifications.
+
+#### Prerequisites
+
+- A running `gossip-listener` instance (provides the SSE stream and archive)
+- The stophammer user must be in the `podping` group to read the archive
+- `CRAWL_TOKEN` and `INGEST_URL` environment variables set
+
+The gossip-listener archive database lives at
+`/var/lib/podping-alpha-gossip-listener/archive.db` by default.
+
+#### Archive-backed mode (recommended)
+
+Uses gossip-listener's `archive.db` as a durable podping backlog. Survives
+restarts, SSE disconnects, and process crashes without losing notifications.
+
+First-time bootstrap (catches up on the last 24 hours of podpings):
 
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  gossip --sse-url http://127.0.0.1:8089/events --concurrency 3
-```
-
-Optional archive catch-up:
-
-```bash
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  gossip \
-  --archive-db ./archive.db \
+stophammer-crawler gossip \
+  --archive-db /var/lib/podping-alpha-gossip-listener/archive.db \
   --since-hours 24 \
-  --concurrency 3
+  --skip-known-non-music \
+  --skip-ttl-days 30
 ```
 
-Important:
+Subsequent runs resume from the stored cursor automatically:
 
-- `--since-hours` only applies when `--archive-db` is set
-- live SSE mode keeps a cursor for observability, but it does not replay from that
-  cursor without an archive database
-- the SSE connection uses a connect timeout only and stays open for normal
-  long-lived streaming
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler gossip \
+  --archive-db /var/lib/podping-alpha-gossip-listener/archive.db \
+  --skip-known-non-music \
+  --skip-ttl-days 30
+```
+
+On startup, the crawler validates the archive schema, checks cursor continuity
+(exits fatally if notifications were lost), replays missed notifications in
+batches of ~500 with backpressure, then connects to SSE for live events.
+A background reconciliation task queries the archive periodically (10 s, then
+60 s steady-state, backing off to 5 min when idle) to catch anything SSE missed.
+
+If the stored cursor is older than the oldest retained archive row, the crawler
+exits with a fatal error. Delete `gossip_state.db` to re-bootstrap.
+
+#### Live-only mode (best-effort)
+
+Without `--archive-db`, gossip mode streams SSE events only. Not restart-safe
+— any events that arrive while the process is down are lost.
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler gossip
+```
+
+#### Feed memory and skip logic
+
+`gossip_state.db` records the latest crawl result for each feed URL (HTTP
+status, outcome, medium, attempt count). With `--skip-known-non-music`, feeds
+proven irrelevant by a prior crawl are skipped on future notifications:
+
+- HTTP 200 with a non-music, non-publisher `raw_medium`, or
+- a `[medium_music]` rejection (including absent `podcast:medium`)
+
+Fetch errors (404, 429, timeouts), parse errors, and prior successful feeds are
+never skipped. `--skip-ttl-days <n>` expires skip decisions after N days so
+feeds are periodically re-evaluated.
+
+#### Gossip options
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--state <path>` | `./gossip_state.db` | Cursor and feed memory database |
+| `--sse-url <url>` | `http://localhost:8089/events` | SSE endpoint URL |
+| `--archive-db <path>` | off | gossip-listener archive database path |
+| `--since-hours <n>` | off | Bootstrap from N hours ago (requires `--archive-db`) |
+| `--concurrency <n>` | `3` | Parallel fetch+ingest workers |
+| `--skip-known-non-music` | off | Skip feeds proven non-music by prior crawl |
+| `--skip-ttl-days <n>` | off | Re-evaluate skip decisions after N days |
+| `-q, --quiet` | off | Hide non-music medium rejections |
 
 ## Environment variables
 

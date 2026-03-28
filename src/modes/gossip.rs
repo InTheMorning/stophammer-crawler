@@ -18,6 +18,10 @@ fn create_async_client() -> reqwest::Client {
 }
 
 const GOSSIP_LISTENER_SSE_URL: &str = "http://localhost:8089/events";
+const ARCHIVE_REPLAY_BATCH_SIZE: usize = 500;
+const RECONCILIATION_INITIAL_DELAY_SECS: u64 = 10;
+const RECONCILIATION_STEADY_STATE_SECS: u64 = 60;
+const RECONCILIATION_MAX_INTERVAL_SECS: u64 = 300;
 
 #[derive(Debug, serde::Deserialize)]
 struct GossipNotification {
@@ -456,6 +460,55 @@ fn validate_archive_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// Return the newest `(created_at, hash)` row in the archive.
+fn get_archive_high_water_mark(conn: &Connection) -> Option<ArchiveCursor> {
+    conn.query_row(
+        "SELECT created_at, hash FROM messages ORDER BY created_at DESC, hash DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(ArchiveCursor {
+                created_at: row.get(0)?,
+                hash: row.get(1)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Return the oldest `(created_at, hash)` row in the archive.
+fn get_archive_oldest_cursor(conn: &Connection) -> Option<ArchiveCursor> {
+    conn.query_row(
+        "SELECT created_at, hash FROM messages ORDER BY created_at ASC, hash ASC LIMIT 1",
+        [],
+        |row| {
+            Ok(ArchiveCursor {
+                created_at: row.get(0)?,
+                hash: row.get(1)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Fail-closed check: is the stored archive cursor still within the retained archive window?
+fn check_archive_continuity(conn: &Connection, cursor: &ArchiveCursor) -> Result<(), String> {
+    let min_created_at: i64 = conn
+        .query_row("SELECT MIN(created_at) FROM messages", [], |row| row.get(0))
+        .map_err(|e| format!("failed to query archive min created_at: {e}"))?;
+
+    if cursor.created_at < min_created_at {
+        return Err(format!(
+            "archive gap: cursor created_at={} is older than the oldest retained row \
+             created_at={} ({} seconds of notifications may be lost). \
+             Remove gossip_state.db to re-bootstrap from the oldest archive row.",
+            cursor.created_at,
+            min_created_at,
+            min_created_at - cursor.created_at,
+        ));
+    }
+    Ok(())
+}
+
 /// A single row from the archive replay query, carrying the cursor position.
 struct ArchiveMessage {
     created_at: i64,
@@ -472,10 +525,12 @@ async fn replay_from_archive(
     archive_path: &str,
     cursor: Option<&ArchiveCursor>,
     since: u64,
+    high_water: &ArchiveCursor,
     dedup: &Arc<Mutex<Dedup>>,
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    concurrency: usize,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
@@ -497,112 +552,163 @@ async fn replay_from_archive(
         return GossipCounters::default();
     }
 
-    let messages: Vec<ArchiveMessage> = if let Some(cur) = cursor {
+    eprintln!(
+        "gossip: replaying archive in batches of {ARCHIVE_REPLAY_BATCH_SIZE} \
+         (high-water: ({}, {}))",
+        high_water.created_at, high_water.hash,
+    );
+
+    let mut total_counters = GossipCounters::default();
+    let mut current_cursor: Option<ArchiveCursor> = cursor.cloned();
+    let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
+    let limit = i64::try_from(ARCHIVE_REPLAY_BATCH_SIZE).unwrap_or(i64::MAX);
+    let mut batch_number = 0u64;
+
+    loop {
+        let messages: Vec<ArchiveMessage> = if let Some(ref cur) = current_cursor {
+            let mut stmt = match conn.prepare(
+                "SELECT hash, payload, created_at FROM messages
+                 WHERE (created_at > ?1 OR (created_at = ?1 AND hash > ?2))
+                   AND (created_at < ?3 OR (created_at = ?3 AND hash <= ?4))
+                 ORDER BY created_at ASC, hash ASC
+                 LIMIT ?5",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("gossip: ERROR: failed to prepare cursor batch query: {e}");
+                    break;
+                }
+            };
+            match stmt.query_map(
+                params![
+                    cur.created_at,
+                    cur.hash,
+                    high_water.created_at,
+                    high_water.hash,
+                    limit,
+                ],
+                |row| {
+                    Ok(ArchiveMessage {
+                        hash: row.get(0)?,
+                        payload: row.get::<_, String>(1)?.into_bytes(),
+                        created_at: row.get(2)?,
+                    })
+                },
+            ) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(e) => {
+                    eprintln!("gossip: ERROR: failed to query archive batch: {e}");
+                    break;
+                }
+            }
+        } else {
+            let mut stmt = match conn.prepare(
+                "SELECT hash, payload, created_at FROM messages
+                 WHERE created_at >= ?1
+                   AND (created_at < ?2 OR (created_at = ?2 AND hash <= ?3))
+                 ORDER BY created_at ASC, hash ASC
+                 LIMIT ?4",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("gossip: ERROR: failed to prepare since batch query: {e}");
+                    break;
+                }
+            };
+            match stmt.query_map(
+                params![since_i64, high_water.created_at, high_water.hash, limit],
+                |row| {
+                    Ok(ArchiveMessage {
+                        hash: row.get(0)?,
+                        payload: row.get::<_, String>(1)?.into_bytes(),
+                        created_at: row.get(2)?,
+                    })
+                },
+            ) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(e) => {
+                    eprintln!("gossip: ERROR: failed to query archive batch: {e}");
+                    break;
+                }
+            }
+        };
+
+        if messages.is_empty() {
+            break;
+        }
+
+        let batch_count = messages.len();
+        batch_number += 1;
+        let pre_launched = total_counters.urls_launched;
+        let pre_skipped =
+            total_counters.urls_dedup_skipped + total_counters.urls_feed_memory_skipped;
+
+        for msg in &messages {
+            let notif: GossipNotification = match serde_json::from_slice(&msg.payload) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+
+            total_counters.notifications_seen += 1;
+            current_cursor = Some(ArchiveCursor {
+                created_at: msg.created_at,
+                hash: msg.hash.clone(),
+            });
+
+            process_notification_urls(
+                &notif,
+                &mut total_counters,
+                dedup,
+                client,
+                config,
+                sem,
+                progress,
+                skip_known_non_music,
+                skip_ttl_days,
+                quiet,
+            )
+            .await;
+        }
+
+        // Drain: wait for all in-flight crawl tasks to complete before next batch
+        let drain = sem
+            .acquire_many(u32::try_from(concurrency).expect("concurrency fits u32"))
+            .await
+            .expect("semaphore closed");
+        drop(drain);
+
+        // Persist cursor after each batch for resume granularity
+        if let Some(ref cur) = current_cursor {
+            progress.lock().unwrap().set_archive_cursor(cur);
+        }
+
+        let batch_launched = total_counters.urls_launched - pre_launched;
+        let batch_skipped = (total_counters.urls_dedup_skipped
+            + total_counters.urls_feed_memory_skipped)
+            - pre_skipped;
         eprintln!(
-            "gossip: replay from archive cursor ({}, {}) db={archive_path}",
-            cur.created_at, cur.hash
+            "gossip: replay batch {batch_number}: {batch_count} notifications, \
+             launched={batch_launched}, skipped={batch_skipped}",
         );
-        let mut stmt = match conn.prepare(
-            "SELECT hash, payload, created_at FROM messages
-             WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
-             ORDER BY created_at ASC, hash ASC",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("gossip: ERROR: failed to prepare cursor query: {e}");
-                return GossipCounters::default();
-            }
-        };
-        match stmt.query_map(params![cur.created_at, cur.hash], |row| {
-            Ok(ArchiveMessage {
-                hash: row.get(0)?,
-                payload: row.get::<_, String>(1)?.into_bytes(),
-                created_at: row.get(2)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(Result::ok).collect(),
-            Err(e) => {
-                eprintln!("gossip: ERROR: failed to query archive: {e}");
-                return GossipCounters::default();
-            }
+
+        if batch_count < ARCHIVE_REPLAY_BATCH_SIZE {
+            break;
         }
-    } else {
-        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
-        eprintln!("gossip: replay from archive since={since} db={archive_path}");
-        let mut stmt = match conn.prepare(
-            "SELECT hash, payload, created_at FROM messages
-             WHERE created_at >= ?1
-             ORDER BY created_at ASC, hash ASC",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("gossip: ERROR: failed to prepare since query: {e}");
-                return GossipCounters::default();
-            }
-        };
-        match stmt.query_map(params![since_i64], |row| {
-            Ok(ArchiveMessage {
-                hash: row.get(0)?,
-                payload: row.get::<_, String>(1)?.into_bytes(),
-                created_at: row.get(2)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(Result::ok).collect(),
-            Err(e) => {
-                eprintln!("gossip: ERROR: failed to query archive: {e}");
-                return GossipCounters::default();
-            }
-        }
-    };
-
-    eprintln!("gossip: found {} messages in archive", messages.len());
-
-    let mut counters = GossipCounters::default();
-    let mut last_cursor: Option<ArchiveCursor> = None;
-
-    for msg in &messages {
-        let notif: GossipNotification = match serde_json::from_slice(&msg.payload) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-
-        counters.notifications_seen += 1;
-        last_cursor = Some(ArchiveCursor {
-            created_at: msg.created_at,
-            hash: msg.hash.clone(),
-        });
-
-        process_notification_urls(
-            &notif,
-            &mut counters,
-            dedup,
-            client,
-            config,
-            sem,
-            progress,
-            skip_known_non_music,
-            skip_ttl_days,
-            quiet,
-        )
-        .await;
-    }
-
-    if let Some(ref cur) = last_cursor {
-        progress.lock().unwrap().set_archive_cursor(cur);
     }
 
     eprintln!(
-        "gossip: replay complete: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
-        counters.notifications_seen,
-        counters.notifications_accepted,
-        counters.notifications_filtered,
-        counters.urls_seen,
-        counters.urls_launched,
-        counters.urls_dedup_skipped,
-        counters.urls_feed_memory_skipped
+        "gossip: replay complete ({batch_number} batches): seen={} accepted={} filtered={} \
+         urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
+        total_counters.notifications_seen,
+        total_counters.notifications_accepted,
+        total_counters.notifications_filtered,
+        total_counters.urls_seen,
+        total_counters.urls_launched,
+        total_counters.urls_dedup_skipped,
+        total_counters.urls_feed_memory_skipped,
     );
 
-    counters
+    total_counters
 }
 
 #[allow(
@@ -673,6 +779,162 @@ async fn stream_sse_events(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "reconciliation threads through shared clients, progress, and output policy"
+)]
+async fn reconcile_archive_batch(
+    archive_path: &str,
+    dedup: &Arc<Mutex<Dedup>>,
+    client: &Arc<Client>,
+    config: &Arc<CrawlConfig>,
+    sem: &Arc<Semaphore>,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
+    quiet: bool,
+) -> u64 {
+    // Collect all messages synchronously, then drop the connection before any .await
+    let messages: Vec<ArchiveMessage> = {
+        let conn = match Connection::open_with_flags(
+            archive_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("gossip: reconciliation: failed to open archive: {e}");
+                return 0;
+            }
+        };
+
+        let Some(cursor) = progress.lock().unwrap().get_archive_cursor() else {
+            return 0;
+        };
+
+        let mut stmt = match conn.prepare(
+            "SELECT hash, payload, created_at FROM messages
+             WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
+             ORDER BY created_at ASC, hash ASC
+             LIMIT 1000",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gossip: reconciliation: failed to prepare query: {e}");
+                return 0;
+            }
+        };
+
+        match stmt.query_map(params![cursor.created_at, cursor.hash], |row| {
+            Ok(ArchiveMessage {
+                hash: row.get(0)?,
+                payload: row.get::<_, String>(1)?.into_bytes(),
+                created_at: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(e) => {
+                eprintln!("gossip: reconciliation: failed to query archive: {e}");
+                return 0;
+            }
+        }
+    };
+
+    if messages.is_empty() {
+        return 0;
+    }
+
+    let count = messages.len() as u64;
+    let mut counters = GossipCounters::default();
+    let mut last_cursor: Option<ArchiveCursor> = None;
+
+    for msg in &messages {
+        let notif: GossipNotification = match serde_json::from_slice(&msg.payload) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        counters.notifications_seen += 1;
+        last_cursor = Some(ArchiveCursor {
+            created_at: msg.created_at,
+            hash: msg.hash.clone(),
+        });
+
+        process_notification_urls(
+            &notif,
+            &mut counters,
+            dedup,
+            client,
+            config,
+            sem,
+            progress,
+            skip_known_non_music,
+            skip_ttl_days,
+            quiet,
+        )
+        .await;
+    }
+
+    if let Some(ref cur) = last_cursor {
+        progress.lock().unwrap().set_archive_cursor(cur);
+    }
+
+    eprintln!(
+        "gossip: reconciliation: {count} rows, launched={}, skipped={}",
+        counters.urls_launched,
+        counters.urls_dedup_skipped + counters.urls_feed_memory_skipped,
+    );
+
+    count
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "reconciliation loop threads through shared clients, progress, and output policy"
+)]
+async fn archive_reconciliation_loop(
+    archive_path: String,
+    dedup: Arc<Mutex<Dedup>>,
+    client: Arc<Client>,
+    config: Arc<CrawlConfig>,
+    sem: Arc<Semaphore>,
+    progress: Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
+    quiet: bool,
+) {
+    let mut interval_secs = RECONCILIATION_INITIAL_DELAY_SECS;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+
+        let rows = reconcile_archive_batch(
+            &archive_path,
+            &dedup,
+            &client,
+            &config,
+            &sem,
+            &progress,
+            skip_known_non_music,
+            skip_ttl_days,
+            quiet,
+        )
+        .await;
+
+        if interval_secs == RECONCILIATION_INITIAL_DELAY_SECS {
+            // After the first (fast) reconciliation, switch to steady-state cadence
+            interval_secs = RECONCILIATION_STEADY_STATE_SECS;
+        } else if rows > 0 {
+            interval_secs = RECONCILIATION_STEADY_STATE_SECS;
+        } else {
+            interval_secs = std::cmp::min(
+                interval_secs.saturating_mul(2),
+                RECONCILIATION_MAX_INTERVAL_SECS,
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     state_path: String,
@@ -692,82 +954,124 @@ pub async fn run(
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress_store = ProgressStore::open(&state_path);
 
-    // Resolve the archive cursor: stored cursor > legacy migration > --since-hours > default
     let archive_cursor = progress_store.get_archive_cursor();
-    let since = if let Some(hours) = since_hours {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(hours * 3600)
-    } else if archive_cursor.is_some() {
-        0 // cursor-based replay, since is unused
-    } else if let Some(ts) = progress_store.get_last_timestamp() {
-        ts
+
+    // --- Archive-backed startup: validate, check continuity, resolve cursor ---
+    let (effective_cursor, high_water, since) = if let Some(ref archive) = archive_db {
+        let archive_conn = match Connection::open_with_flags(
+            archive,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("gossip: FATAL: failed to open archive db {archive}: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        if let Err(e) = validate_archive_schema(&archive_conn) {
+            eprintln!("gossip: FATAL: archive schema validation failed: {e}");
+            std::process::exit(1);
+        }
+
+        // Resolve cursor: stored > legacy migration > none
+        let effective_cursor = if let Some(ref cur) = archive_cursor {
+            if let Err(e) = check_archive_continuity(&archive_conn, cur) {
+                eprintln!("gossip: FATAL: {e}");
+                std::process::exit(1);
+            }
+            archive_cursor.clone()
+        } else if progress_store.get_last_timestamp().is_some() {
+            progress_store.migrate_legacy_cursor(&archive_conn)
+        } else {
+            None
+        };
+
+        let high_water = get_archive_high_water_mark(&archive_conn)
+            .expect("archive validated non-empty above");
+
+        // Resolve since: --since-hours > cursor (unused) > oldest archive row
+        let since = if let Some(hours) = since_hours {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(hours * 3600)
+        } else if effective_cursor.is_some() {
+            0 // cursor-based replay, since is unused
+        } else {
+            // Bootstrap from oldest available archive row
+            get_archive_oldest_cursor(&archive_conn)
+                .map_or(0, |c| u64::try_from(c.created_at).unwrap_or(0))
+        };
+
+        (effective_cursor, Some(high_water), since)
     } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .saturating_sub(86400)
+        // Live-only mode: no archive validation
+        let since = if let Some(hours) = since_hours {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(hours * 3600)
+        } else if let Some(ts) = progress_store.get_last_timestamp() {
+            ts
+        } else {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(86400)
+        };
+        (None, None, since)
     };
 
+    // --- Startup logging ---
     if let Some(ref _archive) = archive_db {
-        if let Some(ref cur) = archive_cursor {
+        if let Some(ref cur) = effective_cursor {
             eprintln!(
                 "gossip: archive-backed mode, cursor=({}, {}), state={state_path}, concurrency={concurrency}",
-                cur.created_at, cur.hash
+                cur.created_at, cur.hash,
             );
         } else {
             eprintln!(
-                "gossip: archive-backed mode, since={since}, state={state_path}, concurrency={concurrency}"
+                "gossip: archive-backed mode, since={since}, state={state_path}, concurrency={concurrency}",
             );
         }
     } else if let Some(ts) = progress_store.get_last_timestamp() {
         eprintln!(
-            "gossip: live-only mode, state={state_path}, last_seen_timestamp={ts}, concurrency={concurrency}"
+            "gossip: live-only mode (best-effort, not restart-safe), state={state_path}, \
+             last_seen_timestamp={ts}, concurrency={concurrency}",
         );
     } else {
-        eprintln!("gossip: live-only mode, state={state_path}, concurrency={concurrency}");
+        eprintln!(
+            "gossip: live-only mode (best-effort, not restart-safe), state={state_path}, \
+             concurrency={concurrency}",
+        );
     }
     if skip_known_non_music {
         eprintln!(
             "gossip: skip-known-non-music enabled{}",
-            skip_ttl_days.map_or(String::new(), |d| format!(", ttl={d}d"))
+            skip_ttl_days.map_or(String::new(), |d| format!(", ttl={d}d")),
         );
     }
     eprintln!("gossip: SSE endpoint={sse_url}");
 
-    // Legacy migration needs mutable access before wrapping in Arc<Mutex>
-    let effective_cursor = if let Some(ref archive) = archive_db {
-        if archive_cursor.is_some() {
-            archive_cursor
-        } else if progress_store.get_last_timestamp().is_some() {
-            let archive_conn = Connection::open_with_flags(
-                archive,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .ok();
-            archive_conn.and_then(|c| progress_store.migrate_legacy_cursor(&c))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let progress = Arc::new(std::sync::Mutex::new(progress_store));
 
+    // --- Archive replay with batched backpressure ---
     if let Some(ref archive) = archive_db {
-        let archive_counters = replay_from_archive(
+        let hw = high_water.as_ref().expect("set above for archive mode");
+        replay_from_archive(
             archive,
             effective_cursor.as_ref(),
             since,
+            hw,
             &dedup,
             &client,
             &config,
             &sem,
+            concurrency,
             &progress,
             skip_known_non_music,
             skip_ttl_days,
@@ -775,18 +1079,27 @@ pub async fn run(
         )
         .await;
 
-        if archive_counters.urls_launched > 0 || archive_counters.urls_feed_memory_skipped > 0 {
-            eprintln!(
-                "gossip: replay stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
-                archive_counters.notifications_seen,
-                archive_counters.notifications_accepted,
-                archive_counters.notifications_filtered,
-                archive_counters.urls_seen,
-                archive_counters.urls_launched,
-                archive_counters.urls_dedup_skipped,
-                archive_counters.urls_feed_memory_skipped
-            );
-        }
+        // Spawn archive reconciliation to catch missed SSE events
+        let recon_archive = archive.clone();
+        let recon_dedup = Arc::clone(&dedup);
+        let recon_client = Arc::clone(&client);
+        let recon_config = Arc::clone(&config);
+        let recon_sem = Arc::clone(&sem);
+        let recon_progress = Arc::clone(&progress);
+        tokio::spawn(async move {
+            archive_reconciliation_loop(
+                recon_archive,
+                recon_dedup,
+                recon_client,
+                recon_config,
+                recon_sem,
+                recon_progress,
+                skip_known_non_music,
+                skip_ttl_days,
+                quiet,
+            )
+            .await;
+        });
     }
 
     let dedup_cleanup = Arc::clone(&dedup);
@@ -1315,5 +1628,82 @@ mod tests {
                 .should_skip_feed("https://example.com/old.xml", Some(90))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn high_water_mark_returns_newest_row() {
+        let conn = create_test_archive(&[
+            ("hash_a", "{}", 1000),
+            ("hash_b", "{}", 2000),
+            ("hash_c", "{}", 1500),
+        ]);
+        let hw = get_archive_high_water_mark(&conn).expect("should find max");
+        assert_eq!(hw.created_at, 2000);
+        assert_eq!(hw.hash, "hash_b");
+    }
+
+    #[test]
+    fn high_water_mark_tiebreaks_by_hash_desc() {
+        let conn = create_test_archive(&[
+            ("aaa", "{}", 1000),
+            ("zzz", "{}", 1000),
+            ("mmm", "{}", 1000),
+        ]);
+        let hw = get_archive_high_water_mark(&conn).expect("should find max");
+        assert_eq!(hw.created_at, 1000);
+        assert_eq!(hw.hash, "zzz");
+    }
+
+    #[test]
+    fn oldest_cursor_returns_earliest_row() {
+        let conn = create_test_archive(&[
+            ("hash_a", "{}", 2000),
+            ("hash_b", "{}", 1000),
+            ("hash_c", "{}", 1500),
+        ]);
+        let oldest = get_archive_oldest_cursor(&conn).expect("should find min");
+        assert_eq!(oldest.created_at, 1000);
+        assert_eq!(oldest.hash, "hash_b");
+    }
+
+    #[test]
+    fn continuity_check_accepts_valid_cursor() {
+        let conn = create_test_archive(&[
+            ("hash_a", "{}", 1000),
+            ("hash_b", "{}", 2000),
+        ]);
+        let cursor = ArchiveCursor {
+            created_at: 1000,
+            hash: "hash_a".to_string(),
+        };
+        assert!(check_archive_continuity(&conn, &cursor).is_ok());
+    }
+
+    #[test]
+    fn continuity_check_accepts_cursor_between_rows() {
+        let conn = create_test_archive(&[
+            ("hash_a", "{}", 1000),
+            ("hash_b", "{}", 2000),
+        ]);
+        let cursor = ArchiveCursor {
+            created_at: 1500,
+            hash: "hash_x".to_string(),
+        };
+        assert!(check_archive_continuity(&conn, &cursor).is_ok());
+    }
+
+    #[test]
+    fn continuity_check_rejects_stale_cursor() {
+        let conn = create_test_archive(&[
+            ("hash_a", "{}", 1000),
+            ("hash_b", "{}", 2000),
+        ]);
+        let cursor = ArchiveCursor {
+            created_at: 500,
+            hash: "old".to_string(),
+        };
+        let result = check_archive_continuity(&conn, &cursor);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("archive gap"));
     }
 }
