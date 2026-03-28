@@ -26,6 +26,7 @@ use crate::url_queue::{host_key, interleave_by_host};
 
 const IMPORT_FETCH_TIMEOUT_SECS: u64 = 5;
 const IMPORT_TASK_HARD_TIMEOUT_SECS: u64 = 15;
+const IMPORT_MAX_CONSECUTIVE_TIMEOUTS: i64 = 3;
 const IMPORT_BATCH_HEARTBEAT_SECS: u64 = 30;
 const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
 const WAVLAKE_IMPORT_MIN_DELAY_MS: u64 = 2_000;
@@ -140,16 +141,17 @@ impl WavlakeThrottle {
 
     async fn record_attempt(&self, candidate: &CandidateRow, report: &CrawlReport) {
         let mut guard = self.state.lock().await;
-        if report.fetch_http_status == Some(429) {
+        let status = report.fetch_http_status;
+        if status == Some(429) || status == Some(503) {
             guard.extra_delay_secs = guard.extra_delay_secs.saturating_add(1);
         }
         let delay = wavlake_throttle_delay(report, guard.extra_delay_secs);
         guard.next_allowed_at = Some(Instant::now() + delay);
 
-        if report.fetch_http_status == Some(429) {
+        if status == Some(429) || status == Some(503) {
             eprintln!(
-                "  import: wavlake 429 backoff {:?} after id={} {} (extra_inter_fetch_delay={}s)",
-                delay, candidate.id, candidate.url, guard.extra_delay_secs,
+                "  import: wavlake {} backoff {:?} after id={} {} (extra_inter_fetch_delay={}s)",
+                status.unwrap(), delay, candidate.id, candidate.url, guard.extra_delay_secs,
             );
         }
     }
@@ -255,6 +257,7 @@ struct KnownImportMemory {
     outcome_reason: Option<String>,
     raw_medium: Option<String>,
     parsed_feed_guid: Option<String>,
+    consecutive_timeout_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,9 +282,15 @@ impl ImportMemoryRow {
         attempted_at: i64,
         attempt_duration_ms: i64,
     ) -> Self {
+        let feed_url = report
+            .final_url
+            .as_ref()
+            .filter(|u| u.as_str() != candidate.url)
+            .cloned()
+            .unwrap_or_else(|| candidate.url.clone());
         Self {
             podcastindex_id: candidate.id,
-            feed_url: candidate.url.clone(),
+            feed_url,
             podcastindex_guid: candidate.podcast_guid.clone(),
             fetch_http_status: report.fetch_http_status,
             fetch_outcome: report.outcome.label().to_string(),
@@ -436,7 +445,7 @@ impl ImportAuditWriter {
     fn spawn(path: &str, append: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let path = path.to_string();
-        let lock_path = acquire_audit_lock(&path);
+        let lock_path = acquire_pid_lock(&path, "import audit");
         let handle = thread::spawn(move || {
             let seen_keys = load_existing_audit_keys(&path, append);
             let writer = open_audit_output(&path, append);
@@ -474,14 +483,14 @@ impl ImportAuditWriter {
     }
 }
 
-fn acquire_audit_lock(path: &str) -> PathBuf {
+fn acquire_pid_lock(path: &str, label: &str) -> PathBuf {
     let lock_path = PathBuf::from(format!("{path}.lock"));
     if let Some(parent) = lock_path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent).unwrap_or_else(|err| {
             panic!(
-                "failed to create import audit lock directory {}: {err}",
+                "failed to create {label} lock directory {}: {err}",
                 parent.display()
             )
         });
@@ -500,12 +509,12 @@ fn acquire_audit_lock(path: &str) -> PathBuf {
             {
                 assert!(
                     !Path::new(&format!("/proc/{pid}")).exists(),
-                    "import audit lock {} held by live process pid={pid}",
+                    "{label} lock {} held by live process pid={pid}",
                     lock_path.display()
                 );
             }
             eprintln!(
-                "import: WARNING: reclaiming stale audit lock {}",
+                "import: WARNING: reclaiming stale {label} lock {}",
                 lock_path.display()
             );
             let mut f = OpenOptions::new()
@@ -514,7 +523,7 @@ fn acquire_audit_lock(path: &str) -> PathBuf {
                 .open(&lock_path)
                 .unwrap_or_else(|err| {
                     panic!(
-                        "failed to reclaim import audit lock {}: {err}",
+                        "failed to reclaim {label} lock {}: {err}",
                         lock_path.display()
                     )
                 });
@@ -522,12 +531,22 @@ fn acquire_audit_lock(path: &str) -> PathBuf {
         }
         Err(err) => {
             panic!(
-                "failed to acquire import audit lock {}: {err}",
+                "failed to acquire {label} lock {}: {err}",
                 lock_path.display()
             );
         }
     }
     lock_path
+}
+
+struct PidLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for PidLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemoryRow) {
@@ -904,7 +923,8 @@ fn initialize_state_schema(conn: &Connection) {
             first_attempted_at INTEGER NOT NULL,
             last_attempted_at  INTEGER NOT NULL,
             attempt_duration_ms INTEGER NOT NULL DEFAULT 0,
-            attempt_count      INTEGER NOT NULL DEFAULT 1
+            attempt_count      INTEGER NOT NULL DEFAULT 1,
+            consecutive_timeout_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_import_feed_memory_status
             ON import_feed_memory(fetch_http_status);
@@ -926,6 +946,21 @@ fn initialize_state_schema(conn: &Connection) {
             [],
         )
         .expect("failed to add attempt_duration_ms to import_feed_memory");
+    }
+
+    let has_consecutive_timeout_count = conn
+        .prepare("PRAGMA table_info(import_feed_memory)")
+        .expect("failed to prepare import_feed_memory table_info pragma")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("failed to inspect import_feed_memory schema")
+        .filter_map(Result::ok)
+        .any(|column| column == "consecutive_timeout_count");
+    if !has_consecutive_timeout_count {
+        conn.execute(
+            "ALTER TABLE import_feed_memory ADD COLUMN consecutive_timeout_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .expect("failed to add consecutive_timeout_count to import_feed_memory");
     }
 }
 
@@ -962,7 +997,12 @@ fn set_last_processed_id(
     )
 }
 
+fn is_timeout_outcome(row: &ImportMemoryRow) -> bool {
+    row.fetch_http_status.is_none() && row.fetch_outcome == "fetch_error"
+}
+
 fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::Result<usize> {
+    let timeout_flag: i64 = i64::from(is_timeout_outcome(row));
     conn.execute(
         "INSERT INTO import_feed_memory (
             podcastindex_id,
@@ -977,8 +1017,9 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             first_attempted_at,
             last_attempted_at,
             attempt_duration_ms,
-            attempt_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1)
+            attempt_count,
+            consecutive_timeout_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, 1, ?12)
         ON CONFLICT(podcastindex_id) DO UPDATE SET
             feed_url = excluded.feed_url,
             podcastindex_guid = excluded.podcastindex_guid,
@@ -990,7 +1031,12 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             parsed_feed_guid = excluded.parsed_feed_guid,
             last_attempted_at = excluded.last_attempted_at,
             attempt_duration_ms = excluded.attempt_duration_ms,
-            attempt_count = import_feed_memory.attempt_count + 1",
+            attempt_count = import_feed_memory.attempt_count + 1,
+            consecutive_timeout_count = CASE
+                WHEN excluded.consecutive_timeout_count > 0
+                THEN import_feed_memory.consecutive_timeout_count + 1
+                ELSE 0
+            END",
         params![
             row.podcastindex_id,
             row.feed_url,
@@ -1003,6 +1049,7 @@ fn upsert_import_memory(conn: &Connection, row: &ImportMemoryRow) -> rusqlite::R
             row.parsed_feed_guid,
             row.attempted_at,
             row.attempt_duration_ms,
+            timeout_flag,
         ],
     )
 }
@@ -1019,7 +1066,7 @@ fn load_known_import_memory(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT podcastindex_id, fetch_http_status, fetch_outcome, outcome_reason, raw_medium, parsed_feed_guid
+        "SELECT podcastindex_id, fetch_http_status, fetch_outcome, outcome_reason, raw_medium, parsed_feed_guid, consecutive_timeout_count
          FROM import_feed_memory
          WHERE podcastindex_id IN ({placeholders})"
     );
@@ -1036,6 +1083,7 @@ fn load_known_import_memory(
                     outcome_reason: row.get(3)?,
                     raw_medium: row.get(4)?,
                     parsed_feed_guid: row.get(5)?,
+                    consecutive_timeout_count: row.get(6)?,
                 },
             ))
         })
@@ -1157,7 +1205,7 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
 }
 
 fn wavlake_throttle_delay(report: &CrawlReport, extra_delay_secs: u64) -> Duration {
-    let base_delay = if report.fetch_http_status == Some(429)
+    let base_delay = if matches!(report.fetch_http_status, Some(429 | 503))
         && let CrawlOutcome::FetchError {
             retry_after_secs, ..
         } = &report.outcome
@@ -1338,6 +1386,12 @@ pub async fn run(
 ) {
     let scope = ImportScope::from_wavlake_only(wavlake_only);
     let audit_append = effective_audit_append(audit_replace, audit_output.as_deref());
+    let _state_lock = if dry_run {
+        None
+    } else {
+        let lock = acquire_pid_lock(&state_path, "import state");
+        Some(PidLockGuard { path: lock })
+    };
     let progress = ProgressStore::open(&state_path);
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
     let audit_writer = if dry_run {
@@ -1504,6 +1558,17 @@ pub async fn run(
                             );
                             enqueue_import_memory(&state_tx, memory_row);
                             eprintln!("  {}: id={} {}", skip_kind.label(), row.id, row.url);
+                            return;
+                        }
+
+                        if let Some(known) = known_memory.get(&row.id)
+                            && known.consecutive_timeout_count >= IMPORT_MAX_CONSECUTIVE_TIMEOUTS
+                        {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "  skip_timeout_exhausted: id={} {} ({} consecutive timeouts)",
+                                row.id, row.url, known.consecutive_timeout_count,
+                            );
                             return;
                         }
 
