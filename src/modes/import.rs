@@ -151,7 +151,11 @@ impl WavlakeThrottle {
         if status == Some(429) || status == Some(503) {
             eprintln!(
                 "  import: wavlake {} backoff {:?} after id={} {} (extra_inter_fetch_delay={}s)",
-                status.unwrap(), delay, candidate.id, candidate.url, guard.extra_delay_secs,
+                status.unwrap(),
+                delay,
+                candidate.id,
+                candidate.url,
+                guard.extra_delay_secs,
             );
         }
     }
