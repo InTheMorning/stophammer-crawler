@@ -1378,6 +1378,7 @@ pub async fn run(
     db_url: String,
     refresh_db: bool,
     state_path: String,
+    skip_db_path: String,
     batch_size: usize,
     concurrency: usize,
     audit_output: Option<String>,
@@ -1397,6 +1398,9 @@ pub async fn run(
         Some(PidLockGuard { path: lock })
     };
     let progress = ProgressStore::open(&state_path);
+    let skip_db = Arc::new(std::sync::Mutex::new(
+        crate::feed_skip::FeedSkipDb::open(&skip_db_path),
+    ));
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
     let audit_writer = if dry_run {
         None
@@ -1537,9 +1541,25 @@ pub async fn run(
                     let active_tasks = Arc::clone(&active_tasks);
                     let known_memory = Arc::clone(&known_memory);
                     let wavlake_throttle = wavlake_throttle.as_ref().map(Arc::clone);
+                    let skip_db = Arc::clone(&skip_db);
                     move || async move {
                         let attempted_at = Utc::now().timestamp();
                         let task_started_at = Instant::now();
+
+                        // Check shared cross-mode skip DB before mode-specific checks
+                        if skip_known_non_music {
+                            if let Some(reason) =
+                                skip_db.lock().unwrap().should_skip(&row.url, None)
+                            {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "  skipped_shared_irrelevant: id={} {} ({reason})",
+                                    row.id, row.url
+                                );
+                                return;
+                            }
+                        }
+
                         if let Some(skip_kind) = known_skip_kind(
                             known_memory.get(&row.id),
                             skip_known_non_music,
@@ -1603,6 +1623,10 @@ pub async fn run(
                                 .expect("attempt duration exceeded i64"),
                         );
                         enqueue_import_memory(&state_tx, memory_row);
+                        skip_db
+                            .lock()
+                            .unwrap()
+                            .record_outcome(&row.url, &report, "import");
                         if let Some(audit_tx) = &audit_tx
                             && let Some(audit_row) =
                                 build_import_audit_row(&row, &report, attempted_at)

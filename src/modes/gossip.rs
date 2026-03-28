@@ -399,6 +399,7 @@ async fn process_notification_urls(
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -417,17 +418,28 @@ async fn process_notification_urls(
             continue;
         }
 
-        if skip_known_non_music
-            && let Some(reason) = progress
+        if skip_known_non_music {
+            // Check shared cross-mode skip DB first
+            if let Some(reason) = skip_db.lock().unwrap().should_skip(url, skip_ttl_days) {
+                counters.urls_feed_memory_skipped += 1;
+                if !quiet {
+                    eprintln!("  skipped (shared: {reason}): {url}");
+                }
+                continue;
+            }
+
+            // Then check mode-specific feed memory
+            if let Some(reason) = progress
                 .lock()
                 .unwrap()
                 .should_skip_feed(url, skip_ttl_days)
-        {
-            counters.urls_feed_memory_skipped += 1;
-            if !quiet {
-                eprintln!("  skipped ({reason}): {url}");
+            {
+                counters.urls_feed_memory_skipped += 1;
+                if !quiet {
+                    eprintln!("  skipped ({reason}): {url}");
+                }
+                continue;
             }
-            continue;
         }
 
         counters.urls_launched += 1;
@@ -437,6 +449,7 @@ async fn process_notification_urls(
         let config = Arc::clone(config);
         let sem = Arc::clone(sem);
         let progress = Arc::clone(progress);
+        let skip_db = Arc::clone(skip_db);
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
@@ -448,6 +461,10 @@ async fn process_notification_urls(
                 eprintln!("  {}: {url}", report.outcome);
             }
 
+            skip_db
+                .lock()
+                .unwrap()
+                .record_outcome(&url, &report, "gossip");
             progress
                 .lock()
                 .unwrap()
@@ -562,6 +579,7 @@ async fn replay_from_archive(
     sem: &Arc<Semaphore>,
     concurrency: usize,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -693,6 +711,7 @@ async fn replay_from_archive(
                 config,
                 sem,
                 progress,
+                &skip_db,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -753,6 +772,7 @@ async fn stream_sse_events(
     sem: &Arc<Semaphore>,
     counters: &mut GossipCounters,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -801,6 +821,7 @@ async fn stream_sse_events(
                     config,
                     sem,
                     progress,
+                    skip_db,
                     skip_known_non_music,
                     skip_ttl_days,
                     quiet,
@@ -824,6 +845,7 @@ async fn reconcile_archive_batch(
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -901,6 +923,7 @@ async fn reconcile_archive_batch(
             config,
             sem,
             progress,
+            skip_db,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -932,6 +955,7 @@ async fn archive_reconciliation_loop(
     config: Arc<CrawlConfig>,
     sem: Arc<Semaphore>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -948,6 +972,7 @@ async fn archive_reconciliation_loop(
             &config,
             &sem,
             &progress,
+            &skip_db,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -971,6 +996,7 @@ async fn archive_reconciliation_loop(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     state_path: String,
+    skip_db_path: String,
     sse_url: Option<String>,
     archive_db: Option<String>,
     since_hours: Option<u64>,
@@ -986,6 +1012,9 @@ pub async fn run(
     let sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress_store = ProgressStore::open(&state_path);
+    let skip_db = Arc::new(std::sync::Mutex::new(
+        crate::feed_skip::FeedSkipDb::open(&skip_db_path),
+    ));
 
     let archive_cursor = progress_store.get_archive_cursor();
 
@@ -1106,6 +1135,7 @@ pub async fn run(
             &sem,
             concurrency,
             &progress,
+            &skip_db,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -1119,6 +1149,7 @@ pub async fn run(
         let recon_config = Arc::clone(&config);
         let recon_sem = Arc::clone(&sem);
         let recon_progress = Arc::clone(&progress);
+        let recon_skip_db = Arc::clone(&skip_db);
         tokio::spawn(async move {
             archive_reconciliation_loop(
                 recon_archive,
@@ -1127,6 +1158,7 @@ pub async fn run(
                 recon_config,
                 recon_sem,
                 recon_progress,
+                recon_skip_db,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -1155,6 +1187,7 @@ pub async fn run(
             &sem,
             &mut session_counters,
             &progress,
+            &skip_db,
             skip_known_non_music,
             skip_ttl_days,
             quiet,

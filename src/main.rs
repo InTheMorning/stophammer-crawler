@@ -1,5 +1,6 @@
 mod crawl;
 mod dedup;
+mod feed_skip;
 mod modes;
 mod pool;
 mod url_queue;
@@ -35,8 +36,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Crawl a list of feed URLs (file, args, env, or stdin)
-    Crawl {
+    /// Batch-process a list of feed URLs (file, args, env, or stdin)
+    Batch {
         /// Feed URLs or path to a file containing URLs
         urls: Vec<String>,
 
@@ -77,6 +78,10 @@ enum Mode {
         /// Path to import state database (resume cursor)
         #[arg(long, default_value = "./import_state.db")]
         state: String,
+
+        /// Path to shared feed skip database (cross-mode skip knowledge)
+        #[arg(long, default_value = "./feed_skip.db")]
+        skip_db: String,
 
         /// Feeds per database query batch
         #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
@@ -121,6 +126,10 @@ enum Mode {
         #[arg(long, default_value = "./gossip_state.db")]
         state: String,
 
+        /// Path to shared feed skip database (cross-mode skip knowledge)
+        #[arg(long, default_value = "./feed_skip.db")]
+        skip_db: String,
+
         /// SSE endpoint URL (default: <http://localhost:8089/events>)
         #[arg(long)]
         sse_url: Option<String>,
@@ -156,19 +165,20 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.mode {
-        Mode::Crawl {
+        Mode::Batch {
             urls,
             concurrency,
             host_delay_ms,
             failed_feeds_output,
         } => {
-            modes::crawl::run(urls, concurrency, host_delay_ms, failed_feeds_output).await;
+            modes::batch::run(urls, concurrency, host_delay_ms, failed_feeds_output).await;
         }
         Mode::Import {
             db,
             db_url,
             refresh_db,
             state,
+            skip_db,
             batch,
             concurrency,
             audit_output,
@@ -184,6 +194,7 @@ async fn main() {
                 db_url,
                 refresh_db,
                 state,
+                skip_db,
                 batch,
                 concurrency,
                 audit_output,
@@ -198,6 +209,7 @@ async fn main() {
         }
         Mode::Gossip {
             state,
+            skip_db,
             sse_url,
             archive_db,
             since_hours,
@@ -208,6 +220,7 @@ async fn main() {
         } => {
             modes::gossip::run(
                 state,
+                skip_db,
                 sse_url,
                 archive_db,
                 since_hours,
