@@ -103,7 +103,7 @@ impl FeedSkipDb {
         }
 
         // Prior medium-gate rejection
-        if outcome == "rejected"
+        if matches!(outcome.as_str(), "rejected" | "skipped_known_irrelevant")
             && let Some(ref r) = reason
             && r.starts_with("[medium_music]")
         {
@@ -249,6 +249,29 @@ mod tests {
             None,
         );
         db.record_outcome("https://example.com/feed.xml", &report, "test");
+
+        let reason = db
+            .should_skip("https://example.com/feed.xml", None)
+            .expect("should skip");
+        assert!(reason.contains("prior medium-gate rejection"));
+    }
+
+    #[test]
+    fn skips_prior_skipped_known_irrelevant_medium_gate_rows() {
+        let db = FeedSkipDb::open(&temp_db());
+        db.conn
+            .execute(
+                "INSERT INTO feed_outcomes (
+                    feed_url, fetch_http_status, raw_medium, fetch_outcome,
+                    outcome_reason, parsed_feed_guid, source_mode,
+                    first_seen_at, last_seen_at, seen_count
+                ) VALUES (?1, 200, NULL, 'skipped_known_irrelevant', ?2, NULL, 'import', 1, 2, 2)",
+                params![
+                    "https://example.com/feed.xml",
+                    "[medium_music] podcast:medium absent — must be 'music', 'publisher', or 'musicL'"
+                ],
+            )
+            .expect("seed prior skipped row");
 
         let reason = db
             .should_skip("https://example.com/feed.xml", None)
