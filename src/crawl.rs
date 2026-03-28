@@ -14,18 +14,44 @@ pub struct CrawlConfig {
     pub user_agent: String,
     pub fetch_timeout: Duration,
     pub ingest_timeout: Duration,
+    /// Dedicated HTTP client for ingest POSTs, built with connection pooling
+    /// disabled so stale keep-alive sockets never cause spurious failures.
+    ingest_client: reqwest::Client,
 }
 
 impl CrawlConfig {
     pub fn from_env() -> Self {
+        let ingest_timeout = Duration::from_secs(10);
         Self {
             crawl_token: std::env::var("CRAWL_TOKEN").expect("CRAWL_TOKEN is required"),
             ingest_url: std::env::var("INGEST_URL")
                 .unwrap_or_else(|_| "http://localhost:8008/ingest/feed".to_string()),
             user_agent: "stophammer-crawler/0.1".to_string(),
             fetch_timeout: Duration::from_secs(20),
-            ingest_timeout: Duration::from_secs(10),
+            ingest_timeout,
+            ingest_client: Self::build_ingest_client(ingest_timeout),
         }
+    }
+
+    /// Placeholder config for dry-run modes that skip the ingest POST.
+    pub fn dry_run(user_agent: &str, fetch_timeout: Duration) -> Self {
+        let ingest_timeout = Duration::from_secs(10);
+        Self {
+            crawl_token: String::new(),
+            ingest_url: String::new(),
+            user_agent: user_agent.to_string(),
+            fetch_timeout,
+            ingest_timeout,
+            ingest_client: Self::build_ingest_client(ingest_timeout),
+        }
+    }
+
+    fn build_ingest_client(timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(timeout)
+            .build()
+            .expect("failed to build ingest HTTP client")
     }
 }
 
@@ -302,7 +328,6 @@ fn build_crawl_report(
 }
 
 async fn post_ingest_payload(
-    client: &reqwest::Client,
     canonical_url: &str,
     source_url: &str,
     http_status: u16,
@@ -319,7 +344,8 @@ async fn post_ingest_payload(
         "feed_data": feed_data,
     });
 
-    let ingest_resp = match client
+    let ingest_resp = match config
+        .ingest_client
         .post(&config.ingest_url)
         .json(&payload)
         .timeout(config.ingest_timeout)
@@ -383,12 +409,7 @@ async fn post_ingest_payload(
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "replay/import paths pass through source URL, canonical URL, status, raw XML, optional hash, fallback GUID, and config"
-)]
 pub async fn ingest_cached_feed_report(
-    client: &reqwest::Client,
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
@@ -417,7 +438,6 @@ pub async fn ingest_cached_feed_report(
     };
 
     let outcome = post_ingest_payload(
-        client,
         canonical_url,
         source_url,
         http_status,
@@ -442,12 +462,7 @@ pub async fn ingest_cached_feed_report(
     dead_code,
     reason = "analysis binaries import crawl.rs via #[path] and call this shared helper"
 )]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "replay/import paths pass through source URL, canonical URL, status, raw XML, optional hash, fallback GUID, and config"
-)]
 pub async fn ingest_cached_feed(
-    client: &reqwest::Client,
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
@@ -457,7 +472,6 @@ pub async fn ingest_cached_feed(
     config: &CrawlConfig,
 ) -> CrawlOutcome {
     ingest_cached_feed_report(
-        client,
         source_url,
         canonical_url,
         http_status,
@@ -544,7 +558,6 @@ pub async fn crawl_feed_report(
     let xml = String::from_utf8_lossy(&body);
 
     ingest_cached_feed_report(
-        client,
         url,
         final_url.as_deref().unwrap_or(url),
         status,

@@ -200,12 +200,7 @@ fn query_batch(path: &str, start_row: usize, batch_size: usize) -> Vec<AuditCand
     batch
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "audit import retry wrapper threads through cached row details plus retry context"
-)]
 async fn ingest_cached_feed_with_retries(
-    client: &reqwest::Client,
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
@@ -219,7 +214,6 @@ async fn ingest_cached_feed_with_retries(
 
     loop {
         let outcome = ingest_cached_feed(
-            client,
             source_url,
             canonical_url,
             http_status,
@@ -263,18 +257,14 @@ async fn main() {
     );
 
     let config = Arc::new(if cli.dry_run {
-        CrawlConfig {
-            crawl_token: String::new(),
-            ingest_url: String::new(),
-            user_agent: "stophammer-crawler/0.1 (audit-import dry-run)".to_string(),
-            fetch_timeout: std::time::Duration::from_secs(1),
-            ingest_timeout: std::time::Duration::from_secs(10),
-        }
+        CrawlConfig::dry_run(
+            "stophammer-crawler/0.1 (audit-import dry-run)",
+            std::time::Duration::from_secs(1),
+        )
     } else {
         CrawlConfig::from_env()
     });
 
-    let client = Arc::new(reqwest::Client::new());
     let mut total_processed: u64 = 0;
 
     loop {
@@ -326,7 +316,6 @@ async fn main() {
             let tasks: Vec<_> = batch
                 .into_iter()
                 .map(|row| {
-                    let client = Arc::clone(&client);
                     let config = Arc::clone(&config);
                     let accepted = Arc::clone(&accepted);
                     let rejected = Arc::clone(&rejected);
@@ -351,7 +340,6 @@ async fn main() {
                         let http_status = row.fetch.http_status.unwrap_or(200);
                         let fallback_guid = Some(row.source_db.feed_guid.as_str());
                         let outcome = ingest_cached_feed_with_retries(
-                            &client,
                             source_url,
                             canonical_url,
                             http_status,

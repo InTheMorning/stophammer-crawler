@@ -1445,14 +1445,10 @@ pub async fn run(
     });
 
     let config = Arc::new(if dry_run {
-        // Dry run still needs a config but won't POST
-        CrawlConfig {
-            crawl_token: String::new(),
-            ingest_url: String::new(),
-            user_agent: "stophammer-crawler/0.1 (dry-run)".to_string(),
-            fetch_timeout: std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
-            ingest_timeout: std::time::Duration::from_secs(10),
-        }
+        CrawlConfig::dry_run(
+            "stophammer-crawler/0.1 (dry-run)",
+            std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
+        )
     } else {
         let mut config = CrawlConfig::from_env();
         config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
