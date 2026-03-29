@@ -5,7 +5,7 @@ COPY stophammer-parser ./stophammer-parser
 COPY stophammer-crawler ./stophammer-crawler
 RUN cd stophammer-crawler && cargo build --release
 
-FROM alpine:3.20
+FROM alpine:3.20 AS stophammer-crawler
 RUN apk add --no-cache ca-certificates \
  && addgroup -S stophammer-crawler \
  && adduser -S -G stophammer-crawler stophammer-crawler \
