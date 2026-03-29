@@ -36,7 +36,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Batch-process a list of feed URLs (file, args, env, or stdin)
+    /// Crawl a list of feed URLs (file, args, env, or stdin)
+    #[command(name = "crawl", alias = "batch")]
     Batch {
         /// Feed URLs or path to a file containing URLs
         urls: Vec<String>,
