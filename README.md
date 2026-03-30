@@ -49,6 +49,16 @@ cd stophammer-crawler
 cargo build --release --bins
 ```
 
+The container build does not require that sibling checkout in the Docker
+context. [Dockerfile](Dockerfile) clones `stophammer-parser` from Git during
+the builder stage and accepts optional build args:
+
+```bash
+docker build \
+  --build-arg STOPHAMMER_PARSER_REF=main \
+  -t stophammer-crawler .
+```
+
 That produces:
 
 - `target/release/stophammer-crawler`

@@ -1,7 +1,22 @@
 FROM rust:alpine AS builder
-RUN apk add --no-cache musl-dev
+
+ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
+ARG STOPHAMMER_PARSER_REF=main
+
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    git \
+    linux-headers \
+    musl-dev \
+    perl \
+    pkgconf
 WORKDIR /build
-COPY stophammer-parser ./stophammer-parser
+
+RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
+    "${STOPHAMMER_PARSER_REPO}" \
+    ./stophammer-parser
+
 COPY stophammer-crawler ./stophammer-crawler
 RUN cd stophammer-crawler && cargo build --release
 
