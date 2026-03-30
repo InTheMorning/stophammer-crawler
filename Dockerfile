@@ -17,7 +17,7 @@ RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
     "${STOPHAMMER_PARSER_REPO}" \
     ./stophammer-parser
 
-COPY stophammer-crawler ./stophammer-crawler
+COPY . ./stophammer-crawler
 RUN cd stophammer-crawler && cargo build --release
 
 FROM alpine:3.20 AS stophammer-crawler
