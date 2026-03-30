@@ -1,9 +1,10 @@
 # stophammer-crawler
 
-Unified feed crawler for the [stophammer](https://github.com/dardevelin/stophammer)
-V4V music index. Fetches RSS feeds, hashes content, parses with
-[stophammer-parser](https://github.com/dardevelin/stophammer-parser) as a native
-library, and submits results to a stophammer node's `/ingest/feed` endpoint.
+Unified feed crawler for the
+[stophammer](https://github.com/inthemorning/stophammer) V4V music index.
+Fetches RSS feeds, hashes content, parses with the `stophammer-parser` Rust
+library dependency, and submits results to a stophammer node's
+`/ingest/feed` endpoint.
 
 Three subcommands cover every discovery path:
 
@@ -16,34 +17,62 @@ Three subcommands cover every discovery path:
 - Rust 1.85+ (edition 2024)
 - For import mode: a [PodcastIndex](https://podcastindex.org) database snapshot
 
-## Build and run
+## Installation
 
-From this checkout:
+### Published artifacts
+
+The recommended operator install surfaces are published from the main
+[`stophammer`](https://github.com/inthemorning/stophammer) release pipeline:
+
+- `stophammer-crawler-<version>.tar.gz`
+- `ghcr.io/<owner>/stophammer-crawler`
+- the Arch `stophammer-crawler` package built from the main repo packaging assets
+
+The crawler release bundle includes:
+
+- `stophammer-crawler`
+- systemd units for long-running `gossip` and optional one-shot `crawl` /
+  `import` runs
+- example env files
+- `sysusers.d` / `tmpfiles.d` snippets
+
+### Build from source
+
+Source builds require a sibling `stophammer-parser` checkout because the crawler
+depends on it via a local Cargo path dependency:
 
 ```bash
-# Operational crawler modes
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- import --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- gossip --help
+git clone https://github.com/inthemorning/stophammer-parser
+git clone https://github.com/inthemorning/stophammer-crawler
 
-# Analysis / replay tools
-cargo run --manifest-path stophammer-crawler/Cargo.toml \
-  --bin feed_audit -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml \
-  --bin audit_analyzer -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml \
-  --bin audit_import -- --help
-cargo run --manifest-path stophammer-crawler/Cargo.toml \
-  --bin musicl_backfill -- --help
+cd stophammer-crawler
+cargo build --release --bins
 ```
 
-Or build binaries once:
+That produces:
+
+- `target/release/stophammer-crawler`
+- analysis binaries such as `feed_audit`, `audit_import`,
+  `audit_expand_publishers`, and `musicl_backfill`
+
+Quick checks from this checkout:
 
 ```bash
-cargo build --manifest-path stophammer-crawler/Cargo.toml --release --bins
+cargo run -- crawl --help
+cargo run -- import --help
+cargo run -- gossip --help
+
+cargo run --bin feed_audit -- --help
+cargo run --bin audit_analyzer -- --help
+cargo run --bin audit_import -- --help
+cargo run --bin audit_expand_publishers -- --help
+cargo run --bin musicl_backfill -- --help
 ```
 
 ## Usage
+
+The examples below assume `stophammer-crawler` is on your `PATH`. After a local
+source build, use `./target/release/stophammer-crawler` instead.
 
 ### crawl
 
@@ -53,26 +82,23 @@ Fetch and ingest a list of feed URLs:
 # From arguments
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  crawl https://example.com/feed.xml
+stophammer-crawler crawl https://example.com/feed.xml
 
 # From a file
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  crawl feeds.txt
+stophammer-crawler crawl feeds.txt
 
 # From env
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 FEED_URLS="https://a.com/feed,https://b.com/feed" \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- \
-  crawl
+stophammer-crawler crawl
 
 # From stdin
 cat urls.txt | CRAWL_TOKEN=secret \
   INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-  cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl
+  stophammer-crawler crawl
 ```
 
 ### import
@@ -82,7 +108,7 @@ Batch-scan a PodcastIndex snapshot for music feeds:
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
+stophammer-crawler import \
   --batch 100 --concurrency 5
 ```
 
@@ -94,7 +120,7 @@ Restart or resume from an explicit `PodcastIndex` id:
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
+stophammer-crawler import \
   --cursor 5000000 \
   --batch 100 --concurrency 5
 ```
@@ -104,7 +130,7 @@ Wavlake-only import from the same snapshot:
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- import \
+stophammer-crawler import \
   --wavlake-only \
   --cursor 0
 ```
@@ -124,6 +150,7 @@ for multi-gigabyte snapshots.
 | `--db-url <url>` | (public PI URL) | Snapshot archive URL |
 | `--refresh-db` | off | Re-download the snapshot |
 | `--state <path>` | `./import_state.db` | Progress cursor database |
+| `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
 | `--audit-output <path>` | off | Optional NDJSON dump of successfully ingested `200 OK` feeds in `feed_audit` format |
@@ -261,6 +288,7 @@ feeds are periodically re-evaluated.
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
 | `--state <path>` | `./gossip_state.db` | Cursor and feed memory database |
+| `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
 | `--sse-url <url>` | `http://localhost:8089/events` | SSE endpoint URL |
 | `--archive-db <path>` | off | gossip-listener archive database path |
 | `--since-hours <n>` | off | Bootstrap from N hours ago (requires `--archive-db`) |
@@ -291,7 +319,10 @@ feeds are periodically re-evaluated.
   `import-idle` on exit.
 - **`RESOLVERCTL_BIN`** --
   Override the resolver control binary used with
-  `RESOLVER_DB_PATH`. Default: `resolverctl`
+  `RESOLVER_DB_PATH`. Default: `resolverctl`.
+  If you are using packaged `stophammer` binaries from the main repo, set this
+  to `stophammer-resolverctl`.
+
 ## Architecture
 
 ```text
@@ -301,8 +332,9 @@ stophammer-crawler
     crawl.rs          Shared pipeline: fetch → SHA-256 → parse → POST
     pool.rs           Bounded concurrency pool (tokio semaphore)
     dedup.rs          In-memory cooldown map (gossip mode)
+    feed_skip.rs      Shared skip-memory database for proven irrelevant feeds
     modes/
-      crawl.rs        Load URLs from file/env/stdin, run pool
+      batch.rs        Load URLs from file/env/stdin, run pool
       import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
       gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
@@ -343,6 +375,7 @@ Available binaries:
 - `cargo run --bin feed_audit -- ...`
 - `cargo run --bin audit_analyzer -- ...`
 - `cargo run --bin audit_import -- ...`
+- `cargo run --bin audit_expand_publishers -- ...`
 - `cargo run --bin musicl_backfill -- ...`
 
 By default:
@@ -373,13 +406,13 @@ Examples:
 
 ```bash
 # Create / refresh the cached NDJSON corpus
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
+cargo run --bin feed_audit -- \
   --db ./analysis/data/stophammer-feeds.db \
   --output ./analysis/data/feed_audit.ndjson \
   --failed-feeds-output ./analysis/data/failed_feeds.txt
 
 # Refill only missing feeds from failed_feeds.txt back into the same corpus
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
+cargo run --bin feed_audit -- \
   --urls-file ./analysis/data/failed_feeds.txt \
   --output ./analysis/data/feed_audit.ndjson \
   --append \
@@ -389,35 +422,39 @@ cargo run --manifest-path stophammer-crawler/Cargo.toml --bin feed_audit -- \
   --max-backoff-secs 600
 
 # Re-analyze the cached corpus
-cargo run --manifest-path stophammer-crawler/Cargo.toml \
-  --bin audit_analyzer -- \
+cargo run --bin audit_analyzer -- \
   --input ./analysis/data/feed_audit.ndjson
 
 # Replay cached feeds into a running primary
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin audit_import -- \
+cargo run --bin audit_import -- \
   --input ./analysis/data/feed_audit.ndjson \
   --reset
+
+# Discover and optionally fetch publisher feeds referenced by the audit corpus
+cargo run --bin audit_expand_publishers -- \
+  --input ./analysis/data/feed_audit.ndjson \
+  --dry-run
 
 # Dry-run musicL backfill from crawler state DBs
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin musicl_backfill -- \
+cargo run --bin musicl_backfill -- \
   --stophammer-db ./stophammer.db \
   --dry-run
 
 # Real musicL backfill
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml --bin musicl_backfill -- \
+cargo run --bin musicl_backfill -- \
   --stophammer-db ./stophammer.db \
   --concurrency 5
 
 # Live crawl with per-host spacing and retry dumps
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --manifest-path stophammer-crawler/Cargo.toml -- crawl \
+cargo run -- crawl \
   --concurrency 5 \
   --host-delay-ms 1500 \
   --failed-feeds-output ./failed_feeds.txt \
@@ -467,18 +504,13 @@ WHERE lower(f.raw_medium) = 'musicl';"
 
 ## Docker
 
-```bash
-# This repo does not ship a general-purpose crawler compose stack.
-# The top-level repo only includes test environments:
-docker compose -f ../docker-compose.e2e.yml up -d --build --wait
-docker compose -f ../docker-compose.e2e.yml down -v
-```
+Published releases also push a crawler runtime image:
 
-For day-to-day crawler operation, run the binary directly or supply your own
-compose file / scheduler. The available top-level compose files are:
+- `ghcr.io/<owner>/stophammer-crawler`
 
-- `../docker-compose.e2e.yml`
-- `../docker-compose.e2e-tls.yml`
+This repo does not ship a general-purpose crawler compose stack. For day-to-day
+operation, run the binary directly or provide your own scheduler / compose
+deployment around `stophammer-crawler gossip`, `import`, or `crawl`.
 
 ## License
 
