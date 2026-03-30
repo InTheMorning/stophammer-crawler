@@ -225,12 +225,38 @@ Listen to a local gossip-listener SSE stream for live podping notifications.
 
 #### Prerequisites
 
-- A running `gossip-listener` instance (provides the SSE stream and archive)
-- The stophammer user must be in the `podping` group to read the archive
+- A running `gossip-listener` instance from `podping.alpha` (provides the SSE
+  stream and archive)
+- The crawler process must have read access to the archive database
 - `CRAWL_TOKEN` and `INGEST_URL` environment variables set
 
 The gossip-listener archive database lives at
 `/var/lib/podping-alpha-gossip-listener/archive.db` by default.
+
+Typical host setup:
+
+1. Install and start `podping.alpha` / `gossip-listener`
+2. Enable archive writing in that service
+3. Confirm the resulting `archive.db` path on disk
+4. Point `--archive-db` at that path
+
+If the archive does not live at the default path, pass the actual path:
+
+```bash
+stophammer-crawler gossip --archive-db /some/other/path/archive.db
+```
+
+For packaged systemd installs, the usual pattern is to add the
+`stophammer-crawler` service user to the `podping` group so it can read the
+archive written by `gossip-listener`.
+
+For Docker installs, bind-mount the host directory containing `archive.db` and
+run the container with a UID/GID that can read that mount. The root repo's
+reference `docker-compose.yml` uses:
+
+- `GOSSIP_ARCHIVE_HOST_DIR` for the host-side archive directory
+- `GOSSIP_UID` / `GOSSIP_GID` for the container runtime user/group
+- `GOSSIP_ARCHIVE_DB=/podping/archive.db` inside the container by default
 
 #### Archive-backed mode (recommended)
 
