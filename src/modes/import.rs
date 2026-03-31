@@ -817,8 +817,8 @@ struct ResolverImportGuard {
 impl ResolverImportGuard {
     fn maybe_activate() -> Option<Self> {
         let resolver_db_path = std::env::var(RESOLVER_DB_PATH_ENV).ok()?;
-        let resolverctl_bin =
-            std::env::var(RESOLVERCTL_BIN_ENV).unwrap_or_else(|_| "resolverctl".to_string());
+        let resolverctl_bin = std::env::var(RESOLVERCTL_BIN_ENV)
+            .unwrap_or_else(|_| "stophammer-resolverctl".to_string());
 
         set_import_active(&resolverctl_bin, &resolver_db_path, true);
         let (stop_heartbeat, heartbeat_stop_rx) = mpsc::sync_channel(1);

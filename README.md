@@ -355,9 +355,7 @@ feeds are periodically re-evaluated.
   `import-idle` on exit.
 - **`RESOLVERCTL_BIN`** --
   Override the resolver control binary used with
-  `RESOLVER_DB_PATH`. Default: `resolverctl`.
-  If you are using packaged `stophammer` binaries from the main repo, set this
-  to `stophammer-resolverctl`.
+  `RESOLVER_DB_PATH`. Default: `stophammer-resolverctl`.
 
 ## Architecture
 
