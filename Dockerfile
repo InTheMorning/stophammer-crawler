@@ -1,4 +1,4 @@
-FROM rust:alpine AS builder
+FROM rust:alpine AS chef
 
 ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
 ARG STOPHAMMER_PARSER_REF=main
@@ -10,12 +10,31 @@ RUN apk add --no-cache \
     linux-headers \
     musl-dev \
     perl \
-    pkgconf
+    pkgconf \
+ && cargo install cargo-chef
 WORKDIR /build
+
+FROM chef AS planner
+ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
+ARG STOPHAMMER_PARSER_REF=main
 
 RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
     "${STOPHAMMER_PARSER_REPO}" \
     ./stophammer-parser
+
+COPY . ./stophammer-crawler
+RUN cd stophammer-crawler && cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
+ARG STOPHAMMER_PARSER_REF=main
+
+RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
+    "${STOPHAMMER_PARSER_REPO}" \
+    ./stophammer-parser
+
+COPY --from=planner /build/stophammer-crawler/recipe.json /build/stophammer-crawler/recipe.json
+RUN cd stophammer-crawler && cargo chef cook --release --recipe-path recipe.json
 
 COPY . ./stophammer-crawler
 RUN cd stophammer-crawler && cargo build --release
