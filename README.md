@@ -230,9 +230,6 @@ Listen to a local gossip-listener SSE stream for live podping notifications.
 - The crawler process must have read access to the archive database
 - `CRAWL_TOKEN` and `INGEST_URL` environment variables set
 
-The gossip-listener archive database lives at
-`/var/lib/podping-alpha-gossip-listener/archive.db` by default.
-
 Typical host setup:
 
 1. Install and start `podping.alpha` / `gossip-listener`
@@ -250,13 +247,13 @@ For packaged systemd installs, the usual pattern is to add the
 `stophammer-crawler` service user to the `podping` group so it can read the
 archive written by `gossip-listener`.
 
-For Docker installs, bind-mount the host directory containing `archive.db` and
-run the container with a UID/GID that can read that mount. The root repo's
-reference `docker-compose.yml` uses:
+For Docker installs, the root repo's reference `docker-compose.yml` now runs
+`podping.alpha`'s `gossip-listener` as a sibling `podping` service and shares
+its `archive.db` with the crawler over a named Docker volume. That default path
+inside the crawler container is:
 
-- `GOSSIP_ARCHIVE_HOST_DIR` for the host-side archive directory
-- `GOSSIP_UID` / `GOSSIP_GID` for the container runtime user/group
-- `GOSSIP_ARCHIVE_DB=/podping/archive.db` inside the container by default
+- `GOSSIP_ARCHIVE_DB=/podping/archive.db`
+- `GOSSIP_SSE_URL=http://podping:8089/events`
 
 #### Archive-backed mode (recommended)
 
@@ -269,7 +266,7 @@ First-time bootstrap (catches up on the last 24 hours of podpings):
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 stophammer-crawler gossip \
-  --archive-db /var/lib/podping-alpha-gossip-listener/archive.db \
+  --archive-db /path/to/archive.db \
   --since-hours 24 \
   --skip-known-non-music \
   --skip-ttl-days 30
@@ -281,7 +278,7 @@ Subsequent runs resume from the stored cursor automatically:
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 stophammer-crawler gossip \
-  --archive-db /var/lib/podping-alpha-gossip-listener/archive.db \
+  --archive-db /path/to/archive.db \
   --skip-known-non-music \
   --skip-ttl-days 30
 ```
