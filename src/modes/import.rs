@@ -4,15 +4,16 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use flate2::read::GzDecoder;
+use reqwest::StatusCode;
+use reqwest::header::{HeaderValue, IF_MODIFIED_SINCE};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use stophammer_parser::extract_podcast_namespace;
@@ -32,9 +33,7 @@ const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
 const WAVLAKE_IMPORT_MIN_DELAY_MS: u64 = 2_000;
 const WAVLAKE_IMPORT_FALLBACK_429_BACKOFF_SECS: u64 = 300;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const RESOLVERCTL_BIN_ENV: &str = "RESOLVERCTL_BIN";
-const RESOLVER_DB_PATH_ENV: &str = "RESOLVER_DB_PATH";
-const RESOLVER_HEARTBEAT_INTERVAL_SECS: u64 = 60;
+const MUSIC_FIRST_LOWER_BOUND_ID: i64 = 4_630_863;
 const WAVLAKE_HOSTS: [&str; 2] = ["wavlake.com", "www.wavlake.com"];
 
 struct CandidateRow {
@@ -78,12 +77,31 @@ impl ImportScope {
             Self::WavlakeOnly => 1,
         }
     }
+
+    fn music_first_lower_bound(self) -> Option<i64> {
+        match self {
+            Self::AllFeeds => Some(MUSIC_FIRST_LOWER_BOUND_ID),
+            Self::WavlakeOnly => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KnownSkipKind {
     Irrelevant,
     Success,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartCursorDecision {
+    cursor: i64,
+    jumped_from: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotRefreshOutcome {
+    Downloaded,
+    Unchanged,
 }
 
 impl KnownSkipKind {
@@ -807,54 +825,6 @@ async fn run_import_batch_heartbeat(
     }
 }
 
-struct ResolverImportGuard {
-    resolverctl_bin: String,
-    resolver_db_path: String,
-    stop_heartbeat: mpsc::SyncSender<()>,
-    heartbeat_thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ResolverImportGuard {
-    fn maybe_activate() -> Option<Self> {
-        let resolver_db_path = std::env::var(RESOLVER_DB_PATH_ENV).ok()?;
-        let resolverctl_bin = std::env::var(RESOLVERCTL_BIN_ENV)
-            .unwrap_or_else(|_| "stophammer-resolverctl".to_string());
-
-        set_import_active(&resolverctl_bin, &resolver_db_path, true);
-        let (stop_heartbeat, heartbeat_stop_rx) = mpsc::sync_channel(1);
-        let thread_bin = resolverctl_bin.clone();
-        let thread_db = resolver_db_path.clone();
-        let heartbeat_thread = std::thread::spawn(move || {
-            loop {
-                match heartbeat_stop_rx
-                    .recv_timeout(Duration::from_secs(RESOLVER_HEARTBEAT_INTERVAL_SECS))
-                {
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        set_import_active(&thread_bin, &thread_db, true);
-                    }
-                }
-            }
-        });
-        Some(Self {
-            resolverctl_bin,
-            resolver_db_path,
-            stop_heartbeat,
-            heartbeat_thread: Some(heartbeat_thread),
-        })
-    }
-}
-
-impl Drop for ResolverImportGuard {
-    fn drop(&mut self) {
-        let _ = self.stop_heartbeat.send(());
-        if let Some(handle) = self.heartbeat_thread.take() {
-            let _ = handle.join();
-        }
-        set_import_active(&self.resolverctl_bin, &self.resolver_db_path, false);
-    }
-}
-
 /// Resume cursor stored in a separate state DB.
 struct ProgressStore {
     conn: Connection,
@@ -898,6 +868,34 @@ impl ProgressStore {
 
     fn set_last_id(&self, scope: ImportScope, id: i64) {
         set_last_processed_id(&self.conn, scope, id).expect("failed to override import cursor");
+    }
+
+    fn record_music_first_jump(&self, scope: ImportScope, from: i64, to: i64) {
+        let scope_label = scope.label();
+        set_import_progress_value(
+            &self.conn,
+            &format!("music_first_jump_reason:{scope_label}"),
+            "music_first_lower_bound",
+        )
+        .expect("failed to persist music-first jump reason");
+        set_import_progress_value(
+            &self.conn,
+            &format!("music_first_jump_from:{scope_label}"),
+            &from.to_string(),
+        )
+        .expect("failed to persist music-first jump source cursor");
+        set_import_progress_value(
+            &self.conn,
+            &format!("music_first_jump_to:{scope_label}"),
+            &to.to_string(),
+        )
+        .expect("failed to persist music-first jump target cursor");
+        set_import_progress_value(
+            &self.conn,
+            &format!("music_first_jump_applied_at:{scope_label}"),
+            &Utc::now().timestamp().to_string(),
+        )
+        .expect("failed to persist music-first jump timestamp");
     }
 
     fn known_memory_for_ids(
@@ -994,10 +992,14 @@ fn set_last_processed_id(
     scope: ImportScope,
     id: i64,
 ) -> rusqlite::Result<usize> {
+    set_import_progress_value(conn, scope.cursor_key(), &id.to_string())
+}
+
+fn set_import_progress_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize> {
     conn.execute(
         "INSERT INTO import_progress (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![scope.cursor_key(), id.to_string()],
+        params![key, value],
     )
 }
 
@@ -1222,37 +1224,36 @@ fn wavlake_throttle_delay(report: &CrawlReport, extra_delay_secs: u64) -> Durati
     base_delay.saturating_add(Duration::from_secs(extra_delay_secs))
 }
 
-fn set_import_active(resolverctl_bin: &str, resolver_db_path: &str, active: bool) {
-    let command = if active {
-        "import-active"
-    } else {
-        "import-idle"
-    };
-
-    match Command::new(resolverctl_bin)
-        .args(["--db", resolver_db_path, command])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            eprintln!(
-                "import: resolver queue {} via {} --db {} {}",
-                if active { "paused" } else { "resumed" },
-                resolverctl_bin,
-                resolver_db_path,
-                command,
-            );
-        }
-        Ok(status) => {
-            eprintln!(
-                "import: WARNING: resolverctl returned {status} while running `{resolverctl_bin} --db {resolver_db_path} {command}`"
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "import: WARNING: failed to run `{resolverctl_bin} --db {resolver_db_path} {command}`: {err}"
-            );
-        }
+fn resolve_start_cursor(
+    scope: ImportScope,
+    stored_cursor: i64,
+    cursor_override: Option<i64>,
+) -> StartCursorDecision {
+    if let Some(cursor) = cursor_override {
+        return StartCursorDecision {
+            cursor,
+            jumped_from: None,
+        };
     }
+
+    if let Some(lower_bound) = scope.music_first_lower_bound()
+        && stored_cursor < lower_bound
+    {
+        return StartCursorDecision {
+            cursor: lower_bound,
+            jumped_from: Some(stored_cursor),
+        };
+    }
+
+    StartCursorDecision {
+        cursor: stored_cursor,
+        jumped_from: None,
+    }
+}
+
+fn format_if_modified_since_value(modified_at: SystemTime) -> String {
+    let modified_at = chrono::DateTime::<Utc>::from(modified_at);
+    modified_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()> {
@@ -1316,45 +1317,79 @@ fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()
     Ok(())
 }
 
-fn download_snapshot_archive(db_url: &str, db_path: &Path) -> io::Result<()> {
-    eprintln!(
-        "import: downloading latest PodcastIndex snapshot from {db_url} to {}",
-        db_path.display()
-    );
-
-    let response = reqwest::blocking::Client::builder()
+fn download_snapshot_archive(
+    db_url: &str,
+    db_path: &Path,
+    if_modified_since: Option<SystemTime>,
+) -> io::Result<SnapshotRefreshOutcome> {
+    let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(SNAPSHOT_CONNECT_TIMEOUT_SECS))
         .build()
-        .map_err(io::Error::other)?
-        .get(db_url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(io::Error::other)?;
+    let mut request = client.get(db_url);
+
+    if let Some(modified_at) = if_modified_since {
+        let header_value = HeaderValue::from_str(&format_if_modified_since_value(modified_at))
+            .map_err(io::Error::other)?;
+        eprintln!(
+            "import: checking PodcastIndex snapshot freshness via If-Modified-Since for {}",
+            db_path.display()
+        );
+        request = request.header(IF_MODIFIED_SINCE, header_value);
+    } else {
+        eprintln!(
+            "import: downloading latest PodcastIndex snapshot from {db_url} to {}",
+            db_path.display()
+        );
+    }
+
+    let response = request.send().map_err(io::Error::other)?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        eprintln!(
+            "import: remote PodcastIndex snapshot unchanged; keeping {}",
+            db_path.display()
+        );
+        return Ok(SnapshotRefreshOutcome::Unchanged);
+    }
+
+    let response = response.error_for_status().map_err(io::Error::other)?;
 
     extract_snapshot_archive(response, db_path)?;
     eprintln!(
         "import: snapshot ready at {} (archive not retained)",
         db_path.display()
     );
-    Ok(())
+    Ok(SnapshotRefreshOutcome::Downloaded)
 }
 
 async fn ensure_snapshot_db(db_path: &str, db_url: &str, refresh_db: bool) {
     let db_path_buf = db_path.to_owned();
     let db_url_buf = db_url.to_owned();
-    let should_download = refresh_db || !Path::new(db_path).is_file();
+    let snapshot_path = Path::new(db_path);
+    let snapshot_exists = snapshot_path.is_file();
 
-    if !should_download {
+    if !refresh_db && snapshot_exists {
         eprintln!("import: using existing PodcastIndex snapshot at {db_path}");
         return;
     }
 
-    if refresh_db {
-        eprintln!("import: refreshing PodcastIndex snapshot at {db_path}");
-    }
+    let if_modified_since = if snapshot_exists {
+        Some(
+            fs::metadata(snapshot_path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or_else(|err| {
+                    eprintln!(
+                        "import: WARNING: failed to read local snapshot mtime at {db_path}: {err}"
+                    );
+                    SystemTime::UNIX_EPOCH
+                }),
+        )
+    } else {
+        None
+    };
 
     tokio::task::spawn_blocking(move || {
-        download_snapshot_archive(&db_url_buf, Path::new(&db_path_buf))
+        download_snapshot_archive(&db_url_buf, Path::new(&db_path_buf), if_modified_since)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1412,13 +1447,26 @@ pub async fn run(
 
     ensure_snapshot_db(&db_path, &db_url, refresh_db).await;
 
-    let mut cursor = cursor_override.unwrap_or_else(|| progress.get_last_id(scope));
+    let stored_cursor = progress.get_last_id(scope);
+    let cursor_decision = resolve_start_cursor(scope, stored_cursor, cursor_override);
+    let mut cursor = cursor_decision.cursor;
     if let Some(override_cursor) = cursor_override {
         eprintln!("import: cursor override to {override_cursor}");
         if dry_run {
             eprintln!("import: dry-run leaves stored cursor unchanged");
         } else {
             progress.set_last_id(scope, override_cursor);
+        }
+    } else if let Some(previous_cursor) = cursor_decision.jumped_from {
+        eprintln!(
+            "import: music-first jump for scope={} from id={previous_cursor} to id={cursor}",
+            scope.label()
+        );
+        if dry_run {
+            eprintln!("import: dry-run leaves stored cursor unchanged");
+        } else {
+            progress.record_music_first_jump(scope, previous_cursor, cursor);
+            progress.set_last_id(scope, cursor);
         }
     }
 
@@ -1458,12 +1506,6 @@ pub async fn run(
         config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
         config
     });
-
-    let _resolver_guard = if dry_run {
-        None
-    } else {
-        ResolverImportGuard::maybe_activate()
-    };
 
     let client = Arc::new(reqwest::Client::new());
     let wavlake_throttle =
@@ -1696,8 +1738,9 @@ mod tests {
         ImportScope, ImportStateWriter, KnownSkipKind, ProgressStore, WAVLAKE_HOSTS,
         build_import_audit_row, build_import_timeout_report, effective_audit_append,
         enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
-        is_skip_known_non_music, known_skip_kind, load_known_import_memory, open_state_connection,
-        query_batch, upsert_import_memory, wavlake_throttle_delay,
+        format_if_modified_since_value, is_skip_known_non_music, known_skip_kind,
+        load_known_import_memory, open_state_connection, query_batch, resolve_start_cursor,
+        upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
@@ -2360,6 +2403,70 @@ mod tests {
 
         assert_eq!(progress.get_last_id(ImportScope::AllFeeds), 111);
         assert_eq!(progress.get_last_id(ImportScope::WavlakeOnly), 222);
+    }
+
+    #[test]
+    fn resolve_start_cursor_applies_music_first_lower_bound_for_all_feeds() {
+        let decision = resolve_start_cursor(ImportScope::AllFeeds, 0, None);
+
+        assert_eq!(decision.cursor, 4_630_863);
+        assert_eq!(decision.jumped_from, Some(0));
+    }
+
+    #[test]
+    fn resolve_start_cursor_does_not_jump_wavlake_scope_or_override() {
+        let wavlake_decision = resolve_start_cursor(ImportScope::WavlakeOnly, 0, None);
+        let override_decision = resolve_start_cursor(ImportScope::AllFeeds, 0, Some(123));
+
+        assert_eq!(wavlake_decision.cursor, 0);
+        assert_eq!(wavlake_decision.jumped_from, None);
+        assert_eq!(override_decision.cursor, 123);
+        assert_eq!(override_decision.jumped_from, None);
+    }
+
+    #[test]
+    fn progress_store_records_music_first_jump_metadata() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let progress = ProgressStore::open(state_path.to_str().expect("utf-8 path"));
+
+        progress.record_music_first_jump(ImportScope::AllFeeds, 0, 4_630_863);
+
+        let reason: String = progress
+            .conn
+            .query_row(
+                "SELECT value FROM import_progress WHERE key = 'music_first_jump_reason:all_feeds'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("jump reason");
+        let from_cursor: String = progress
+            .conn
+            .query_row(
+                "SELECT value FROM import_progress WHERE key = 'music_first_jump_from:all_feeds'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("jump from");
+        let to_cursor: String = progress
+            .conn
+            .query_row(
+                "SELECT value FROM import_progress WHERE key = 'music_first_jump_to:all_feeds'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("jump to");
+
+        assert_eq!(reason, "music_first_lower_bound");
+        assert_eq!(from_cursor, "0");
+        assert_eq!(to_cursor, "4630863");
+    }
+
+    #[test]
+    fn format_if_modified_since_value_uses_http_date_shape() {
+        let formatted = format_if_modified_since_value(std::time::UNIX_EPOCH);
+
+        assert_eq!(formatted, "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]

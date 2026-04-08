@@ -72,7 +72,7 @@ enum Mode {
         )]
         db_url: String,
 
-        /// Re-download the latest snapshot even if `--db` already exists
+        /// Conditionally refresh the local snapshot when the remote archive changed
         #[arg(long)]
         refresh_db: bool,
 
@@ -116,7 +116,7 @@ enum Mode {
         #[arg(long)]
         dry_run: bool,
 
-        /// Start from an explicit `PodcastIndex` id instead of the stored cursor
+        /// Start from an explicit `PodcastIndex` id instead of the stored or music-first cursor
         #[arg(long, value_parser = parse_non_negative_i64)]
         cursor: Option<i64>,
     },

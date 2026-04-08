@@ -123,7 +123,9 @@ stophammer-crawler import \
 ```
 
 Normal snapshot import excludes Wavlake-hosted rows. Use `--wavlake-only` for
-the Wavlake-specific pass.
+the Wavlake-specific pass. The default `all_feeds` scope now jumps to the
+music-first PodcastIndex lower bound instead of replaying the full pre-music
+corpus from `0`.
 
 Restart or resume from an explicit `PodcastIndex` id:
 
@@ -148,7 +150,8 @@ stophammer-crawler import \
 If `--db` does not exist yet, the importer downloads the latest PodcastIndex
 snapshot archive from `https://public.podcastindex.org/podcastindex_feeds.db.tgz`,
 extracts the `.db` directly into place, and does not keep the `.tgz` on disk.
-Use `--refresh-db` to force a fresh download over an existing local snapshot.
+Use `--refresh-db` to check the remote snapshot with `If-Modified-Since` and
+download only when it changed.
 Downloads are streamed through gzip/tar extraction, so RAM usage stays low even
 for multi-gigabyte snapshots.
 
@@ -158,7 +161,7 @@ for multi-gigabyte snapshots.
 | ---- | ------- | ----------- |
 | `--db <path>` | `./podcastindex_feeds.db` | PodcastIndex snapshot path |
 | `--db-url <url>` | (public PI URL) | Snapshot archive URL |
-| `--refresh-db` | off | Re-download the snapshot |
+| `--refresh-db` | off | Conditionally refresh the snapshot if the remote archive changed |
 | `--state <path>` | `./import_state.db` | Progress cursor database |
 | `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
 | `--batch <n>` | `100` | Feeds per DB query batch |
@@ -168,6 +171,7 @@ for multi-gigabyte snapshots.
 | `--dry-run` | off | Log without fetching/ingesting |
 | `--skip-known-non-music` | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
 | `--skip-known-success` | off | Skip rows already known to have reached `accepted`, `no_change`, or `skipped_known_success` in importer memory |
+| `--cursor <id>` | stored cursor | Override the stored or music-first start cursor |
 | `--wavlake-only` | off | Restrict snapshot import to `wavlake.com` / `www.wavlake.com` feeds; without this flag, normal import excludes Wavlake rows |
 | `--cursor <id>` | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
 
