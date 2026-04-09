@@ -572,26 +572,44 @@ impl Drop for PidLockGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LockIdentity {
     pid: u32,
     start_ticks: Option<u64>,
+    /// Hostname of the machine/container that wrote the lock.  When present, a
+    /// mismatch with the current hostname is sufficient to declare the lock stale
+    /// without inspecting `/proc` at all.  This closes the Docker pid=1 false-live
+    /// scenario: every container has a unique hostname (its container-ID hash) so a
+    /// lock left over from a previously-stopped container is immediately reclaimed.
+    hostname: Option<String>,
 }
 
 fn write_lock_identity(file: &mut fs::File) {
     let identity = current_lock_identity();
     let _ = file.set_len(0);
-    if let Some(start_ticks) = identity.start_ticks {
-        let _ = write!(file, "{} {start_ticks}", identity.pid);
-    } else {
-        let _ = write!(file, "{}", identity.pid);
-    }
+    let ticks_field = identity
+        .start_ticks
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let hostname_field = identity.hostname.as_deref().unwrap_or("-");
+    let _ = write!(file, "{} {ticks_field} {hostname_field}", identity.pid);
 }
 
 fn current_lock_identity() -> LockIdentity {
     LockIdentity {
         pid: std::process::id(),
         start_ticks: process_start_ticks(std::process::id()),
+        hostname: current_hostname(),
+    }
+}
+
+fn current_hostname() -> Option<String> {
+    let raw = fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -599,11 +617,33 @@ fn read_lock_identity(lock_path: &Path) -> Option<LockIdentity> {
     let contents = fs::read_to_string(lock_path).ok()?;
     let mut parts = contents.split_whitespace();
     let pid = parts.next()?.parse::<u32>().ok()?;
+    // Second field is start_ticks or "-" (placeholder written by new code).
     let start_ticks = parts.next().and_then(|v| v.parse::<u64>().ok());
-    Some(LockIdentity { pid, start_ticks })
+    // Third field is hostname or "-" (placeholder); absent in old lock files.
+    let hostname = parts.next().and_then(|v| {
+        if v == "-" {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    });
+    Some(LockIdentity {
+        pid,
+        start_ticks,
+        hostname,
+    })
 }
 
 fn lock_held_by_live_process(lock_path: &Path, identity: &LockIdentity) -> bool {
+    // If both sides have a hostname and they differ, the lock is definitely from
+    // a different host or container — treat it as stale immediately.
+    if let (Some(lock_host), Some(our_host)) = (identity.hostname.as_deref(), current_hostname())
+    {
+        if lock_host != our_host {
+            return false;
+        }
+    }
+
     if !Path::new(&format!("/proc/{}", identity.pid)).exists() {
         return false;
     }
