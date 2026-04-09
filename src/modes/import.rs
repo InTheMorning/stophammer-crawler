@@ -523,14 +523,15 @@ fn acquire_pid_lock(path: &str, label: &str) -> PathBuf {
         .open(&lock_path)
     {
         Ok(mut f) => {
-            let _ = write!(f, "{}", std::process::id());
+            write_lock_identity(&mut f);
         }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if let Ok(contents) = fs::read_to_string(&lock_path)
-                && let Ok(pid) = contents.trim().parse::<u32>()
+            if let Some(identity) = read_lock_identity(&lock_path)
+                && lock_held_by_live_process(&lock_path, &identity)
             {
+                let pid = identity.pid;
                 assert!(
-                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    false,
                     "{label} lock {} held by live process pid={pid}",
                     lock_path.display()
                 );
@@ -549,7 +550,7 @@ fn acquire_pid_lock(path: &str, label: &str) -> PathBuf {
                         lock_path.display()
                     )
                 });
-            let _ = write!(f, "{}", std::process::id());
+            write_lock_identity(&mut f);
         }
         Err(err) => {
             panic!(
@@ -569,6 +570,102 @@ impl Drop for PidLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockIdentity {
+    pid: u32,
+    start_ticks: Option<u64>,
+}
+
+fn write_lock_identity(file: &mut fs::File) {
+    let identity = current_lock_identity();
+    let _ = file.set_len(0);
+    if let Some(start_ticks) = identity.start_ticks {
+        let _ = write!(file, "{} {start_ticks}", identity.pid);
+    } else {
+        let _ = write!(file, "{}", identity.pid);
+    }
+}
+
+fn current_lock_identity() -> LockIdentity {
+    LockIdentity {
+        pid: std::process::id(),
+        start_ticks: process_start_ticks(std::process::id()),
+    }
+}
+
+fn read_lock_identity(lock_path: &Path) -> Option<LockIdentity> {
+    let contents = fs::read_to_string(lock_path).ok()?;
+    let mut parts = contents.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let start_ticks = parts.next().and_then(|v| v.parse::<u64>().ok());
+    Some(LockIdentity { pid, start_ticks })
+}
+
+fn lock_held_by_live_process(lock_path: &Path, identity: &LockIdentity) -> bool {
+    if !Path::new(&format!("/proc/{}", identity.pid)).exists() {
+        return false;
+    }
+
+    let Some(actual_start_ticks) = process_start_ticks(identity.pid) else {
+        return true;
+    };
+
+    if let Some(expected_start_ticks) = identity.start_ticks {
+        return actual_start_ticks == expected_start_ticks;
+    }
+
+    let Some(lock_modified_at) = fs::metadata(lock_path).ok().and_then(|m| m.modified().ok())
+    else {
+        return true;
+    };
+    let Some(actual_start_time) = process_start_time(actual_start_ticks) else {
+        return true;
+    };
+
+    legacy_lock_matches_process(lock_modified_at, actual_start_time)
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_comm, rest) = stat.rsplit_once(") ")?;
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn process_start_time(start_ticks: u64) -> Option<SystemTime> {
+    let boot_time_secs = system_boot_time_secs()?;
+    let ticks_per_second = clock_ticks_per_second()?;
+    let secs = start_ticks / ticks_per_second;
+    let nanos = (start_ticks % ticks_per_second).saturating_mul(1_000_000_000) / ticks_per_second;
+    Some(
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(boot_time_secs)
+            + Duration::from_secs(secs)
+            + Duration::from_nanos(nanos),
+    )
+}
+
+fn legacy_lock_matches_process(lock_modified_at: SystemTime, process_start_at: SystemTime) -> bool {
+    process_start_at <= lock_modified_at
+}
+
+fn system_boot_time_secs() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(|line| {
+        let value = line.strip_prefix("btime ")?;
+        value.trim().parse::<u64>().ok()
+    })
+}
+
+fn clock_ticks_per_second() -> Option<u64> {
+    // SAFETY: `sysconf` is thread-safe for `_SC_CLK_TCK` and does not require
+    // any pointers or aliasing guarantees.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return None;
+    }
+    u64::try_from(ticks).ok().filter(|value| *value > 0)
 }
 
 fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemoryRow) {
@@ -1735,11 +1832,12 @@ pub async fn run(
 mod tests {
     use super::{
         ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter, ImportMemoryRow,
-        ImportScope, ImportStateWriter, KnownSkipKind, ProgressStore, WAVLAKE_HOSTS,
-        build_import_audit_row, build_import_timeout_report, effective_audit_append,
-        enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
-        format_if_modified_since_value, is_skip_known_non_music, known_skip_kind,
-        load_known_import_memory, open_state_connection, query_batch, resolve_start_cursor,
+        ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity, ProgressStore, WAVLAKE_HOSTS,
+        build_import_audit_row, build_import_timeout_report, current_lock_identity,
+        effective_audit_append, enqueue_import_audit, enqueue_import_memory,
+        extract_snapshot_archive, format_if_modified_since_value, is_skip_known_non_music,
+        known_skip_kind, legacy_lock_matches_process, load_known_import_memory,
+        open_state_connection, query_batch, read_lock_identity, resolve_start_cursor,
         upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
@@ -1748,7 +1846,7 @@ mod tests {
     use rusqlite::Connection;
     use std::fs;
     use std::io::{self, Cursor};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use stophammer_parser::types::IngestFeedData;
     use tar::{Builder, Header};
     use tempfile::tempdir;
@@ -2298,6 +2396,61 @@ mod tests {
             report.outcome.reason(),
             Some("import crawl exceeded hard deadline of 15s; marking row as failed")
         );
+    }
+
+    #[test]
+    fn read_lock_identity_accepts_current_format() {
+        let tempdir = tempdir().expect("tempdir");
+        let lock_path = tempdir.path().join("import_state.db.lock");
+        fs::write(&lock_path, "123 456").expect("write lock file");
+
+        let identity = read_lock_identity(&lock_path).expect("parse lock identity");
+        assert_eq!(
+            identity,
+            LockIdentity {
+                pid: 123,
+                start_ticks: Some(456)
+            }
+        );
+    }
+
+    #[test]
+    fn read_lock_identity_accepts_legacy_pid_only_format() {
+        let tempdir = tempdir().expect("tempdir");
+        let lock_path = tempdir.path().join("import_state.db.lock");
+        fs::write(&lock_path, "123").expect("write lock file");
+
+        let identity = read_lock_identity(&lock_path).expect("parse lock identity");
+        assert_eq!(
+            identity,
+            LockIdentity {
+                pid: 123,
+                start_ticks: None
+            }
+        );
+    }
+
+    #[test]
+    fn current_lock_identity_records_start_ticks() {
+        let identity = current_lock_identity();
+        assert_eq!(identity.pid, std::process::id());
+        assert!(
+            identity.start_ticks.is_some(),
+            "current process should expose /proc start ticks"
+        );
+    }
+
+    #[test]
+    fn legacy_lock_only_matches_process_when_file_is_newer_than_start() {
+        let process_start_at = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let lock_after_start = SystemTime::UNIX_EPOCH + Duration::from_secs(201);
+        let stale_lock = SystemTime::UNIX_EPOCH + Duration::from_secs(199);
+
+        assert!(legacy_lock_matches_process(
+            lock_after_start,
+            process_start_at
+        ));
+        assert!(!legacy_lock_matches_process(stale_lock, process_start_at));
     }
 
     #[test]

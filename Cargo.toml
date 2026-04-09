@@ -41,6 +41,7 @@ roxmltree = "0.21"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
 tar = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

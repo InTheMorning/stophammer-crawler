@@ -1338,6 +1338,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "reqwest",
  "roxmltree",
  "rusqlite",
