@@ -119,6 +119,14 @@ INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 stophammer-crawler --force feed https://example.com/feed.xml
 ```
 
+#### feed options
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--concurrency` | `CONCURRENCY` | `5` | Parallel fetch+ingest workers |
+| `--host-delay-ms` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
+| `--failed-feeds-output` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
+
 ### import
 
 Batch-scan a PodcastIndex snapshot for music feeds:
@@ -360,14 +368,6 @@ feeds are periodically re-evaluated.
 - **`PODCASTINDEX_DB_URL`** --
   Override the PodcastIndex snapshot archive URL for
   import mode.
-- **`RESOLVER_DB_PATH`** --
-  If set, import mode runs
-  `resolverctl import-active` at start, refreshes that
-  heartbeat while the import is active, and runs
-  `import-idle` on exit.
-- **`RESOLVERCTL_BIN`** --
-  Override the resolver control binary used with
-  `RESOLVER_DB_PATH`. Default: `stophammer-resolverctl`.
 
 ## Architecture
 
@@ -396,13 +396,6 @@ subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function
 
 Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
 fixed task list; gossip mode runs an unbounded stream with a permit-based cap.
-
-When `RESOLVER_DB_PATH` is set, import mode also brackets the run with
-`resolverctl import-active` / `import-idle` and refreshes that import heartbeat
-while the bulk import is in progress. This is intended for single-host
-deployments where the importer and `stophammer` share access to the same
-primary database path. If the importer crashes, `resolverd` will eventually
-ignore the stale heartbeat and resume draining the queue.
 
 ## Analysis Tools
 
@@ -442,9 +435,9 @@ By default:
 - `musicl_backfill` scans crawler import state DBs for successful `musicL`
   discoveries, compares them against `stophammer.db`, and re-fetches only the
   missing feeds through the normal ingest path
-- `crawl` writes retryable feed URLs to `./failed_feeds.txt` unless you
+- `feed` writes retryable feed URLs to `./failed_feeds.txt` unless you
   override `--failed-feeds-output`
-- `crawl` also spaces requests per host (`--host-delay-ms`, default `1500`) and
+- `feed` also spaces requests per host (`--host-delay-ms`, default `1500`) and
   retries transient fetch / ingest throttles before writing a URL to the failed
   feed dump
 
