@@ -22,14 +22,6 @@ pub struct CrawlConfig {
 }
 
 impl CrawlConfig {
-    #[allow(
-        dead_code,
-        reason = "analysis binaries import crawl.rs via #[path] and call this"
-    )]
-    pub fn from_env() -> Self {
-        Self::from_env_with_force(false)
-    }
-
     pub fn from_env_with_force(force_reingest: bool) -> Self {
         let ingest_timeout = Duration::from_secs(10);
         Self {
@@ -473,10 +465,6 @@ pub async fn ingest_cached_feed_report(
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
-#[allow(
-    dead_code,
-    reason = "analysis binaries import crawl.rs via #[path] and call this shared helper"
-)]
 pub async fn ingest_cached_feed(
     source_url: &str,
     canonical_url: &str,

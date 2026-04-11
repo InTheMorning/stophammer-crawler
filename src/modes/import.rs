@@ -774,6 +774,25 @@ fn audit_dedupe_key(row: &ImportAuditRow) -> Option<ImportAuditDedupeKey> {
     })
 }
 
+fn is_audit_accepted_medium(raw_medium: &str) -> bool {
+    raw_medium.eq_ignore_ascii_case("music")
+        || raw_medium.eq_ignore_ascii_case("publisher")
+        || raw_medium.eq_ignore_ascii_case("musicL")
+}
+
+fn should_record_audit_row(report: &CrawlReport) -> bool {
+    report.fetch_http_status == Some(200)
+        && matches!(
+            report.outcome,
+            CrawlOutcome::Accepted { .. } | CrawlOutcome::NoChange
+        )
+        && report.parsed_feed.as_ref().is_some_and(|feed| {
+            feed.raw_medium
+                .as_deref()
+                .is_some_and(is_audit_accepted_medium)
+        })
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "the writer thread takes ownership of the receiver for the duration of the loop"
@@ -814,14 +833,9 @@ fn build_import_audit_row(
     fetched_at: i64,
 ) -> Option<ImportAuditRow> {
     let raw_xml = report.raw_xml.clone()?;
-    if report.fetch_http_status != Some(200) {
+    if !should_record_audit_row(report) {
         return None;
     }
-
-    let parse_error = match &report.outcome {
-        CrawlOutcome::ParseError(reason) => Some(reason.clone()),
-        _ => None,
-    };
 
     let parsed_feed = report.parsed_feed.clone();
     let podcast_namespace = extract_podcast_namespace(&raw_xml).ok().flatten();
@@ -850,7 +864,7 @@ fn build_import_audit_row(
         raw_xml,
         parsed_feed,
         podcast_namespace,
-        parse_error,
+        parse_error: None,
     })
 }
 
@@ -861,14 +875,9 @@ pub(crate) fn build_audit_row_from_url(
     fetched_at: i64,
 ) -> Option<ImportAuditRow> {
     let raw_xml = report.raw_xml.clone()?;
-    if report.fetch_http_status != Some(200) {
+    if !should_record_audit_row(report) {
         return None;
     }
-
-    let parse_error = match &report.outcome {
-        CrawlOutcome::ParseError(reason) => Some(reason.clone()),
-        _ => None,
-    };
 
     let parsed_feed = report.parsed_feed.clone();
     let podcast_namespace = extract_podcast_namespace(&raw_xml).ok().flatten();
@@ -895,7 +904,7 @@ pub(crate) fn build_audit_row_from_url(
         raw_xml,
         parsed_feed,
         podcast_namespace,
-        parse_error,
+        parse_error: None,
     })
 }
 
@@ -2290,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn build_import_audit_row_uses_feed_audit_shape_for_200_fetches() {
+    fn build_import_audit_row_uses_cached_feed_shape_for_200_fetches() {
         let candidate = sample_candidate_row();
         let report = sample_audit_report();
 
@@ -2312,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn build_import_audit_row_keeps_parse_errors_for_200_bodies() {
+    fn build_import_audit_row_skips_parse_errors_for_200_bodies() {
         let candidate = sample_candidate_row();
         let report = CrawlReport {
             outcome: CrawlOutcome::ParseError("invalid xml".to_string()),
@@ -2325,10 +2334,7 @@ mod tests {
             parsed_feed: None,
         };
 
-        let row = build_import_audit_row(&candidate, &report, 1_700_000_000)
-            .expect("expected audit row for parse error with 200 body");
-        assert_eq!(row.parse_error.as_deref(), Some("invalid xml"));
-        assert!(row.parsed_feed.is_none());
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
     }
 
     #[test]
@@ -2365,10 +2371,61 @@ mod tests {
         assert_eq!(row.parse_error, None);
     }
 
+    #[test]
+    fn build_import_audit_row_skips_missing_medium() {
+        let candidate = sample_candidate_row();
+        let mut parsed_feed = sample_parsed_feed();
+        parsed_feed.raw_medium = None;
+        let mut report = sample_audit_report();
+        report.raw_medium = None;
+        report.parsed_feed = Some(parsed_feed);
+
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn build_import_audit_row_skips_unaccepted_medium() {
+        let candidate = sample_candidate_row();
+        let mut parsed_feed = sample_parsed_feed();
+        parsed_feed.raw_medium = Some("podcast".to_string());
+        let mut report = sample_audit_report();
+        report.raw_medium = Some("podcast".to_string());
+        report.parsed_feed = Some(parsed_feed);
+
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn build_import_audit_row_skips_rejections_even_with_accepted_medium() {
+        let candidate = sample_candidate_row();
+        let mut report = sample_audit_report();
+        report.outcome = CrawlOutcome::Rejected {
+            reason: "[feed_guid] missing guid".to_string(),
+            warnings: Vec::new(),
+        };
+
+        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn build_import_audit_row_keeps_musicl_feeds() {
+        let candidate = sample_candidate_row();
+        let mut parsed_feed = sample_parsed_feed();
+        parsed_feed.raw_medium = Some("musicL".to_string());
+        let mut report = sample_audit_report();
+        report.raw_medium = Some("musicL".to_string());
+        report.parsed_feed = Some(parsed_feed);
+
+        let row = build_import_audit_row(&candidate, &report, 1_700_000_000)
+            .expect("expected audit row for musicL feed");
+
+        assert_eq!(row.parse_error, None);
+    }
+
     #[tokio::test]
     async fn audit_writer_persists_ndjson_rows() {
         let tempdir = tempdir().expect("tempdir");
-        let output_path = tempdir.path().join("feed_audit.ndjson");
+        let output_path = tempdir.path().join("stored-feeds.ndjson");
         let writer = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), false);
         let row = ImportAuditRow {
             source_db: ImportAuditSourceDb {
@@ -2401,7 +2458,7 @@ mod tests {
     #[should_panic(expected = "held by live process")]
     fn audit_writer_refuses_second_writer_for_same_path() {
         let tempdir = tempdir().expect("tempdir");
-        let output_path = tempdir.path().join("feed_audit.ndjson");
+        let output_path = tempdir.path().join("stored-feeds.ndjson");
         let _first = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), true);
         let _second = ImportAuditWriter::spawn(output_path.to_str().expect("utf-8 path"), true);
     }
@@ -2409,7 +2466,7 @@ mod tests {
     #[tokio::test]
     async fn audit_writer_append_dedupes_existing_rows_by_feed_guid_and_hash() {
         let tempdir = tempdir().expect("tempdir");
-        let output_path = tempdir.path().join("feed_audit.ndjson");
+        let output_path = tempdir.path().join("stored-feeds.ndjson");
         fs::write(
             &output_path,
             "{\"source_db\":{\"feed_guid\":\"feed-guid\"},\"fetch\":{\"content_sha256\":\"abc123\"}}\n",
@@ -2708,10 +2765,10 @@ mod tests {
     fn audit_output_appends_by_default_unless_replaced() {
         assert!(effective_audit_append(
             false,
-            Some("./feed_audit_wavlake.ndjson")
+            Some("./stored-wavlake-feeds.ndjson")
         ));
-        assert!(effective_audit_append(false, Some("./feed_audit.ndjson")));
-        assert!(!effective_audit_append(true, Some("./feed_audit.ndjson")));
+        assert!(effective_audit_append(false, Some("./stored-feeds.ndjson")));
+        assert!(!effective_audit_append(true, Some("./stored-feeds.ndjson")));
         assert!(!effective_audit_append(false, None));
     }
 

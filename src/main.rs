@@ -96,7 +96,7 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
         concurrency: usize,
 
-        /// Optional NDJSON output containing local RSS copies in `feed_audit` format
+        /// Optional cached-feed NDJSON output containing local RSS copies
         #[arg(long)]
         audit_output: Option<String>,
 
@@ -127,8 +127,8 @@ enum Mode {
 
     /// Replay cached NDJSON rows into stophammer without re-fetching feeds
     Ndjson {
-        /// Path to `feed_audit`-format NDJSON file
-        #[arg(long, default_value = "./feed_audit.ndjson")]
+        /// Path to cached feed NDJSON file
+        #[arg(long, default_value = "./stored-feeds.ndjson")]
         input: String,
 
         /// Path to resume-cursor state database
@@ -194,7 +194,7 @@ enum Mode {
         #[arg(short, long)]
         quiet: bool,
 
-        /// Optional NDJSON output containing local RSS copies in `feed_audit` format
+        /// Optional cached-feed NDJSON output containing local RSS copies
         #[arg(long)]
         audit_output: Option<String>,
 

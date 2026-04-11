@@ -5,31 +5,10 @@ edition = "2024"
 license = "AGPL-3.0-only"
 description = "Unified RSS feed crawler with crawl, import, ndjson, and gossip modes"
 
-[[bin]]
-name = "feed_audit"
-path = "analysis/bin/feed_audit.rs"
-
-[[bin]]
-name = "audit_analyzer"
-path = "analysis/bin/audit_analyzer.rs"
-
-[[bin]]
-name = "audit_import"
-path = "analysis/bin/audit_import.rs"
-
-[[bin]]
-name = "audit_expand_publishers"
-path = "analysis/bin/audit_expand_publishers.rs"
-
-[[bin]]
-name = "musicl_backfill"
-path = "analysis/bin/musicl_backfill.rs"
-
 [dependencies]
 stophammer-parser = { path = "../stophammer-parser" }
 tokio       = { version = "1", features = ["full"] }
 reqwest     = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-bytes = "1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 sha2        = "0.10"
@@ -37,7 +16,6 @@ hex         = "0.4"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 clap        = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-roxmltree = "0.21"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
 tar = "0.4"

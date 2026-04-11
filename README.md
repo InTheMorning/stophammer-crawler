@@ -10,7 +10,7 @@ Four subcommands cover every discovery path:
 
 - **feed** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
-- **ndjson** — replay cached `feed_audit`-format NDJSON into stophammer without re-fetching
+- **ndjson** — replay cached feed NDJSON into stophammer without re-fetching
 - **gossip** — long-running gossip-listener SSE consumer with optional archive replay
 
 ## Requirements
@@ -60,11 +60,7 @@ docker build \
   -t stophammer-crawler .
 ```
 
-That produces:
-
-- `target/release/stophammer-crawler`
-- analysis binaries such as `feed_audit`, `audit_import`,
-  `audit_expand_publishers`, and `musicl_backfill`
+That produces `target/release/stophammer-crawler`.
 
 Quick checks from this checkout:
 
@@ -73,12 +69,6 @@ cargo run -- feed --help
 cargo run -- import --help
 cargo run -- ndjson --help
 cargo run -- gossip --help
-
-cargo run --bin feed_audit -- --help
-cargo run --bin audit_analyzer -- --help
-cargo run --bin audit_import -- --help
-cargo run --bin audit_expand_publishers -- --help
-cargo run --bin musicl_backfill -- --help
 ```
 
 ## Usage
@@ -184,12 +174,11 @@ for multi-gigabyte snapshots.
 | `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
 | `--batch <n>` | `100` | Feeds per DB query batch |
 | `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
-| `--audit-output <path>` | off | Optional NDJSON dump of successfully ingested `200 OK` feeds in `feed_audit` format |
+| `--audit-output <path>` | off | Optional cached-feed NDJSON dump of successfully ingested `200 OK` feeds |
 | `--audit-replace` | off | Replace `--audit-output` instead of appending to it |
 | `--dry-run` | off | Log without fetching/ingesting |
 | `--skip-known-non-music` | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
 | `--skip-known-success` | off | Skip rows already known to have reached `accepted`, `no_change`, or `skipped_known_success` in importer memory |
-| `--cursor <id>` | stored cursor | Override the stored or music-first start cursor |
 | `--wavlake-only` | off | Restrict snapshot import to `wavlake.com` / `www.wavlake.com` feeds; without this flag, normal import excludes Wavlake rows |
 | `--cursor <id>` | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
 
@@ -224,16 +213,15 @@ that run. Wavlake scope does not imply any skip policy; use
 `--skip-known-success` and/or `--skip-known-non-music` if you want to trade
 freshness for speed on reruns.
 
-If `--audit-output` is set, import mode writes only feeds that were actually
-ingested by stophammer to an NDJSON file compatible with the `feed_audit` /
-`audit_import` tooling. That includes newly accepted feeds and `no_change`
-re-submissions of already-ingested feeds. Rejected feeds, parse errors, and
-non-`200` fetches are not written. By default, `--audit-output` appends and the
-writer de-dupes by `source_db.feed_guid` plus `fetch.content_sha256` so reruns
-do not append the same fetched body again. Use `--audit-replace` to truncate
-and rewrite the file instead. Import mode also creates an adjacent lock file
-while writing the audit NDJSON, so only one importer can target a given audit
-path at a time.
+If `--audit-output` is set, import mode writes newly accepted feeds and
+`no_change` re-submissions of already-ingested feeds to cached-feed NDJSON.
+Rejected feeds, parse errors, missing or unaccepted `podcast:medium` values,
+and non-`200` fetches are not written. By default, `--audit-output` appends and
+the writer de-dupes by `source_db.feed_guid` plus `fetch.content_sha256` so
+reruns do not append the same fetched body again. Use `--audit-replace` to
+truncate and rewrite the file instead. Import mode also creates an adjacent
+lock file while writing the NDJSON, so only one importer can target a given
+output path at a time.
 
 Operational note:
 
@@ -243,15 +231,15 @@ Operational note:
 
 ### ndjson
 
-Replay cached `feed_audit`-format NDJSON rows into stophammer without
-re-fetching feeds. Parses each row's `raw_xml`, posts it to `/ingest/feed`,
-and tracks progress with a resume cursor.
+Replay cached feed NDJSON rows into stophammer without re-fetching feeds.
+Parses each row's `raw_xml`, posts it to `/ingest/feed`, and tracks progress
+with a resume cursor.
 
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 stophammer-crawler ndjson \
-  --input ./feed_audit.ndjson \
+  --input ./stored-feeds.ndjson \
   --concurrency 5
 ```
 
@@ -261,7 +249,7 @@ Force re-ingestion of all rows:
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 stophammer-crawler --force ndjson \
-  --input ./feed_audit.ndjson \
+  --input ./stored-feeds.ndjson \
   --reset
 ```
 
@@ -269,7 +257,7 @@ Dry-run to preview what would be ingested:
 
 ```bash
 stophammer-crawler ndjson \
-  --input ./feed_audit.ndjson \
+  --input ./stored-feeds.ndjson \
   --dry-run
 ```
 
@@ -277,7 +265,7 @@ stophammer-crawler ndjson \
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--input <path>` | | `./feed_audit.ndjson` | Path to `feed_audit`-format NDJSON file |
+| `--input <path>` | | `./stored-feeds.ndjson` | Path to cached feed NDJSON file |
 | `--state <path>` | | `./ndjson_state.db` | Resume-cursor state database |
 | `--batch <n>` | | `100` | Rows per processing batch |
 | `--limit <n>` | | off | Maximum NDJSON rows to process this run |
@@ -435,7 +423,7 @@ stophammer-crawler
     modes/
       batch.rs        Load URLs from file/env/stdin, run pool
       import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
-      ndjson.rs       Replay cached feed_audit NDJSON without re-fetching
+      ndjson.rs       Replay cached feed NDJSON without re-fetching
       gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
 
@@ -450,150 +438,6 @@ subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function
 
 Concurrency is bounded by a tokio semaphore — crawl and import modes drain a
 fixed task list; gossip mode runs an unbounded stream with a permit-based cap.
-
-## Analysis Tools
-
-Audit and corpus-analysis tools live under `analysis/` so they stay separate from
-the crawler's operational code and runtime data:
-
-```text
-analysis/
-  bin/                 Rust binaries for feed audits and corpus analysis
-  data/                Local audit inputs/outputs (NDJSON, SQLite snapshots)
-  reports/             Generated Markdown/JSON reports and clustering artifacts
-```
-
-Available binaries:
-
-- `cargo run --bin feed_audit -- ...`
-- `cargo run --bin audit_analyzer -- ...`
-- `cargo run --bin audit_import -- ...`
-- `cargo run --bin audit_expand_publishers -- ...`
-- `cargo run --bin musicl_backfill -- ...`
-
-By default:
-
-- `feed_audit` reads `./analysis/data/stophammer-feeds.db` and writes
-  successful `200 OK` XML captures to `./analysis/data/feed_audit.ndjson`
-- `feed_audit` writes retryable / failed feed URLs to
-  `./analysis/data/failed_feeds.txt`
-- `feed_audit` can also fetch a plain-text URL list via `--urls-file` and
-  append successful captures back into an existing NDJSON corpus with `--append`
-- `audit_analyzer` reads `./analysis/data/feed_audit.ndjson` and writes reports
-  under `./analysis/reports/`
-- `audit_import` reads `./analysis/data/feed_audit.ndjson` and replays cached
-  feeds into `/ingest/feed` using `./analysis/data/audit_import_state.db` as its
-  resume cursor
-- `audit_import` retries transient ingest throttles / failures such as `429`
-  before counting the row as an ingest error
-- `musicl_backfill` scans crawler import state DBs for successful `musicL`
-  discoveries, compares them against `stophammer.db`, and re-fetches only the
-  missing feeds through the normal ingest path
-- `feed` writes retryable feed URLs to `./failed_feeds.txt` unless you
-  override `--failed-feeds-output`
-- `feed` also spaces requests per host (`--host-delay-ms`, default `1500`) and
-  retries transient fetch / ingest throttles before writing a URL to the failed
-  feed dump
-
-Examples:
-
-```bash
-# Create / refresh the cached NDJSON corpus
-cargo run --bin feed_audit -- \
-  --db ./analysis/data/stophammer-feeds.db \
-  --output ./analysis/data/feed_audit.ndjson \
-  --failed-feeds-output ./analysis/data/failed_feeds.txt
-
-# Refill only missing feeds from failed_feeds.txt back into the same corpus
-cargo run --bin feed_audit -- \
-  --urls-file ./analysis/data/failed_feeds.txt \
-  --output ./analysis/data/feed_audit.ndjson \
-  --append \
-  --failed-feeds-output ./analysis/data/failed_feeds.txt \
-  --success-delay-ms 2000 \
-  --failure-backoff-secs 30 \
-  --max-backoff-secs 600
-
-# Re-analyze the cached corpus
-cargo run --bin audit_analyzer -- \
-  --input ./analysis/data/feed_audit.ndjson
-
-# Replay cached feeds into a running primary
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --bin audit_import -- \
-  --input ./analysis/data/feed_audit.ndjson \
-  --reset
-
-# Discover and optionally fetch publisher feeds referenced by the audit corpus
-cargo run --bin audit_expand_publishers -- \
-  --input ./analysis/data/feed_audit.ndjson \
-  --dry-run
-
-# Dry-run musicL backfill from crawler state DBs
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --bin musicl_backfill -- \
-  --stophammer-db ./stophammer.db \
-  --dry-run
-
-# Real musicL backfill
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run --bin musicl_backfill -- \
-  --stophammer-db ./stophammer.db \
-  --concurrency 5
-
-# Live crawl with per-host spacing and retry dumps
-CRAWL_TOKEN=secret \
-INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run -- feed \
-  --concurrency 5 \
-  --host-delay-ms 1500 \
-  --failed-feeds-output ./failed_feeds.txt \
-  ./feeds.txt
-```
-
-If `--state-db` is omitted, `musicl_backfill` scans:
-
-- `./import_state.db`
-- `./import_state_wavlake.db`
-
-Candidate selection is intentionally narrow:
-
-- `fetch_http_status = 200`
-- `lower(raw_medium) = 'musicl'`
-- `parsed_feed_guid IS NOT NULL`
-- feed GUID not already present in `stophammer.db`
-
-`musicl_backfill` reads crawler state DBs only; it does not mutate importer
-progress. It dedupes candidates by parsed feed GUID across state DBs, re-fetches
-only missing candidate URLs through the normal crawl+ingest path, and uses a
-short fetch timeout plus a hard per-feed deadline so bad hosts do not stall the
-run indefinitely.
-
-Useful verification queries:
-
-```bash
-sqlite3 ./import_state.db "
-SELECT COUNT(*)
-FROM import_feed_memory
-WHERE fetch_http_status = 200
-  AND lower(raw_medium) = 'musicl'
-  AND parsed_feed_guid IS NOT NULL;"
-```
-
-```bash
-sqlite3 ./stophammer.db "SELECT COUNT(*) FROM feeds WHERE lower(raw_medium) = 'musicl';"
-```
-
-```bash
-sqlite3 ./stophammer.db "
-SELECT COUNT(*)
-FROM resolver_queue rq
-JOIN feeds f ON f.feed_guid = rq.feed_guid
-WHERE lower(f.raw_medium) = 'musicl';"
-```
 
 ## Docker
 
@@ -612,7 +456,7 @@ docker compose run --rm stophammer-crawler feed https://example.com/feed.xml
 docker compose run --rm stophammer-crawler --force feed https://example.com/feed.xml
 
 # Replay NDJSON corpus
-docker compose run --rm stophammer-crawler ndjson --input /data/feed_audit.ndjson
+docker compose run --rm stophammer-crawler ndjson --input /data/stored-feeds.ndjson
 
 # Long-running gossip listener
 docker compose up -d gossip
