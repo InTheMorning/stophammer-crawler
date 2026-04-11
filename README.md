@@ -31,7 +31,7 @@ The recommended operator install surfaces are published from the main
 The crawler release bundle includes:
 
 - `stophammer-crawler`
-- systemd units for long-running `gossip` and optional one-shot `crawl` /
+- systemd units for long-running `gossip` and optional one-shot `feed` /
   `import` runs
 - example env files
 - `sysusers.d` / `tmpfiles.d` snippets
@@ -259,13 +259,13 @@ For packaged systemd installs, the usual pattern is to add the
 `stophammer-crawler` service user to the `podping` group so it can read the
 archive written by `gossip-listener`.
 
-For Docker installs, the root repo's reference `docker-compose.yml` now runs
-`podping.alpha`'s `gossip-listener` as a sibling `podping` service and shares
-its `archive.db` with the crawler over a named Docker volume. That default path
-inside the crawler container is:
+For Docker installs, the root repo's reference `docker-compose.yml` runs
+`podping.alpha`'s `gossip-listener` as a sibling `podping-listener` service
+and shares its `archive.db` with the crawler over a named Docker volume. That
+default path inside the crawler container is:
 
 - `GOSSIP_ARCHIVE_DB=/podping/archive.db`
-- `GOSSIP_SSE_URL=http://podping:8089/events`
+- `GOSSIP_SSE_URL=http://podping-listener:8089/events`
 
 #### Archive-backed mode (recommended)
 
@@ -500,7 +500,7 @@ cargo run --bin musicl_backfill -- \
 # Live crawl with per-host spacing and retry dumps
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-cargo run -- crawl \
+cargo run -- feed \
   --concurrency 5 \
   --host-delay-ms 1500 \
   --failed-feeds-output ./failed_feeds.txt \
@@ -576,7 +576,8 @@ The `stophammer-crawler` service requires `CRAWL_TOKEN` and `INGEST_URL` in
 The `gossip` and `import` services use separate env files configured in the compose stack.
 
 For day-to-day operation, run the binary directly or provide your own scheduler / compose
-deployment around `stophammer-crawler gossip`, `import`, or `feed`.
+deployment around `stophammer-crawler gossip`, `stophammer-crawler import`, or
+`stophammer-crawler feed`.
 
 ## License
 
