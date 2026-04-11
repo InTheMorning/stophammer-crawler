@@ -1022,10 +1022,11 @@ pub async fn run(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    force: bool,
 ) {
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
 
-    let config = Arc::new(CrawlConfig::from_env());
+    let config = Arc::new(CrawlConfig::from_env_with_force(force));
     let client = Arc::new(create_async_client());
     let sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));

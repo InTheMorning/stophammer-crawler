@@ -30,15 +30,19 @@ fn parse_non_negative_i64(raw: &str) -> Result<i64, String> {
 #[derive(Parser)]
 #[command(name = "stophammer-crawler", about = "Unified RSS feed crawler")]
 struct Cli {
+    /// Force re-ingestion even if the feed content has not changed
+    #[arg(long, env = "FORCE_REINGEST")]
+    force: bool,
+
     #[command(subcommand)]
     mode: Mode,
 }
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Crawl a list of feed URLs (file, args, env, or stdin)
-    #[command(name = "crawl", alias = "batch")]
-    Batch {
+    /// Fetch and ingest a list of feed URLs (file, args, env, or stdin)
+    #[command(name = "feed", alias = "crawl")]
+    Feed {
         /// Feed URLs or path to a file containing URLs
         urls: Vec<String>,
 
@@ -56,6 +60,7 @@ enum Mode {
             default_value = "./failed_feeds.txt"
         )]
         failed_feeds_output: String,
+
     },
 
     /// Import from a `PodcastIndex` snapshot database
@@ -164,15 +169,16 @@ enum Mode {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let force = cli.force;
 
     match cli.mode {
-        Mode::Batch {
+        Mode::Feed {
             urls,
             concurrency,
             host_delay_ms,
             failed_feeds_output,
         } => {
-            modes::batch::run(urls, concurrency, host_delay_ms, failed_feeds_output).await;
+            modes::batch::run(urls, concurrency, host_delay_ms, failed_feeds_output, force).await;
         }
         Mode::Import {
             db,
@@ -205,6 +211,7 @@ async fn main() {
                 wavlake_only,
                 dry_run,
                 cursor,
+                force,
             )
             .await;
         }
@@ -229,6 +236,7 @@ async fn main() {
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
+                force,
             )
             .await;
         }

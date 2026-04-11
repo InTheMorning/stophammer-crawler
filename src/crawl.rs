@@ -14,13 +14,20 @@ pub struct CrawlConfig {
     pub user_agent: String,
     pub fetch_timeout: Duration,
     pub ingest_timeout: Duration,
+    /// When true, the ingest server skips the content-hash dedup check.
+    pub force_reingest: bool,
     /// Dedicated HTTP client for ingest POSTs, built with connection pooling
     /// disabled so stale keep-alive sockets never cause spurious failures.
     ingest_client: reqwest::Client,
 }
 
 impl CrawlConfig {
+    #[allow(dead_code, reason = "analysis binaries import crawl.rs via #[path] and call this")]
     pub fn from_env() -> Self {
+        Self::from_env_with_force(false)
+    }
+
+    pub fn from_env_with_force(force_reingest: bool) -> Self {
         let ingest_timeout = Duration::from_secs(10);
         Self {
             crawl_token: std::env::var("CRAWL_TOKEN").expect("CRAWL_TOKEN is required"),
@@ -29,6 +36,7 @@ impl CrawlConfig {
             user_agent: "stophammer-crawler/0.1".to_string(),
             fetch_timeout: Duration::from_secs(20),
             ingest_timeout,
+            force_reingest,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -42,6 +50,7 @@ impl CrawlConfig {
             user_agent: user_agent.to_string(),
             fetch_timeout,
             ingest_timeout,
+            force_reingest: false,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -335,7 +344,7 @@ async fn post_ingest_payload(
     feed_data: Option<IngestFeedData>,
     config: &CrawlConfig,
 ) -> CrawlOutcome {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "canonical_url": canonical_url,
         "source_url": source_url,
         "crawl_token": config.crawl_token,
@@ -343,6 +352,9 @@ async fn post_ingest_payload(
         "content_hash": content_hash,
         "feed_data": feed_data,
     });
+    if config.force_reingest {
+        payload["force_reingest"] = serde_json::json!(true);
+    }
 
     let ingest_resp = match config
         .ingest_client

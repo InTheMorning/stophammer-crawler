@@ -1560,6 +1560,7 @@ pub async fn run(
     wavlake_only: bool,
     dry_run: bool,
     cursor_override: Option<i64>,
+    force: bool,
 ) {
     let scope = ImportScope::from_wavlake_only(wavlake_only);
     let audit_append = effective_audit_append(audit_replace, audit_output.as_deref());
@@ -1639,7 +1640,7 @@ pub async fn run(
             std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
         )
     } else {
-        let mut config = CrawlConfig::from_env();
+        let mut config = CrawlConfig::from_env_with_force(force);
         config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
         config
     });

@@ -172,6 +172,7 @@ pub async fn run(
     concurrency: usize,
     host_delay_ms: u64,
     failed_feeds_output: String,
+    force: bool,
 ) {
     let urls = interleave_by_host(load_urls(&urls_arg), |url| host_key(url));
 
@@ -186,7 +187,7 @@ pub async fn run(
         host_delay_ms
     );
 
-    let config = Arc::new(CrawlConfig::from_env());
+    let config = Arc::new(CrawlConfig::from_env_with_force(force));
     let client = Arc::new(reqwest::Client::new());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
