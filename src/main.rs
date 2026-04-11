@@ -125,6 +125,37 @@ enum Mode {
         cursor: Option<i64>,
     },
 
+    /// Replay cached NDJSON rows into stophammer without re-fetching feeds
+    Ndjson {
+        /// Path to `feed_audit`-format NDJSON file
+        #[arg(long, default_value = "./feed_audit.ndjson")]
+        input: String,
+
+        /// Path to resume-cursor state database
+        #[arg(long, default_value = "./ndjson_state.db")]
+        state: String,
+
+        /// Rows per processing batch
+        #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
+        batch: usize,
+
+        /// Maximum number of NDJSON rows to process this run
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Parallel parse+ingest workers
+        #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
+        concurrency: usize,
+
+        /// Log candidates without posting to stophammer
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Clear resume cursor and start from the first row
+        #[arg(long)]
+        reset: bool,
+    },
+
     /// Listen to gossip-listener SSE stream for real-time podping notifications
     Gossip {
         /// Path to gossip state database (latest seen timestamp cursor)
@@ -162,6 +193,14 @@ enum Mode {
         /// Quiet mode: hide `medium_music` rejections (non-music spam)
         #[arg(short, long)]
         quiet: bool,
+
+        /// Optional NDJSON output containing local RSS copies in `feed_audit` format
+        #[arg(long)]
+        audit_output: Option<String>,
+
+        /// Replace `--audit-output` instead of appending to it
+        #[arg(long, requires = "audit_output")]
+        audit_replace: bool,
     },
 }
 
@@ -214,6 +253,27 @@ async fn main() {
             )
             .await;
         }
+        Mode::Ndjson {
+            input,
+            state,
+            batch,
+            limit,
+            concurrency,
+            dry_run,
+            reset,
+        } => {
+            modes::ndjson::run(
+                input,
+                state,
+                batch,
+                limit,
+                concurrency,
+                dry_run,
+                reset,
+                force,
+            )
+            .await;
+        }
         Mode::Gossip {
             state,
             skip_db,
@@ -224,6 +284,8 @@ async fn main() {
             skip_known_non_music,
             skip_ttl_days,
             quiet,
+            audit_output,
+            audit_replace,
         } => {
             modes::gossip::run(
                 state,
@@ -236,6 +298,8 @@ async fn main() {
                 skip_ttl_days,
                 quiet,
                 force,
+                audit_output,
+                audit_replace,
             )
             .await;
         }

@@ -200,33 +200,33 @@ impl Drop for ActiveImportTaskGuard {
 }
 
 #[derive(Debug, Clone)]
-struct ImportAuditRow {
-    source_db: ImportAuditSourceDb,
-    fetched_at: i64,
-    fetch: ImportAuditFetch,
-    raw_xml: String,
-    parsed_feed: Option<IngestFeedData>,
-    podcast_namespace: Option<IngestPodcastNamespaceSnapshot>,
+pub(crate) struct ImportAuditRow {
+    pub(crate) source_db: ImportAuditSourceDb,
+    pub(crate) fetched_at: i64,
+    pub(crate) fetch: ImportAuditFetch,
+    pub(crate) raw_xml: String,
+    pub(crate) parsed_feed: Option<IngestFeedData>,
+    pub(crate) podcast_namespace: Option<IngestPodcastNamespaceSnapshot>,
     parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ImportAuditSourceDb {
-    feed_guid: String,
-    feed_url: String,
-    title: String,
+pub(crate) struct ImportAuditSourceDb {
+    pub(crate) feed_guid: String,
+    pub(crate) feed_url: String,
+    pub(crate) title: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ImportAuditFetch {
-    final_url: Option<String>,
-    http_status: Option<u16>,
-    content_sha256: Option<String>,
-    error: Option<String>,
+pub(crate) struct ImportAuditFetch {
+    pub(crate) final_url: Option<String>,
+    pub(crate) http_status: Option<u16>,
+    pub(crate) content_sha256: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ImportAuditRecord {
+pub(crate) struct ImportAuditRecord {
     source_db: ImportAuditSourceDb,
     fetched_at: i64,
     fetch: ImportAuditFetch,
@@ -376,7 +376,7 @@ enum ImportStateCommand {
     },
 }
 
-enum ImportAuditCommand {
+pub(crate) enum ImportAuditCommand {
     Write(Box<ImportAuditRow>),
     Shutdown { ack: oneshot::Sender<()> },
 }
@@ -386,8 +386,8 @@ struct ImportStateWriter {
     handle: Option<thread::JoinHandle<()>>,
 }
 
-struct ImportAuditWriter {
-    tx: mpsc::Sender<ImportAuditCommand>,
+pub(crate) struct ImportAuditWriter {
+    pub(crate) tx: mpsc::Sender<ImportAuditCommand>,
     handle: Option<thread::JoinHandle<()>>,
     lock_path: PathBuf,
 }
@@ -464,7 +464,7 @@ impl ImportStateWriter {
 }
 
 impl ImportAuditWriter {
-    fn spawn(path: &str, append: bool) -> Self {
+    pub(crate) fn spawn(path: &str, append: bool) -> Self {
         let (tx, rx) = mpsc::channel();
         let path = path.to_string();
         let lock_path = acquire_pid_lock(&path, "import audit");
@@ -481,7 +481,7 @@ impl ImportAuditWriter {
         }
     }
 
-    async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(ImportAuditCommand::Shutdown { ack: ack_tx })
@@ -713,7 +713,7 @@ fn enqueue_import_memory(tx: &mpsc::Sender<ImportStateCommand>, row: ImportMemor
     }
 }
 
-fn enqueue_import_audit(tx: &mpsc::Sender<ImportAuditCommand>, row: ImportAuditRow) {
+pub(crate) fn enqueue_import_audit(tx: &mpsc::Sender<ImportAuditCommand>, row: ImportAuditRow) {
     if tx.send(ImportAuditCommand::Write(Box::new(row))).is_err() {
         eprintln!("import: WARNING: audit writer channel closed, dropping audit row");
     }
@@ -818,12 +818,10 @@ fn build_import_audit_row(
         return None;
     }
 
-    if !matches!(
-        report.outcome,
-        CrawlOutcome::Accepted { .. } | CrawlOutcome::NoChange
-    ) {
-        return None;
-    }
+    let parse_error = match &report.outcome {
+        CrawlOutcome::ParseError(reason) => Some(reason.clone()),
+        _ => None,
+    };
 
     let parsed_feed = report.parsed_feed.clone();
     let podcast_namespace = extract_podcast_namespace(&raw_xml).ok().flatten();
@@ -852,7 +850,52 @@ fn build_import_audit_row(
         raw_xml,
         parsed_feed,
         podcast_namespace,
-        parse_error: None,
+        parse_error,
+    })
+}
+
+/// Build an audit row from a URL and crawl report (used by gossip mode).
+pub(crate) fn build_audit_row_from_url(
+    url: &str,
+    report: &CrawlReport,
+    fetched_at: i64,
+) -> Option<ImportAuditRow> {
+    let raw_xml = report.raw_xml.clone()?;
+    if report.fetch_http_status != Some(200) {
+        return None;
+    }
+
+    let parse_error = match &report.outcome {
+        CrawlOutcome::ParseError(reason) => Some(reason.clone()),
+        _ => None,
+    };
+
+    let parsed_feed = report.parsed_feed.clone();
+    let podcast_namespace = extract_podcast_namespace(&raw_xml).ok().flatten();
+    let source_feed_guid = parsed_feed
+        .as_ref()
+        .map_or_else(|| url.to_string(), |feed| feed.feed_guid.clone());
+    let title = parsed_feed
+        .as_ref()
+        .map_or_else(|| url.to_string(), |feed| feed.title.clone());
+
+    Some(ImportAuditRow {
+        source_db: ImportAuditSourceDb {
+            feed_guid: source_feed_guid,
+            feed_url: url.to_string(),
+            title,
+        },
+        fetched_at,
+        fetch: ImportAuditFetch {
+            final_url: report.final_url.clone(),
+            http_status: report.fetch_http_status,
+            content_sha256: report.content_sha256.clone(),
+            error: None,
+        },
+        raw_xml,
+        parsed_feed,
+        podcast_namespace,
+        parse_error,
     })
 }
 
@@ -2269,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn build_import_audit_row_skips_parse_errors_for_200_bodies() {
+    fn build_import_audit_row_keeps_parse_errors_for_200_bodies() {
         let candidate = sample_candidate_row();
         let report = CrawlReport {
             outcome: CrawlOutcome::ParseError("invalid xml".to_string()),
@@ -2282,7 +2325,10 @@ mod tests {
             parsed_feed: None,
         };
 
-        assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
+        let row = build_import_audit_row(&candidate, &report, 1_700_000_000)
+            .expect("expected audit row for parse error with 200 body");
+        assert_eq!(row.parse_error.as_deref(), Some("invalid xml"));
+        assert!(row.parsed_feed.is_none());
     }
 
     #[test]

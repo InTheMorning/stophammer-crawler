@@ -3,7 +3,7 @@ name = "stophammer-crawler"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-description = "Unified RSS feed crawler with crawl, import, and gossip modes"
+description = "Unified RSS feed crawler with crawl, import, ndjson, and gossip modes"
 
 [[bin]]
 name = "feed_audit"

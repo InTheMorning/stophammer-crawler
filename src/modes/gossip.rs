@@ -4,10 +4,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use reqwest::Client;
 use rusqlite::{Connection, params};
+use std::sync::mpsc;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::crawl::{CrawlConfig, CrawlReport, crawl_feed_report};
 use crate::dedup::Dedup;
+use crate::modes::import::{
+    ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
+};
 
 fn create_async_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -387,9 +391,9 @@ impl SseParser {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
-    reason = "shared handler threads through dedup, crawl infra, progress, and skip policy"
+    reason = "gossip notification processing requires many shared resources"
 )]
 async fn process_notification_urls(
     notification: &GossipNotification,
@@ -403,6 +407,7 @@ async fn process_notification_urls(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) {
     if !should_accept(notification) {
         counters.notifications_filtered += 1;
@@ -450,6 +455,7 @@ async fn process_notification_urls(
         let sem = Arc::clone(sem);
         let progress = Arc::clone(progress);
         let skip_db = Arc::clone(skip_db);
+        let audit_tx = audit_tx.cloned();
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
@@ -459,6 +465,17 @@ async fn process_notification_urls(
 
             if !(quiet && report.outcome.is_medium_rejection()) {
                 eprintln!("  {}: {url}", report.outcome);
+            }
+
+            if let Some(ref tx) = audit_tx {
+                let fetched_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let fetched_at_i64 = i64::try_from(fetched_at).expect("unix timestamp fits i64");
+                if let Some(audit_row) = build_audit_row_from_url(&url, &report, fetched_at_i64) {
+                    enqueue_import_audit(tx, audit_row);
+                }
             }
 
             skip_db
@@ -581,8 +598,11 @@ fn collect_archive_messages(
     messages
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
+    reason = "archive replay requires many shared resources"
+)]
+#[allow(
     clippy::too_many_lines,
     reason = "archive replay threads through shared clients, counters, progress, and output policy"
 )]
@@ -601,6 +621,7 @@ async fn replay_from_archive(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> GossipCounters {
     let conn = match Connection::open_with_flags(
         archive_path,
@@ -733,6 +754,7 @@ async fn replay_from_archive(
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
+                audit_tx,
             )
             .await;
         }
@@ -778,9 +800,9 @@ async fn replay_from_archive(
     total_counters
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
-    reason = "SSE streaming threads through shared clients, counters, progress, and output policy"
+    reason = "SSE streaming requires many shared resources"
 )]
 async fn stream_sse_events(
     sse_url: &str,
@@ -794,6 +816,7 @@ async fn stream_sse_events(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> Result<(), String> {
     eprintln!("gossip: connecting to SSE at {sse_url}");
 
@@ -843,6 +866,7 @@ async fn stream_sse_events(
                     skip_known_non_music,
                     skip_ttl_days,
                     quiet,
+                    audit_tx,
                 )
                 .await;
             }
@@ -852,9 +876,9 @@ async fn stream_sse_events(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
-    reason = "reconciliation threads through shared clients, progress, and output policy"
+    reason = "archive reconciliation requires many shared resources"
 )]
 async fn reconcile_archive_batch(
     archive_path: &str,
@@ -867,6 +891,7 @@ async fn reconcile_archive_batch(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> u64 {
     // Collect all messages synchronously, then drop the connection before any .await
     let messages: Vec<ArchiveMessage> = {
@@ -945,6 +970,7 @@ async fn reconcile_archive_batch(
             skip_known_non_music,
             skip_ttl_days,
             quiet,
+            audit_tx,
         )
         .await;
     }
@@ -962,9 +988,9 @@ async fn reconcile_archive_batch(
     count
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
-    reason = "reconciliation loop threads through shared clients, progress, and output policy"
+    reason = "archive reconciliation loop requires many shared resources"
 )]
 async fn archive_reconciliation_loop(
     archive_path: String,
@@ -977,6 +1003,7 @@ async fn archive_reconciliation_loop(
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
+    audit_tx: Option<mpsc::Sender<ImportAuditCommand>>,
 ) {
     let mut interval_secs = RECONCILIATION_INITIAL_DELAY_SECS;
 
@@ -994,6 +1021,7 @@ async fn archive_reconciliation_loop(
             skip_known_non_music,
             skip_ttl_days,
             quiet,
+            audit_tx.as_ref(),
         )
         .await;
 
@@ -1011,7 +1039,11 @@ async fn archive_reconciliation_loop(
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
 pub async fn run(
     state_path: String,
     skip_db_path: String,
@@ -1023,6 +1055,8 @@ pub async fn run(
     skip_ttl_days: Option<u64>,
     quiet: bool,
     force: bool,
+    audit_output: Option<String>,
+    audit_replace: bool,
 ) {
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
 
@@ -1140,6 +1174,11 @@ pub async fn run(
 
     let progress = Arc::new(std::sync::Mutex::new(progress_store));
 
+    let audit_writer = audit_output
+        .as_deref()
+        .map(|path| ImportAuditWriter::spawn(path, !audit_replace));
+    let audit_tx = audit_writer.as_ref().map(|w| w.tx.clone());
+
     // --- Archive replay with batched backpressure ---
     if let Some(ref archive) = archive_db {
         let hw = high_water.as_ref().expect("set above for archive mode");
@@ -1158,6 +1197,7 @@ pub async fn run(
             skip_known_non_music,
             skip_ttl_days,
             quiet,
+            audit_tx.as_ref(),
         )
         .await;
 
@@ -1169,6 +1209,7 @@ pub async fn run(
         let recon_sem = Arc::clone(&sem);
         let recon_progress = Arc::clone(&progress);
         let recon_skip_db = Arc::clone(&skip_db);
+        let recon_audit_tx = audit_tx.clone();
         tokio::spawn(async move {
             archive_reconciliation_loop(
                 recon_archive,
@@ -1181,6 +1222,7 @@ pub async fn run(
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
+                recon_audit_tx,
             )
             .await;
         });
@@ -1210,6 +1252,7 @@ pub async fn run(
             skip_known_non_music,
             skip_ttl_days,
             quiet,
+            audit_tx.as_ref(),
         )
         .await
         {
@@ -1521,6 +1564,7 @@ mod tests {
             false,
             None,
             true,
+            None,
         )
         .await;
 

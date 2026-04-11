@@ -6,10 +6,11 @@ Fetches RSS feeds, hashes content, parses with the `stophammer-parser` Rust
 library dependency, and submits results to a stophammer node's
 `/ingest/feed` endpoint.
 
-Three subcommands cover every discovery path:
+Four subcommands cover every discovery path:
 
 - **feed** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
+- **ndjson** — replay cached `feed_audit`-format NDJSON into stophammer without re-fetching
 - **gossip** — long-running gossip-listener SSE consumer with optional archive replay
 
 ## Requirements
@@ -32,7 +33,7 @@ The crawler release bundle includes:
 
 - `stophammer-crawler`
 - systemd units for long-running `gossip` and optional one-shot `feed` /
-  `import` runs
+  `import` / `ndjson` runs
 - example env files
 - `sysusers.d` / `tmpfiles.d` snippets
 
@@ -70,6 +71,7 @@ Quick checks from this checkout:
 ```bash
 cargo run -- feed --help
 cargo run -- import --help
+cargo run -- ndjson --help
 cargo run -- gossip --help
 
 cargo run --bin feed_audit -- --help
@@ -239,6 +241,57 @@ Operational note:
 - `--refresh-db` temporarily needs room for both the existing `.db` and the new
   replacement `.db` while the importer swaps them safely
 
+### ndjson
+
+Replay cached `feed_audit`-format NDJSON rows into stophammer without
+re-fetching feeds. Parses each row's `raw_xml`, posts it to `/ingest/feed`,
+and tracks progress with a resume cursor.
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler ndjson \
+  --input ./feed_audit.ndjson \
+  --concurrency 5
+```
+
+Force re-ingestion of all rows:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler --force ndjson \
+  --input ./feed_audit.ndjson \
+  --reset
+```
+
+Dry-run to preview what would be ingested:
+
+```bash
+stophammer-crawler ndjson \
+  --input ./feed_audit.ndjson \
+  --dry-run
+```
+
+#### ndjson options
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--input <path>` | | `./feed_audit.ndjson` | Path to `feed_audit`-format NDJSON file |
+| `--state <path>` | | `./ndjson_state.db` | Resume-cursor state database |
+| `--batch <n>` | | `100` | Rows per processing batch |
+| `--limit <n>` | | off | Maximum NDJSON rows to process this run |
+| `--concurrency <n>` | `CONCURRENCY` | `5` | Parallel parse+ingest workers |
+| `--dry-run` | | off | Log candidates without posting to stophammer |
+| `--reset` | | off | Clear resume cursor and start from the first row |
+
+Progress is stored in `--state`. If the process is interrupted, the next run
+resumes from the last completed batch. `--reset` clears the cursor.
+
+Rows without `raw_xml` (e.g. fetch errors captured in the NDJSON) are
+automatically skipped. Transient ingest failures (429, 5xx) are retried
+up to 3 times with exponential backoff before counting as an error.
+
 ### gossip
 
 Listen to a local gossip-listener SSE stream for live podping notifications.
@@ -382,6 +435,7 @@ stophammer-crawler
     modes/
       batch.rs        Load URLs from file/env/stdin, run pool
       import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
+      ndjson.rs       Replay cached feed_audit NDJSON without re-fetching
       gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
 
@@ -556,6 +610,9 @@ docker compose run --rm stophammer-crawler feed https://example.com/feed.xml
 
 # Force re-ingestion
 docker compose run --rm stophammer-crawler --force feed https://example.com/feed.xml
+
+# Replay NDJSON corpus
+docker compose run --rm stophammer-crawler ndjson --input /data/feed_audit.ndjson
 
 # Long-running gossip listener
 docker compose up -d gossip
