@@ -60,7 +60,6 @@ enum Mode {
             default_value = "./failed_feeds.txt"
         )]
         failed_feeds_output: String,
-
     },
 
     /// Import from a `PodcastIndex` snapshot database

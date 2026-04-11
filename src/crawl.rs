@@ -22,7 +22,10 @@ pub struct CrawlConfig {
 }
 
 impl CrawlConfig {
-    #[allow(dead_code, reason = "analysis binaries import crawl.rs via #[path] and call this")]
+    #[allow(
+        dead_code,
+        reason = "analysis binaries import crawl.rs via #[path] and call this"
+    )]
     pub fn from_env() -> Self {
         Self::from_env_with_force(false)
     }

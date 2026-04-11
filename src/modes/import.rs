@@ -530,8 +530,7 @@ fn acquire_pid_lock(path: &str, label: &str) -> PathBuf {
                 && lock_held_by_live_process(&lock_path, &identity)
             {
                 let pid = identity.pid;
-                assert!(
-                    false,
+                panic!(
                     "{label} lock {} held by live process pid={pid}",
                     lock_path.display()
                 );
@@ -589,8 +588,7 @@ fn write_lock_identity(file: &mut fs::File) {
     let _ = file.set_len(0);
     let ticks_field = identity
         .start_ticks
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| "-".to_string());
+        .map_or_else(|| "-".to_string(), |t| t.to_string());
     let hostname_field = identity.hostname.as_deref().unwrap_or("-");
     let _ = write!(file, "{} {ticks_field} {hostname_field}", identity.pid);
 }
@@ -620,13 +618,9 @@ fn read_lock_identity(lock_path: &Path) -> Option<LockIdentity> {
     // Second field is start_ticks or "-" (placeholder written by new code).
     let start_ticks = parts.next().and_then(|v| v.parse::<u64>().ok());
     // Third field is hostname or "-" (placeholder); absent in old lock files.
-    let hostname = parts.next().and_then(|v| {
-        if v == "-" {
-            None
-        } else {
-            Some(v.to_string())
-        }
-    });
+    let hostname = parts
+        .next()
+        .and_then(|v| if v == "-" { None } else { Some(v.to_string()) });
     Some(LockIdentity {
         pid,
         start_ticks,
@@ -638,10 +632,9 @@ fn lock_held_by_live_process(lock_path: &Path, identity: &LockIdentity) -> bool 
     // If both sides have a hostname and they differ, the lock is definitely from
     // a different host or container — treat it as stale immediately.
     if let (Some(lock_host), Some(our_host)) = (identity.hostname.as_deref(), current_hostname())
+        && lock_host != our_host
     {
-        if lock_host != our_host {
-            return false;
-        }
+        return false;
     }
 
     if !Path::new(&format!("/proc/{}", identity.pid)).exists() {
@@ -2450,7 +2443,8 @@ mod tests {
             identity,
             LockIdentity {
                 pid: 123,
-                start_ticks: Some(456)
+                start_ticks: Some(456),
+                hostname: None,
             }
         );
     }
@@ -2466,7 +2460,8 @@ mod tests {
             identity,
             LockIdentity {
                 pid: 123,
-                start_ticks: None
+                start_ticks: None,
+                hostname: None,
             }
         );
     }
