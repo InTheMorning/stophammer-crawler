@@ -8,7 +8,7 @@ library dependency, and submits results to a stophammer node's
 
 Three subcommands cover every discovery path:
 
-- **crawl** — one-shot URL list (file, args, env, or stdin)
+- **feed** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
 - **gossip** — long-running gossip-listener SSE consumer with optional archive replay
 
@@ -68,7 +68,7 @@ That produces:
 Quick checks from this checkout:
 
 ```bash
-cargo run -- crawl --help
+cargo run -- feed --help
 cargo run -- import --help
 cargo run -- gossip --help
 
@@ -84,7 +84,7 @@ cargo run --bin musicl_backfill -- --help
 The examples below assume `stophammer-crawler` is on your `PATH`. After a local
 source build, use `./target/release/stophammer-crawler` instead.
 
-### crawl
+### feed
 
 Fetch and ingest a list of feed URLs:
 
@@ -92,23 +92,31 @@ Fetch and ingest a list of feed URLs:
 # From arguments
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-stophammer-crawler crawl https://example.com/feed.xml
+stophammer-crawler feed https://example.com/feed.xml
 
 # From a file
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-stophammer-crawler crawl feeds.txt
+stophammer-crawler feed feeds.txt
 
 # From env
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
 FEED_URLS="https://a.com/feed,https://b.com/feed" \
-stophammer-crawler crawl
+stophammer-crawler feed
 
 # From stdin
 cat urls.txt | CRAWL_TOKEN=secret \
   INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-  stophammer-crawler crawl
+  stophammer-crawler feed
+```
+
+Force re-ingestion even if feed content is unchanged:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler --force feed https://example.com/feed.xml
 ```
 
 ### import
@@ -341,11 +349,14 @@ feeds are periodically re-evaluated.
 - **`INGEST_URL`** --
   Stophammer ingest endpoint.
   Default: `http://localhost:8008/ingest/feed`
+- **`FORCE_REINGEST`** --
+  Force re-ingestion of feeds even if content has not changed.
+  Set to `1` to enable. Can also be passed as `--force` flag at the top level.
 - **`CONCURRENCY`** --
   Worker pool size.
-  Default: `5` (crawl/import) / `3` (gossip)
+  Default: `5` (feed/import) / `3` (gossip)
 - **`FEED_URLS`** --
-  Comma- or newline-separated URLs (crawl mode only).
+  Comma- or newline-separated URLs (feed mode only).
 - **`PODCASTINDEX_DB_URL`** --
   Override the PodcastIndex snapshot archive URL for
   import mode.
@@ -543,9 +554,29 @@ Published releases also push a crawler runtime image:
 
 - `ghcr.io/<owner>/stophammer-crawler`
 
-This repo does not ship a general-purpose crawler compose stack. For day-to-day
-operation, run the binary directly or provide your own scheduler / compose
-deployment around `stophammer-crawler gossip`, `import`, or `crawl`.
+The main `stophammer` repo's [docker-compose.yml](../docker-compose.yml) includes
+multi-mode crawler support with shared `crawler-data` volume:
+
+```bash
+# One-shot feed crawl
+docker compose run --rm stophammer-crawler feed https://example.com/feed.xml
+
+# Force re-ingestion
+docker compose run --rm stophammer-crawler --force feed https://example.com/feed.xml
+
+# Long-running gossip listener
+docker compose up -d gossip
+
+# Batch import from PodcastIndex
+docker compose run --rm import
+```
+
+The `stophammer-crawler` service requires `CRAWL_TOKEN` and `INGEST_URL` in
+[packaging/env/crawler-feed.compose.env](../packaging/env/crawler-feed.compose.env).
+The `gossip` and `import` services use separate env files configured in the compose stack.
+
+For day-to-day operation, run the binary directly or provide your own scheduler / compose
+deployment around `stophammer-crawler gossip`, `import`, or `feed`.
 
 ## License
 
