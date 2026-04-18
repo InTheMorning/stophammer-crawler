@@ -18,9 +18,12 @@ FROM chef AS planner
 ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
 ARG STOPHAMMER_PARSER_REF=main
 
-RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
-    "${STOPHAMMER_PARSER_REPO}" \
-    ./stophammer-parser
+RUN if [ -d "stophammer-parser" ]; then \
+      echo "Using local stophammer-parser"; \
+    else \
+      git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
+        "${STOPHAMMER_PARSER_REPO}" ./stophammer-parser; \
+    fi
 
 COPY . ./stophammer-crawler
 RUN cd stophammer-crawler && cargo chef prepare --recipe-path recipe.json
@@ -29,9 +32,12 @@ FROM chef AS builder
 ARG STOPHAMMER_PARSER_REPO=https://github.com/inthemorning/stophammer-parser.git
 ARG STOPHAMMER_PARSER_REF=main
 
-RUN git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
-    "${STOPHAMMER_PARSER_REPO}" \
-    ./stophammer-parser
+RUN if [ -d "stophammer-parser" ]; then \
+      echo "Using local stophammer-parser"; \
+    else \
+      git clone --depth 1 --branch "${STOPHAMMER_PARSER_REF}" \
+        "${STOPHAMMER_PARSER_REPO}" ./stophammer-parser; \
+    fi
 
 COPY --from=planner /build/stophammer-crawler/recipe.json /build/stophammer-crawler/recipe.json
 RUN cd stophammer-crawler && cargo chef cook --release --recipe-path recipe.json
