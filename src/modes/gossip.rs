@@ -1355,13 +1355,13 @@ mod tests {
         assert!(store.get_archive_cursor().is_none());
 
         let cursor = ArchiveCursor {
-            created_at: 1700000000,
+            created_at: 1_700_000_000,
             hash: "abc123def456".to_string(),
         };
         store.set_archive_cursor(&cursor);
 
         let loaded = store.get_archive_cursor().expect("cursor should exist");
-        assert_eq!(loaded.created_at, 1700000000);
+        assert_eq!(loaded.created_at, 1_700_000_000);
         assert_eq!(loaded.hash, "abc123def456");
     }
 
@@ -1803,11 +1803,12 @@ mod tests {
         store.upsert_feed_memory("https://example.com/old.xml", &report, 100);
 
         // Manually backdate last_attempted_at to 60 days ago
-        let old_ts = SystemTime::now()
+        let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64
-            - (60 * 86400);
+            .as_secs();
+        let old_ts =
+            i64::try_from(now_secs).expect("current timestamp should fit i64") - (60 * 86_400);
         store
             .conn
             .execute(

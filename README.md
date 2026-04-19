@@ -248,8 +248,9 @@ Force re-ingestion of all rows:
 ```bash
 CRAWL_TOKEN=secret \
 INGEST_URL=http://127.0.0.1:8008/ingest/feed \
-stophammer-crawler --force ndjson \
+stophammer-crawler ndjson \
   --input ./stored-feeds.ndjson \
+  --force \
   --reset
 ```
 
@@ -270,6 +271,7 @@ stophammer-crawler ndjson \
 | `--batch <n>` | | `100` | Rows per processing batch |
 | `--limit <n>` | | off | Maximum NDJSON rows to process this run |
 | `--concurrency <n>` | `CONCURRENCY` | `5` | Parallel parse+ingest workers |
+| `--force` | `FORCE_REINGEST` | off | Force re-ingestion even if content has not changed |
 | `--dry-run` | | off | Log candidates without posting to stophammer |
 | `--reset` | | off | Clear resume cursor and start from the first row |
 

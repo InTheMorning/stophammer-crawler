@@ -1981,7 +1981,7 @@ mod tests {
 
     fn sample_candidate_row() -> super::CandidateRow {
         super::CandidateRow {
-            id: 4630863,
+            id: 4_630_863,
             url: "https://example.com/feed.xml".to_string(),
             podcast_guid: Some("pi-guid".to_string()),
         }
@@ -2114,7 +2114,7 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
-        let row = sample_memory_row(4630863, Some(200), "accepted", None, false, Some("music"));
+        let row = sample_memory_row(4_630_863, Some(200), "accepted", None, false, Some("music"));
 
         upsert_import_memory(&conn, &row).expect("upsert import memory");
 
@@ -2146,8 +2146,8 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
         let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
-        let first = sample_memory_row(4630863, Some(404), "fetch_error", None, false, None);
-        let second = sample_memory_row(4630863, Some(429), "fetch_error", None, true, None);
+        let first = sample_memory_row(4_630_863, Some(404), "fetch_error", None, false, None);
+        let second = sample_memory_row(4_630_863, Some(429), "fetch_error", None, true, None);
 
         upsert_import_memory(&conn, &first).expect("first upsert");
         upsert_import_memory(&conn, &second).expect("second upsert");

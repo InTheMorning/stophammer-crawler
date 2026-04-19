@@ -384,7 +384,7 @@ mod tests {
                 "feed_url": url,
                 "title": title,
             },
-            "fetched_at": 1700000000,
+            "fetched_at": 1_700_000_000,
             "fetch": {
                 "final_url": url,
                 "http_status": 200,

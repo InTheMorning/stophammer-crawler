@@ -31,7 +31,7 @@ fn parse_non_negative_i64(raw: &str) -> Result<i64, String> {
 #[command(name = "stophammer-crawler", about = "Unified RSS feed crawler")]
 struct Cli {
     /// Force re-ingestion even if the feed content has not changed
-    #[arg(long, env = "FORCE_REINGEST")]
+    #[arg(long, env = "FORCE_REINGEST", global = true)]
     force: bool,
 
     #[command(subcommand)]
