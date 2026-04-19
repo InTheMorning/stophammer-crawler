@@ -589,7 +589,7 @@ mod tests {
     use super::{
         CrawlOutcome, body_preview, build_crawl_report, format_http_fetch_error,
         format_ingest_http_error, is_retryable_http_status, is_retryable_ingest_status,
-        normalize_rejection_reason,
+        normalize_rejection_reason, parse_feed_xml,
     };
     use reqwest::StatusCode;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
@@ -618,6 +618,40 @@ mod tests {
             live_items: Vec::new(),
             tracks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parse_feed_xml_preserves_publisher_feed_level_people_and_rss_artwork() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss xmlns:podcast="https://podcastindex.org/namespace/1.0">
+          <channel>
+            <title>Publisher Feed</title>
+            <podcast:guid>publisher-feed-guid</podcast:guid>
+            <podcast:medium>publisher</podcast:medium>
+            <image>
+              <url>https://img.example.com/publisher-rss.jpg</url>
+            </image>
+            <podcast:person role="artist" group="music" href="https://example.com/artist" img="https://img.example.com/artist.jpg">Publisher Artist</podcast:person>
+            <podcast:remoteItem medium="music" feedGuid="music-feed-guid" feedUrl="https://example.com/music.xml"/>
+          </channel>
+        </rss>"#;
+
+        let parsed = parse_feed_xml(xml, None)
+            .expect("publisher feed should parse")
+            .expect("publisher feed data should be present");
+
+        assert_eq!(parsed.raw_medium.as_deref(), Some("publisher"));
+        assert_eq!(
+            parsed.image_url.as_deref(),
+            Some("https://img.example.com/publisher-rss.jpg")
+        );
+        assert_eq!(parsed.persons.len(), 1);
+        assert_eq!(parsed.persons[0].name, "Publisher Artist");
+        assert_eq!(
+            parsed.persons[0].img.as_deref(),
+            Some("https://img.example.com/artist.jpg")
+        );
+        assert_eq!(parsed.remote_items.len(), 1);
     }
 
     #[test]
