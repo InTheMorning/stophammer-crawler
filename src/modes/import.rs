@@ -1383,6 +1383,10 @@ fn query_batch(
     interleave_by_host(rows, |row| host_key(&row.url))
 }
 
+fn batch_max_id(batch: &[CandidateRow], fallback: i64) -> i64 {
+    batch.iter().map(|row| row.id).max().unwrap_or(fallback)
+}
+
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -1702,7 +1706,7 @@ pub async fn run(
             break;
         }
 
-        let batch_max_id = batch.last().map_or(cursor, |r| r.id);
+        let batch_max_id = batch_max_id(&batch, cursor);
         let batch_len = batch.len();
         let known_memory = if skip_known_non_music || skip_known_success {
             progress.known_memory_for_ids(&batch.iter().map(|row| row.id).collect::<Vec<_>>())
@@ -1917,14 +1921,14 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter, ImportMemoryRow,
-        ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity, ProgressStore, WAVLAKE_HOSTS,
-        build_import_audit_row, build_import_timeout_report, current_lock_identity,
-        effective_audit_append, enqueue_import_audit, enqueue_import_memory,
-        extract_snapshot_archive, format_if_modified_since_value, is_skip_known_non_music,
-        known_skip_kind, legacy_lock_matches_process, load_known_import_memory,
-        open_state_connection, query_batch, read_lock_identity, resolve_start_cursor,
-        upsert_import_memory, wavlake_throttle_delay,
+        CandidateRow, ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter,
+        ImportMemoryRow, ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity,
+        ProgressStore, WAVLAKE_HOSTS, batch_max_id, build_import_audit_row,
+        build_import_timeout_report, current_lock_identity, effective_audit_append,
+        enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
+        format_if_modified_since_value, is_skip_known_non_music, known_skip_kind,
+        legacy_lock_matches_process, load_known_import_memory, open_state_connection, query_batch,
+        read_lock_identity, resolve_start_cursor, upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
@@ -1979,12 +1983,16 @@ mod tests {
         }
     }
 
-    fn sample_candidate_row() -> super::CandidateRow {
-        super::CandidateRow {
-            id: 4_630_863,
-            url: "https://example.com/feed.xml".to_string(),
-            podcast_guid: Some("pi-guid".to_string()),
+    fn candidate_row(id: i64, url: &str) -> CandidateRow {
+        CandidateRow {
+            id,
+            url: url.to_string(),
+            podcast_guid: Some(format!("pi-guid-{id}")),
         }
+    }
+
+    fn sample_candidate_row() -> CandidateRow {
+        candidate_row(4_630_863, "https://example.com/feed.xml")
     }
 
     fn sample_parsed_feed() -> IngestFeedData {
@@ -2625,6 +2633,18 @@ mod tests {
                 .iter()
                 .all(|row| { WAVLAKE_HOSTS.iter().all(|host| !row.url.contains(host)) })
         );
+    }
+
+    #[test]
+    fn batch_max_id_uses_highest_id_not_interleaved_tail() {
+        let batch = vec![
+            candidate_row(10, "https://wavlake.com/feed/music/a"),
+            candidate_row(12, "https://www.wavlake.com/feed/music/b"),
+            candidate_row(11, "https://wavlake.com/feed/music/c"),
+        ];
+
+        assert_eq!(batch_max_id(&batch, 9), 12);
+        assert_eq!(batch_max_id(&[], 9), 9);
     }
 
     #[test]

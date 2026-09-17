@@ -7,6 +7,71 @@ mod url_queue;
 
 use clap::{Parser, Subcommand};
 
+fn parse_force_reingest_value(raw: &str) -> Result<bool, String> {
+    match raw.trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        value
+            if value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on") =>
+        {
+            Ok(true)
+        }
+        value
+            if value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off") =>
+        {
+            Ok(false)
+        }
+        _ => Err("expected one of: 1, 0, true, false, yes, no, on, off".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_force_reingest_value;
+
+    #[test]
+    fn force_reingest_env_accepts_boolish_values() {
+        for enabled in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(
+                parse_force_reingest_value(enabled),
+                Ok(true),
+                "expected {enabled} to enable force reingest"
+            );
+        }
+
+        for disabled in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(
+                parse_force_reingest_value(disabled),
+                Ok(false),
+                "expected {disabled} to disable force reingest"
+            );
+        }
+
+        assert!(
+            parse_force_reingest_value("maybe").is_err(),
+            "unexpected FORCE_REINGEST value should be rejected"
+        );
+    }
+}
+
+fn force_reingest_from_env() -> bool {
+    match std::env::var("FORCE_REINGEST") {
+        Ok(raw) => parse_force_reingest_value(&raw).unwrap_or_else(|err| {
+            eprintln!("error: invalid FORCE_REINGEST value {raw:?}: {err}");
+            std::process::exit(2);
+        }),
+        Err(std::env::VarError::NotPresent) => false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("error: FORCE_REINGEST must be valid Unicode");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn parse_positive_usize(raw: &str) -> Result<usize, String> {
     let value = raw
         .parse::<usize>()
@@ -31,7 +96,7 @@ fn parse_non_negative_i64(raw: &str) -> Result<i64, String> {
 #[command(name = "stophammer-crawler", about = "Unified RSS feed crawler")]
 struct Cli {
     /// Force re-ingestion even if the feed content has not changed
-    #[arg(long, env = "FORCE_REINGEST", global = true)]
+    #[arg(long, global = true)]
     force: bool,
 
     #[command(subcommand)]
@@ -207,7 +272,7 @@ enum Mode {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let force = cli.force;
+    let force = cli.force || force_reingest_from_env();
 
     match cli.mode {
         Mode::Feed {
