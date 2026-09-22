@@ -609,6 +609,7 @@ mod tests {
             author_name: None,
             owner_name: None,
             pub_date: None,
+            last_build_date: None,
             remote_items: Vec::new(),
             persons: Vec::new(),
             entity_ids: Vec::new(),

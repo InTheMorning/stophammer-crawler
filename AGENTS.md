@@ -12,9 +12,16 @@ operator command lines and the environment variables.
 
 ## Where The Work Stands
 
-2026-09-22: no change is in progress here. `stophammer` ADR 0043 is Proposed.
-When the operator accepts it, a feed corrects itself on the next read, and a
-feed with unchanged content needs `FORCE_REINGEST`.
+2026-09-22: `stophammer` ADR 0043 is Accepted. A feed corrects itself on the
+next read. A feed with unchanged content needs `FORCE_REINGEST`, because the
+node stops an unchanged feed.
+
+Pending work here: limit a forced pass to the feeds the node already holds.
+`FORCE_REINGEST` is one global flag today. `src/crawl.rs:350` adds
+`force_reingest` to every `/ingest/feed` payload of the run, whatever the mode.
+A forced `import` run would therefore also ingest feeds the index never held,
+and would grow the corpus during a corrective pass. Until that limit exists,
+run a trickle from a feed list exported from the index.
 
 ## What Is True Here
 
