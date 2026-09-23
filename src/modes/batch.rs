@@ -167,6 +167,8 @@ async fn crawl_feed_with_retries(
     }
 }
 
+/// Resolve URLs from args, `FEED_URLS`, or stdin, then hand them to
+/// [`run_urls`]. This is the `feed` mode entry point.
 pub async fn run(
     urls_arg: Vec<String>,
     concurrency: usize,
@@ -174,12 +176,29 @@ pub async fn run(
     failed_feeds_output: String,
     force: bool,
 ) {
-    let urls = interleave_by_host(load_urls(&urls_arg), |url| host_key(url));
+    let urls = load_urls(&urls_arg);
 
     if urls.is_empty() {
         eprintln!("no URLs provided (pass as args, set FEED_URLS, or pipe to stdin)");
         std::process::exit(1);
     }
+
+    run_urls(urls, concurrency, host_delay_ms, failed_feeds_output, force).await;
+}
+
+/// Run the batch pipeline over an already-resolved URL list: interleave by
+/// host, then fetch and ingest through the concurrency pool.
+///
+/// A caller that already holds a list calls this directly instead of `run`, so
+/// the host interleave and the rest of the pipeline still apply to it.
+pub async fn run_urls(
+    urls: Vec<String>,
+    concurrency: usize,
+    host_delay_ms: u64,
+    failed_feeds_output: String,
+    force: bool,
+) {
+    let urls = interleave_by_host(urls, |url| host_key(url));
 
     eprintln!(
         "crawl: {} URLs, concurrency={concurrency}, host_delay={}ms",

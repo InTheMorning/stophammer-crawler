@@ -127,6 +127,25 @@ enum Mode {
         failed_feeds_output: String,
     },
 
+    /// Read the node's feed list, then re-run the crawl pipeline over it
+    /// (a corrective pass; combine with `--force`)
+    Refresh {
+        #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
+        concurrency: usize,
+
+        /// Minimum spacing between fetches to the same host
+        #[arg(long, env = "HOST_DELAY_MS", default_value_t = 1500)]
+        host_delay_ms: u64,
+
+        /// Plain-text output file for retryable feed URLs
+        #[arg(
+            long,
+            env = "FAILED_FEEDS_OUTPUT",
+            default_value = "./failed_feeds.txt"
+        )]
+        failed_feeds_output: String,
+    },
+
     /// Import from a `PodcastIndex` snapshot database
     Import {
         /// Path to the extracted `podcastindex_feeds.db`
@@ -270,6 +289,10 @@ enum Mode {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one dispatch arm per crawler mode; grows by design as modes are added"
+)]
 async fn main() {
     let cli = Cli::parse();
     let force = cli.force || force_reingest_from_env();
@@ -282,6 +305,13 @@ async fn main() {
             failed_feeds_output,
         } => {
             modes::batch::run(urls, concurrency, host_delay_ms, failed_feeds_output, force).await;
+        }
+        Mode::Refresh {
+            concurrency,
+            host_delay_ms,
+            failed_feeds_output,
+        } => {
+            modes::refresh::run(concurrency, host_delay_ms, failed_feeds_output, force).await;
         }
         Mode::Import {
             db,

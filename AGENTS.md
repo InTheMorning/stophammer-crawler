@@ -12,9 +12,16 @@ operator command lines and the environment variables.
 
 ## Where The Work Stands
 
-2026-09-22: `stophammer` ADR 0043 is Accepted. A feed corrects itself on the
-next read. A feed with unchanged content needs `FORCE_REINGEST`, because the
-node stops an unchanged feed.
+2026-09-22: `stophammer` ADR 0043 is Accepted and deployed. A feed corrects
+itself on the next read. A feed with unchanged content needs `--force`, because
+the node stops an unchanged feed.
+
+Pending work here: the corrective pass.
+[stophammer ADR 0047](../docs/adr/0047-a-corrective-pass-reads-the-index.md) is
+Accepted. The pass takes its corpus from the node's feed list, because the
+index is what defines the feeds the node holds. Its
+[packet](../docs/tasks/adr-0047-task-001-corrective-pass-mode.md) is written.
+No code is written.
 
 Pending work here: limit a forced pass to the feeds the node already holds.
 `FORCE_REINGEST` is one global flag today. `src/crawl.rs:350` adds
