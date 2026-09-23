@@ -12,31 +12,28 @@ operator command lines and the environment variables.
 
 ## Where The Work Stands
 
-2026-09-22: `stophammer` ADR 0043 is Accepted and deployed. A feed corrects
+2026-09-23: `stophammer` ADR 0043 is Accepted and deployed. A feed corrects
 itself on the next read. A feed with unchanged content needs `--force`, because
 the node stops an unchanged feed.
 
-Pending work here: the corrective pass.
 [stophammer ADR 0047](../docs/adr/0047-a-corrective-pass-reads-the-index.md) is
-Accepted. The pass takes its corpus from the node's feed list, because the
-index is what defines the feeds the node holds. Its
-[packet](../docs/tasks/adr-0047-task-001-corrective-pass-mode.md) is written.
-No code is written.
+Accepted and implemented. The `refresh` mode in `src/modes/refresh.rs` takes
+its corpus from the feed list of the node. The index is what defines the feeds
+the node holds. The pass has run.
 
-Pending work here: limit a forced pass to the feeds the node already holds.
-`FORCE_REINGEST` is one global flag today. `src/crawl.rs:350` adds
-`force_reingest` to every `/ingest/feed` payload of the run, whatever the mode.
-A forced `import` run would therefore also ingest feeds the index never held,
-and would grow the corpus during a corrective pass. Until that limit exists,
-run a trickle from a feed list exported from the index.
+`FORCE_REINGEST` and `--force` stay global to a run. `src/crawl.rs:350` adds
+`force_reingest` to each `/ingest/feed` payload, whatever the mode. Thus a
+forced pass must use `refresh`, which reads only feeds the index holds. A
+forced `import` run ingests feeds the index never held, and it grows the corpus
+during a corrective pass.
 
 ## What Is True Here
 
 - **This crawler is untrusted.** ADR 0006. The node verifies what this crate
   sends. Never move a check out of the node to save a request.
-- **Four modes**, in `src/modes/`: `feed`, `import`, `ndjson` and `gossip`.
-  `crawl` is an alias of `feed`. There is no `podping` mode. The `gossip` mode
-  consumes the stream that carries podping notifications.
+- **Five modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip` and
+  `refresh`. `crawl` is an alias of `feed`. There is no `podping` mode. The
+  `gossip` mode consumes the stream that carries podping notifications.
 - **The node owns the index.** Local SQLite holds progress and memory of
   attempts only.
 - Lints are `[lints.clippy] pedantic = "deny"` and nothing more.

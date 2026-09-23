@@ -119,6 +119,60 @@ stophammer-crawler --force feed https://example.com/feed.xml
 | `--host-delay-ms` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
 | `--failed-feeds-output` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
 
+### refresh
+
+Run a corrective pass over the feeds the node already holds. The mode reads the
+feed list of the node, then runs the same pipeline as `feed` over it.
+
+The corpus comes from `GET /v1/feeds/recent` at `limit=100` and `medium=all`,
+paged to the end. The mode derives that address from the origin of
+`INGEST_URL`, so it reads the node it writes to. It reads no local database,
+because `feed_skip.db` and `import_state.db` record what the crawler attempted
+and not what the index holds. stophammer ADR 0047 owns this decision.
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler refresh \
+  --concurrency 5
+```
+
+Add `--force` when the feeds hold unchanged content. Without it the node stops
+each unchanged feed at `ContentHashVerifier`:
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+stophammer-crawler refresh \
+  --force \
+  --concurrency 3 \
+  --host-delay-ms 3000
+```
+
+#### refresh options
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--concurrency <n>` | `CONCURRENCY` | `5` | Parallel fetch+ingest workers |
+| `--host-delay-ms <ms>` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
+| `--failed-feeds-output <path>` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
+| `--force` | `FORCE_REINGEST` | off | Force re-ingestion even if content has not changed |
+
+The mode prints the corpus size before it starts. A page that fails stops the
+whole pass, and the pipeline never runs on a partial corpus.
+
+One host serves most of the corpus, so raise `--host-delay-ms` and lower
+`--concurrency` for a large pass. A run against Wavlake at the default spacing
+receives HTTP 429.
+
+The crawler writes each outcome to standard error. Capture it to count the
+results:
+
+```bash
+stophammer-crawler refresh --force 2>&1 | tee run.log
+analysis/bin/refresh_log_summary.sh run.log .
+```
+
 ### import
 
 Batch-scan a PodcastIndex snapshot for music feeds:
@@ -405,7 +459,10 @@ feeds are periodically re-evaluated.
   Set to `1` to enable. Can also be passed as `--force` flag at the top level.
 - **`CONCURRENCY`** --
   Worker pool size.
-  Default: `5` (feed/import) / `3` (gossip)
+  Default: `5` (feed/import/refresh) / `3` (gossip)
+- **`HOST_DELAY_MS`** --
+  Minimum spacing between fetches to the same host (feed and refresh modes).
+  Default: `1500`
 - **`FEED_URLS`** --
   Comma- or newline-separated URLs (feed mode only).
 - **`PODCASTINDEX_DB_URL`** --
