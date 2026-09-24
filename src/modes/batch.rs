@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
-use crate::follow::follow_urls;
+use crate::follow::{FollowLevel, follow_urls_at_level};
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -177,7 +177,8 @@ async fn crawl_feed_with_retries(
     }
 }
 
-/// Gives the follow URLs (ADR 0049 §2, `stophammer` repository) of `report`.
+/// Gives the follow URLs (ADR 0049 §2, `stophammer` repository) of `report`,
+/// filtered by the level `report`'s feed was fetched at.
 ///
 /// Only an `Accepted` or `NoChange` report that carries a parsed feed gives
 /// anything; any other outcome, or a report with no parsed feed, gives
@@ -185,7 +186,7 @@ async fn crawl_feed_with_retries(
 /// report can be dropped right after the call, and a wave never has to hold
 /// more than [`run_pool`]'s in-flight reports (bounded by `concurrency`) at
 /// one time.
-pub(crate) fn report_follow_urls(report: &CrawlReport) -> Vec<String> {
+pub(crate) fn report_follow_urls(report: &CrawlReport, level: FollowLevel) -> Vec<String> {
     if !matches!(
         report.outcome,
         CrawlOutcome::Accepted { .. } | CrawlOutcome::NoChange
@@ -195,7 +196,7 @@ pub(crate) fn report_follow_urls(report: &CrawlReport) -> Vec<String> {
     let Some(feed) = &report.parsed_feed else {
         return Vec::new();
     };
-    follow_urls(feed)
+    follow_urls_at_level(feed, level)
 }
 
 /// Runs `urls` through `step` with bounded `concurrency`.
@@ -203,22 +204,22 @@ pub(crate) fn report_follow_urls(report: &CrawlReport) -> Vec<String> {
 /// A report whose outcome is retryable adds its URL to `failed_feeds`.
 /// Prints one line per URL, in the style [`run_urls`] already uses.
 ///
-/// When `collect_follow_urls` is true, each task reads its own report's
-/// follow URLs through [`report_follow_urls`] as soon as the report
-/// arrives, keeps only that small `Vec<String>`, and drops the report. The
-/// wave never collects a `CrawlReport` itself: a `CrawlReport` carries
-/// `raw_xml` and a full `parsed_feed`, and a `refresh` pass over the whole
-/// index must not hold every one of those in memory at once. The returned
-/// list is in the order `urls` was given, not completion order, because
-/// tasks finish concurrently and completion order is not reproducible.
-/// When `collect_follow_urls` is false, no task reads a follow URL at all,
-/// and the returned list is empty.
+/// When `follow_level` is `Some`, each task reads its own report's follow
+/// URLs through [`report_follow_urls`], at that level, as soon as the
+/// report arrives. It keeps only that small `Vec<String>` and drops the
+/// report. The wave never collects a `CrawlReport` itself: a `CrawlReport`
+/// carries `raw_xml` and a full `parsed_feed`, and a `refresh` pass over the
+/// whole index must not hold every one of those in memory at once. The
+/// returned list is in the order `urls` was given, not completion order,
+/// because tasks finish concurrently and completion order is not
+/// reproducible. When `follow_level` is `None`, no task reads a follow URL
+/// at all, and the returned list is empty.
 async fn run_wave<S, Fut>(
     urls: Vec<String>,
     concurrency: usize,
     failed_feeds: &Arc<std::sync::Mutex<Vec<String>>>,
     step: &Arc<S>,
-    collect_follow_urls: bool,
+    follow_level: Option<FollowLevel>,
 ) -> Vec<String>
 where
     S: Fn(String) -> Fut + Send + Sync + 'static,
@@ -244,8 +245,8 @@ where
                 }
                 eprintln!("  {}: {url}", report.outcome);
 
-                if collect_follow_urls {
-                    let follow = report_follow_urls(&report);
+                if let Some(level) = follow_level {
+                    let follow = report_follow_urls(&report, level);
                     if !follow.is_empty() {
                         follow_by_index
                             .lock()
@@ -272,18 +273,18 @@ where
         .collect()
 }
 
-/// Excludes each URL already in `wave1_urls`, by exact string, from
-/// `collected` — the follow URLs that wave 1 gave, in wave-1 order. Removes
-/// duplicates and keeps the first position.
-fn wave2_follow_urls(collected: &[String], wave1_urls: &HashSet<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
+/// Excludes each URL already in `seen`, by exact string, from `collected` —
+/// the follow URLs a wave gave, in that wave's order. Removes duplicates and
+/// keeps the first position.
+fn exclude_seen_urls(collected: &[String], seen: &HashSet<String>) -> Vec<String> {
+    let mut deduped = HashSet::new();
     let mut follow = Vec::new();
 
     for url in collected {
-        if wave1_urls.contains(url) {
+        if seen.contains(url) {
             continue;
         }
-        if seen.insert(url.clone()) {
+        if deduped.insert(url.clone()) {
             follow.push(url.clone());
         }
     }
@@ -291,11 +292,15 @@ fn wave2_follow_urls(collected: &[String], wave1_urls: &HashSet<String>) -> Vec<
     follow
 }
 
-/// Runs `wave1_urls`, then crawls a second wave: the feeds that an accepted
-/// or unchanged wave-1 feed names through a publisher link (ADR 0049 §2,
-/// `stophammer` repository). The walk stops there. A feed that wave 2
-/// crawls never starts a wave 3, even when it names a further link, because
-/// wave 2 runs with `collect_follow_urls: false`.
+/// Runs `wave1_urls` first. Then it crawls the publisher feeds that an
+/// accepted or unchanged wave-1 feed names (wave 2). Then it crawls the
+/// album feeds that an accepted or unchanged wave-2 publisher feed lists
+/// (wave 3). ADR 0049 §2, in the `stophammer` repository, owns this
+/// sequence.
+///
+/// A wave-3 feed can name a further link. Wave 3 never starts a wave 4 for
+/// it, because wave 3 runs with `follow_level: None`. No task in wave 3
+/// reads a follow URL.
 ///
 /// `step` fetches and ingests one URL and gives its crawl report. A test
 /// gives a stub `step` and needs no network.
@@ -311,9 +316,16 @@ async fn run_waves<S, Fut>(
 {
     let wave1_seen: HashSet<String> = wave1_urls.iter().cloned().collect();
 
-    let collected = run_wave(wave1_urls, concurrency, failed_feeds, step, true).await;
+    let collected1 = run_wave(
+        wave1_urls,
+        concurrency,
+        failed_feeds,
+        step,
+        Some(FollowLevel::Input),
+    )
+    .await;
 
-    let wave2_urls = wave2_follow_urls(&collected, &wave1_seen);
+    let wave2_urls = exclude_seen_urls(&collected1, &wave1_seen);
     let wave2_urls = interleave_by_host(wave2_urls, |url| host_key(url));
 
     if wave2_urls.is_empty() {
@@ -325,7 +337,34 @@ async fn run_waves<S, Fut>(
         wave2_urls.len()
     );
 
-    run_wave(wave2_urls, concurrency, failed_feeds, step, false).await;
+    let wave1_and_2_seen: HashSet<String> = wave1_seen
+        .iter()
+        .cloned()
+        .chain(wave2_urls.iter().cloned())
+        .collect();
+
+    let collected2 = run_wave(
+        wave2_urls,
+        concurrency,
+        failed_feeds,
+        step,
+        Some(FollowLevel::Publisher),
+    )
+    .await;
+
+    let wave3_urls = exclude_seen_urls(&collected2, &wave1_and_2_seen);
+    let wave3_urls = interleave_by_host(wave3_urls, |url| host_key(url));
+
+    if wave3_urls.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "crawl: wave 3 is {} URLs, concurrency={concurrency}, host_delay={host_delay_ms}ms",
+        wave3_urls.len()
+    );
+
+    run_wave(wave3_urls, concurrency, failed_feeds, step, None).await;
 }
 
 /// Resolve URLs from args, `FEED_URLS`, or stdin, then hand them to
@@ -399,7 +438,8 @@ mod tests {
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef};
 
     use super::{
-        CrawlOutcome, CrawlReport, report_follow_urls, run_wave, run_waves, wave2_follow_urls,
+        CrawlOutcome, CrawlReport, FollowLevel, exclude_seen_urls, report_follow_urls, run_wave,
+        run_waves,
     };
 
     fn remote_item(position: i64, medium: &str, url: &str) -> IngestRemoteFeedRef {
@@ -490,16 +530,20 @@ mod tests {
         );
 
         // What `run_wave` would collect: each report's own follow URLs, in
-        // submission order.
-        let collected: Vec<String> = report_follow_urls(&accepted_report(music_feed))
-            .into_iter()
-            .chain(report_follow_urls(&no_change_report(publisher_feed)))
-            .collect();
+        // submission order. Wave 1 runs at `FollowLevel::Input`.
+        let collected: Vec<String> =
+            report_follow_urls(&accepted_report(music_feed), FollowLevel::Input)
+                .into_iter()
+                .chain(report_follow_urls(
+                    &no_change_report(publisher_feed),
+                    FollowLevel::Input,
+                ))
+                .collect();
         let wave1_urls: HashSet<String> = ["https://a.example/feed.xml".to_string()]
             .into_iter()
             .collect();
 
-        let wave2 = wave2_follow_urls(&collected, &wave1_urls);
+        let wave2 = exclude_seen_urls(&collected, &wave1_urls);
 
         assert_eq!(
             wave2,
@@ -520,7 +564,7 @@ mod tests {
         );
 
         assert_eq!(
-            report_follow_urls(&rejected_report(music_feed)),
+            report_follow_urls(&rejected_report(music_feed), FollowLevel::Input),
             Vec::<String>::new(),
             "a rejected report must not contribute a follow URL"
         );
@@ -542,9 +586,30 @@ mod tests {
         };
 
         assert_eq!(
-            report_follow_urls(&report),
+            report_follow_urls(&report, FollowLevel::Input),
             Vec::<String>::new(),
             "a report with no parsed feed must not contribute a follow URL"
+        );
+    }
+
+    #[test]
+    fn a_music_feed_report_gives_no_follow_url_at_publisher_level() {
+        // The parsed feed does not parse as a publisher feed. At
+        // `FollowLevel::Publisher`, it must give nothing (ADR 0049 §2
+        // task 010b), even though the feed carries a link of its own.
+        let music_feed = feed(
+            "music",
+            vec![remote_item(
+                0,
+                "publisher",
+                "https://publisher.example/feed.xml",
+            )],
+        );
+
+        assert_eq!(
+            report_follow_urls(&accepted_report(music_feed), FollowLevel::Publisher),
+            Vec::<String>::new(),
+            "a music feed in wave 2 must give no link"
         );
     }
 
@@ -575,7 +640,7 @@ mod tests {
             1,
             &failed_feeds,
             &step,
-            true,
+            Some(FollowLevel::Input),
         )
         .await;
 
@@ -586,9 +651,21 @@ mod tests {
         );
     }
 
+    /// Corrects `wave_2_is_not_itself_a_source_of_a_further_wave`, which
+    /// asserted that wave 2 never becomes a source of a further wave. Task
+    /// 010b (ADR 0049 §2) adds wave 3: a wave-2 report that parses as a
+    /// publisher feed does give its `medium="music"` links.
+    ///
+    /// Old expectation: only `music.example` and `publisher.example` are
+    /// fetched. The wave-2 feed's own further link is never followed.
+    /// New expectation: wave 3 runs and fetches each album the wave-2
+    /// publisher feed lists (`a1.example`, `a2.example`). One of those
+    /// albums names a further link (`q.example`), but wave 3 runs with
+    /// `follow_level: None`, so that link is never fetched.
     #[tokio::test]
-    async fn wave_2_is_not_itself_a_source_of_a_further_wave() {
-        let music_feed = feed(
+    async fn wave_3_is_the_links_of_wave_2_and_no_wave_4_runs() {
+        // An album in wave 1 names publisher P.
+        let album = feed(
             "music",
             vec![remote_item(
                 0,
@@ -596,26 +673,36 @@ mod tests {
                 "https://publisher.example/feed.xml",
             )],
         );
-        // If wave 2 were followed, this feed would name a wave-3 candidate.
-        let publisher_feed = feed(
+        // P, in wave 2, lists albums A1 and A2. It also re-lists the
+        // wave-1 URL, to prove a URL of wave 1 does not reappear in wave 3.
+        let publisher = feed(
             "publisher",
-            vec![remote_item(0, "music", "https://third.example/feed.xml")],
+            vec![
+                remote_item(0, "music", "https://a1.example/feed.xml"),
+                remote_item(1, "music", "https://a2.example/feed.xml"),
+                remote_item(2, "music", "https://music.example/feed.xml"),
+            ],
         );
+        // A1, in wave 3, names publisher Q. Wave 3 must give no link, so Q
+        // must never be fetched.
+        let a1 = feed(
+            "music",
+            vec![remote_item(0, "publisher", "https://q.example/feed.xml")],
+        );
+        let a2 = feed("music", Vec::new());
 
         let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_for_step = Arc::clone(&calls);
-        let music_feed_for_step = music_feed.clone();
-        let publisher_feed_for_step = publisher_feed.clone();
         let step: Arc<_> = Arc::new(move |url: String| {
             calls_for_step
                 .lock()
                 .expect("call list mutex poisoned")
                 .push(url.clone());
             let report = match url.as_str() {
-                "https://music.example/feed.xml" => accepted_report(music_feed_for_step.clone()),
-                "https://publisher.example/feed.xml" => {
-                    accepted_report(publisher_feed_for_step.clone())
-                }
+                "https://music.example/feed.xml" => accepted_report(album.clone()),
+                "https://publisher.example/feed.xml" => accepted_report(publisher.clone()),
+                "https://a1.example/feed.xml" => accepted_report(a1.clone()),
+                "https://a2.example/feed.xml" => accepted_report(a2.clone()),
                 other => panic!("unexpected fetch of {other}"),
             };
             async move { report }
@@ -632,14 +719,18 @@ mod tests {
         )
         .await;
 
-        let called = calls.lock().expect("call list mutex poisoned").clone();
+        let mut called = calls.lock().expect("call list mutex poisoned").clone();
+        called.sort();
         assert_eq!(
             called,
             vec![
+                "https://a1.example/feed.xml".to_string(),
+                "https://a2.example/feed.xml".to_string(),
                 "https://music.example/feed.xml".to_string(),
                 "https://publisher.example/feed.xml".to_string(),
             ],
-            "wave 2 must run, but must never itself become a source of a further wave"
+            "wave 3 must fetch each album wave 2's publisher feed lists, exactly once, \
+             and no wave 4 must run"
         );
     }
 

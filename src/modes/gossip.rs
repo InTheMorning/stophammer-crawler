@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::crawl::{CrawlConfig, CrawlReport, crawl_feed_report};
 use crate::dedup::Dedup;
+use crate::follow::FollowLevel;
 use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
@@ -333,7 +334,8 @@ struct GossipCounters {
     urls_dedup_skipped: u64,
     urls_feed_memory_skipped: u64,
     /// Follow fetches launched for a publisher link (ADR 0049 §2,
-    /// `stophammer` repository). Never counts a URL from a notification.
+    /// `stophammer` repository), at any level. Never counts a URL from a
+    /// notification.
     follow_fetches_launched: u64,
 }
 
@@ -477,8 +479,9 @@ async fn process_notification_urls(
             // ADR 0049 §2 (`stophammer` repository): read the follow URLs
             // as soon as the report arrives, so `report` (which carries
             // `raw_xml` and the full parsed feed) can drop at the end of
-            // this task instead of living through the follow fetches.
-            let follow = report_follow_urls(&report);
+            // this task instead of living through the follow fetches. The
+            // notification crawl is `FollowLevel::Input`.
+            let follow = report_follow_urls(&report, FollowLevel::Input);
 
             if !(quiet && report.outcome.is_medium_rejection()) {
                 eprintln!("  {}: {url}", report.outcome);
@@ -504,8 +507,12 @@ async fn process_notification_urls(
                 .unwrap()
                 .upsert_feed_memory(&url, &report, duration_ms);
 
+            // A fetch of one of these URLs is a level-1 follow fetch
+            // (task 010b): `FollowLevel::Publisher`. It gives its own
+            // links only when it parses as a publisher feed.
             spawn_follow_fetches(
                 follow,
+                FollowLevel::Publisher,
                 &client,
                 &config,
                 &dedup,
@@ -523,57 +530,97 @@ async fn process_notification_urls(
     }
 }
 
-/// Spawns a follow fetch for each URL in `follow` that passes
+/// Spawns a follow fetch for each URL in `follow`, at `level`, that passes
 /// [`should_launch_follow_url`] (ADR 0049 §2, `stophammer` repository).
 ///
-/// The notification fetch's own task calls this when its `CrawlReport` is
-/// done. It counts each launch in `follow_launches`.
+/// A notification fetch's own task calls this at [`FollowLevel::Publisher`]
+/// when its `CrawlReport` is done (task 012). A [`FollowLevel::Publisher`]
+/// fetch that itself parses as a publisher feed calls this again, at
+/// [`FollowLevel::Listed`], for its own `medium="music"` links (task 010b).
+/// This function never receives [`FollowLevel::Input`]: that level names
+/// the notification crawl itself, which is not a follow fetch.
+///
+/// Counts each launch, at any level, in `follow_launches`.
+///
+/// This function returns a boxed future. It is not an `async fn`. The
+/// reason: [`run_follow_fetch`] calls this function, and this function
+/// spawns [`run_follow_fetch`]. Two `async fn` items with that cycle
+/// would each get an opaque return type that refers to the other. The
+/// compiler cannot check the `Send` auto trait on such a cycle. A boxed,
+/// type-erased future breaks it.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a follow fetch needs the same shared resources as a notification fetch"
+    reason = "a follow fetch needs the same shared resources as a notification fetch, plus the resources to spawn its own level-2 fetches"
 )]
-async fn spawn_follow_fetches(
+fn spawn_follow_fetches<'a>(
     follow: Vec<String>,
-    client: &Arc<Client>,
-    config: &Arc<CrawlConfig>,
-    dedup: &Arc<Mutex<Dedup>>,
-    follow_sem: &Arc<Semaphore>,
-    host_throttle: &Arc<HostThrottle>,
-    follow_launches: &Arc<std::sync::Mutex<u64>>,
-    progress: &Arc<std::sync::Mutex<ProgressStore>>,
-    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    level: FollowLevel,
+    client: &'a Arc<Client>,
+    config: &'a Arc<CrawlConfig>,
+    dedup: &'a Arc<Mutex<Dedup>>,
+    follow_sem: &'a Arc<Semaphore>,
+    host_throttle: &'a Arc<HostThrottle>,
+    follow_launches: &'a Arc<std::sync::Mutex<u64>>,
+    progress: &'a Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &'a Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
-) {
-    for follow_url in follow {
-        let launch = should_launch_follow_url(
-            &follow_url,
-            dedup,
-            skip_db,
-            progress,
-            skip_known_non_music,
-            skip_ttl_days,
-            quiet,
-        )
-        .await;
-        if !launch {
-            continue;
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        for follow_url in follow {
+            let launch = should_launch_follow_url(
+                &follow_url,
+                dedup,
+                skip_db,
+                progress,
+                skip_known_non_music,
+                skip_ttl_days,
+                quiet,
+            )
+            .await;
+            if !launch {
+                continue;
+            }
+
+            *follow_launches.lock().unwrap() += 1;
+
+            match level {
+                FollowLevel::Publisher => {
+                    tokio::spawn(run_follow_fetch(
+                        follow_url,
+                        Arc::clone(client),
+                        Arc::clone(config),
+                        Arc::clone(dedup),
+                        Arc::clone(follow_sem),
+                        Arc::clone(host_throttle),
+                        Arc::clone(follow_launches),
+                        Arc::clone(progress),
+                        Arc::clone(skip_db),
+                        skip_known_non_music,
+                        skip_ttl_days,
+                        quiet,
+                    ));
+                }
+                FollowLevel::Listed => {
+                    tokio::spawn(run_leaf_follow_fetch(
+                        follow_url,
+                        Arc::clone(client),
+                        Arc::clone(config),
+                        Arc::clone(follow_sem),
+                        Arc::clone(host_throttle),
+                        Arc::clone(progress),
+                        Arc::clone(skip_db),
+                        quiet,
+                    ));
+                }
+                FollowLevel::Input => unreachable!(
+                    "spawn_follow_fetches is called only for a follow fetch's own level; \
+                     FollowLevel::Input names the notification crawl, never a follow fetch"
+                ),
+            }
         }
-
-        *follow_launches.lock().unwrap() += 1;
-
-        tokio::spawn(run_follow_fetch(
-            follow_url,
-            Arc::clone(client),
-            Arc::clone(config),
-            Arc::clone(follow_sem),
-            Arc::clone(host_throttle),
-            Arc::clone(progress),
-            Arc::clone(skip_db),
-            quiet,
-        ));
-    }
+    })
 }
 
 /// Decides whether a follow URL should be fetched (ADR 0049 §2, `stophammer`
@@ -620,13 +667,18 @@ async fn should_launch_follow_url(
     true
 }
 
-/// Fetches one follow URL (ADR 0049 §2, `stophammer` repository).
+/// Fetches one follow URL at [`FollowLevel::Publisher`] (ADR 0049 §2,
+/// `stophammer` repository) — a level-1 follow fetch (task 012).
 ///
 /// Acquires a permit from `follow_sem`, its own `Semaphore`, not the
 /// notification `Semaphore`. Then it waits for the host throttle, then it
 /// calls [`crawl_feed_report`]. It records the outcome through
-/// [`record_follow_outcome`], as a notification fetch does. It does not
-/// read the report's follow URLs: the walk stops at one level.
+/// [`record_follow_outcome`], as a notification fetch does.
+///
+/// The report can be `Accepted` or `NoChange`, and parse as a publisher
+/// feed. Then it reads the feed's `medium="music"` links. For each one it
+/// spawns a [`FollowLevel::Listed`] fetch, through
+/// [`run_leaf_follow_fetch`] (task 010b). Otherwise the walk stops here.
 ///
 /// A second semaphore stops a slow run of follow fetches from holding a
 /// notification permit for minutes. A Wavlake publisher feed can name
@@ -635,9 +687,74 @@ async fn should_launch_follow_url(
 /// semaphore, that run would delay real-time notification crawls.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a follow fetch needs the same shared resources as a notification fetch"
+    reason = "a follow fetch needs the same shared resources as a notification fetch, plus the resources to spawn its own level-2 fetches"
 )]
 async fn run_follow_fetch(
+    url: String,
+    client: Arc<Client>,
+    config: Arc<CrawlConfig>,
+    dedup: Arc<Mutex<Dedup>>,
+    follow_sem: Arc<Semaphore>,
+    host_throttle: Arc<HostThrottle>,
+    follow_launches: Arc<std::sync::Mutex<u64>>,
+    progress: Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
+    quiet: bool,
+) {
+    let _permit = follow_sem.acquire().await.expect("semaphore closed");
+    let lease = host_throttle.acquire(&url).await;
+    let start = Instant::now();
+    let report = crawl_feed_report(&client, &url, None, &config).await;
+    host_throttle.release(&lease, Duration::ZERO).await;
+    let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+    // ADR 0049 §2 (`stophammer` repository): read the level-2 follow URLs
+    // before `record_follow_outcome` is called. A notification fetch
+    // reads its own follow URLs the same way, before its report is set
+    // aside.
+    let listed = report_follow_urls(&report, FollowLevel::Publisher);
+
+    record_follow_outcome(&url, &report, duration_ms, quiet, &skip_db, &progress);
+
+    if listed.is_empty() {
+        return;
+    }
+
+    spawn_follow_fetches(
+        listed,
+        FollowLevel::Listed,
+        &client,
+        &config,
+        &dedup,
+        &follow_sem,
+        &host_throttle,
+        &follow_launches,
+        &progress,
+        &skip_db,
+        skip_known_non_music,
+        skip_ttl_days,
+        quiet,
+    )
+    .await;
+}
+
+/// Fetches one follow URL at [`FollowLevel::Listed`] (ADR 0049 §2,
+/// `stophammer` repository) — a level-2 follow fetch (task 010b). A
+/// level-1 fetch's publisher feed listed this URL as an album.
+///
+/// Acquires a permit from `follow_sem`, waits for the host throttle, calls
+/// [`crawl_feed_report`], and records the outcome through
+/// [`record_follow_outcome`], exactly as [`run_follow_fetch`] does. It has
+/// no `dedup` or `follow_launches` parameter, so it has no way to reach
+/// [`spawn_follow_fetches`]. The walk stops here (ADR 0049 §2 step 3), the
+/// same way [`record_follow_outcome`] never reads a report's parsed feed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a follow fetch needs the same shared resources as a notification fetch"
+)]
+async fn run_leaf_follow_fetch(
     url: String,
     client: Arc<Client>,
     config: Arc<CrawlConfig>,
@@ -660,8 +777,10 @@ async fn run_follow_fetch(
 /// Records a follow fetch's `report` in `skip_db` and the progress store,
 /// exactly as a notification fetch records its own report.
 ///
-/// Never reads `report.parsed_feed` and never collects its follow URLs
-/// (ADR 0049 §2, `stophammer` repository): the walk stops at one level.
+/// Never reads `report.parsed_feed`. It plays no part in the decision
+/// whether the walk reaches another level (ADR 0049 §2, `stophammer`
+/// repository). [`run_follow_fetch`] reads the level-2 follow URLs
+/// itself, before this function is called.
 fn record_follow_outcome(
     url: &str,
     report: &CrawlReport,
@@ -1892,9 +2011,11 @@ mod tests {
     }
 
     /// Gives a publisher feed whose one remote item names a music feed at
-    /// `url`. Following this feed again would give `url` as a further
-    /// follow URL, which is what [`a_follow_fetch_does_not_collect_follow_urls`]
-    /// must prove [`record_follow_outcome`] never does.
+    /// `url`. [`a_follow_fetch_does_not_collect_follow_urls`] uses this feed
+    /// to prove one fact: [`record_follow_outcome`] itself never reads
+    /// `url` out of the report. It plays no part in reaching a further
+    /// level. (A level-2 fetch of `url` can still happen, but only through
+    /// `run_follow_fetch`'s own read of the report, task 010b.)
     fn feed_with_music_remote_item(url: &str) -> IngestFeedData {
         IngestFeedData {
             feed_guid: "publisher-guid".to_string(),
@@ -1926,6 +2047,103 @@ mod tests {
         }
     }
 
+    /// Gives a music feed whose one remote item names a publisher feed at
+    /// `url`. A feed's own `raw_medium`, not its remote items, decides
+    /// whether `FollowLevel::Publisher` gives anything (task 010b), so this
+    /// feed's link must never count at that level.
+    fn music_feed_with_publisher_remote_item(url: &str) -> IngestFeedData {
+        IngestFeedData {
+            feed_guid: "music-guid".to_string(),
+            title: "Music Feed".to_string(),
+            description: None,
+            image_url: None,
+            language: None,
+            explicit: false,
+            itunes_type: None,
+            raw_medium: Some("music".to_string()),
+            author_name: None,
+            owner_name: None,
+            pub_date: None,
+            last_build_date: None,
+            remote_items: vec![IngestRemoteFeedRef {
+                position: 0,
+                medium: Some("publisher".to_string()),
+                remote_feed_guid: "publisher-guid".to_string(),
+                remote_feed_url: Some(url.to_string()),
+                rel: None,
+            }],
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            podcast_namespace: None,
+            feed_payment_routes: Vec::new(),
+            live_items: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_level_1_publisher_feed_gives_its_music_links() {
+        let mut report = make_report(
+            "accepted",
+            None,
+            Some(200),
+            Some("publisher"),
+            Some("publisher-guid"),
+        );
+        report.parsed_feed = Some(feed_with_music_remote_item(
+            "https://album.example/feed.xml",
+        ));
+
+        assert_eq!(
+            report_follow_urls(&report, FollowLevel::Publisher),
+            vec!["https://album.example/feed.xml".to_string()],
+            "a level-1 fetch whose feed parses as a publisher feed must give its \
+             medium=\"music\" links"
+        );
+    }
+
+    #[test]
+    fn a_level_1_music_feed_gives_no_link() {
+        let mut report = make_report(
+            "accepted",
+            None,
+            Some(200),
+            Some("music"),
+            Some("music-guid"),
+        );
+        report.parsed_feed = Some(music_feed_with_publisher_remote_item(
+            "https://publisher.example/feed.xml",
+        ));
+
+        assert_eq!(
+            report_follow_urls(&report, FollowLevel::Publisher),
+            Vec::<String>::new(),
+            "a level-1 fetch whose feed does not parse as a publisher feed must give no link"
+        );
+    }
+
+    #[test]
+    fn a_level_2_fetch_gives_no_link() {
+        let mut report = make_report(
+            "accepted",
+            None,
+            Some(200),
+            Some("publisher"),
+            Some("publisher-guid"),
+        );
+        report.parsed_feed = Some(feed_with_music_remote_item(
+            "https://album.example/feed.xml",
+        ));
+
+        assert_eq!(
+            report_follow_urls(&report, FollowLevel::Listed),
+            Vec::<String>::new(),
+            "a level-2 fetch must give no link, even when its feed carries one, \
+             so the walk stops at one further level (ADR 0049 §2 step 3)"
+        );
+    }
+
     #[test]
     fn a_rejected_notification_report_gives_no_follow_fetch() {
         let mut report = make_report(
@@ -1940,7 +2158,7 @@ mod tests {
         ));
 
         assert!(
-            report_follow_urls(&report).is_empty(),
+            report_follow_urls(&report, FollowLevel::Input).is_empty(),
             "a rejected report must give no follow URLs, so process_notification_urls \
              launches no follow fetch for it"
         );
@@ -1978,7 +2196,7 @@ mod tests {
         // The stub report carries its own follow URLs, so this proves the
         // omission below is a choice, not a coincidence of empty data.
         assert!(
-            !report_follow_urls(&report).is_empty(),
+            !report_follow_urls(&report, FollowLevel::Publisher).is_empty(),
             "the stub report must itself carry a follow URL"
         );
 
@@ -2054,15 +2272,21 @@ mod tests {
             .acquire_owned()
             .await
             .expect("acquire the only follow permit");
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
 
         let handle = tokio::spawn(run_follow_fetch(
             "https://example.com/follow.xml".to_string(),
             client,
             config,
+            dedup,
             Arc::clone(&follow_sem),
             host_throttle,
+            follow_launches,
             progress,
             skip_db,
+            false,
+            None,
             true,
         ));
 

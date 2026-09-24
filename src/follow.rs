@@ -10,6 +10,54 @@ use std::collections::HashSet;
 
 use stophammer_parser::types::IngestFeedData;
 
+/// The reason a feed was fetched (ADR 0049 §2, `stophammer` repository).
+///
+/// The level decides which of a feed's [`follow_urls`] the crawler follows
+/// next. A caller states the level as this explicit value. The level is
+/// never read from a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowLevel {
+    /// The input URL list of a batch run, or a gossip notification. Every
+    /// link of [`follow_urls`] counts, whichever step (1 or 2) it belongs
+    /// to.
+    Input,
+    /// Reached through step 1: a music feed named this feed as its
+    /// publisher. Its own `medium="music"` links (step 2) count, but only
+    /// when this feed parses as a publisher feed.
+    Publisher,
+    /// Reached through step 2: a publisher feed listed this feed as an
+    /// album. No link of this feed counts. ADR 0049 §2 step 3 stops the
+    /// walk here.
+    Listed,
+}
+
+/// Gives the follow URLs of `feed`, filtered by the level it was fetched at
+/// (ADR 0049 §2, `stophammer` repository).
+///
+/// [`FollowLevel::Input`] gives every URL [`follow_urls`] gives.
+/// [`FollowLevel::Publisher`] gives those URLs only when `feed`'s
+/// `raw_medium` is `publisher`, ASCII case ignored. A feed that does not
+/// parse as a publisher feed gives nothing at this level, even when it
+/// carries a link of its own. [`FollowLevel::Listed`] always gives nothing.
+#[must_use]
+pub fn follow_urls_at_level(feed: &IngestFeedData, level: FollowLevel) -> Vec<String> {
+    match level {
+        FollowLevel::Input => follow_urls(feed),
+        FollowLevel::Publisher => {
+            let is_publisher_feed = feed
+                .raw_medium
+                .as_deref()
+                .is_some_and(|medium| medium.eq_ignore_ascii_case("publisher"));
+            if is_publisher_feed {
+                follow_urls(feed)
+            } else {
+                Vec::new()
+            }
+        }
+        FollowLevel::Listed => Vec::new(),
+    }
+}
+
 /// Gives the follow URLs of `feed`.
 ///
 /// A feed whose `raw_medium` is `music`, ignoring ASCII case, gives the
@@ -63,7 +111,7 @@ fn is_followable_url(url: &str) -> bool {
 mod tests {
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef, IngestTrackData};
 
-    use super::follow_urls;
+    use super::{FollowLevel, follow_urls, follow_urls_at_level};
 
     fn remote_item(position: i64, medium: Option<&str>, url: Option<&str>) -> IngestRemoteFeedRef {
         IngestRemoteFeedRef {
@@ -311,6 +359,78 @@ mod tests {
             follow_urls(&data),
             Vec::<String>::new(),
             "an item-level remote item, on a track, must not be followed"
+        );
+    }
+
+    #[test]
+    fn an_input_level_feed_gives_every_follow_url() {
+        let data = feed(
+            Some("music"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Input),
+            vec!["https://publisher.example/feed.xml".to_string()],
+            "FollowLevel::Input must give every follow_urls link"
+        );
+    }
+
+    #[test]
+    fn a_publisher_level_publisher_feed_gives_its_music_urls() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(
+                0,
+                Some("music"),
+                Some("https://a.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Publisher),
+            vec!["https://a.example/feed.xml".to_string()],
+            "FollowLevel::Publisher must give the music links of a feed that parses as publisher"
+        );
+    }
+
+    #[test]
+    fn a_publisher_level_music_feed_gives_nothing() {
+        let data = feed(
+            Some("music"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Publisher),
+            Vec::<String>::new(),
+            "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed"
+        );
+    }
+
+    #[test]
+    fn a_listed_level_feed_gives_nothing() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(
+                0,
+                Some("music"),
+                Some("https://a.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Listed),
+            Vec::<String>::new(),
+            "FollowLevel::Listed must always give nothing, so the walk stops at one level (ADR 0049 §2 step 3)"
         );
     }
 }
