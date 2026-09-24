@@ -18,6 +18,9 @@ use crate::modes::batch;
 /// Default `INGEST_URL`, matching [`crate::crawl::CrawlConfig`].
 const DEFAULT_INGEST_URL: &str = "http://localhost:8008/ingest/feed";
 const FEEDS_RECENT_PATH: &str = "/v1/feeds/recent";
+/// stophammer ADR 0049 §8: the corrective pass reports the unresolved
+/// publisher back-links from this route, at the end of the pass.
+const PUBLISHER_LINKS_STATS_PATH: &str = "/v1/publisher-links/stats";
 /// The route's page-size cap.
 const PAGE_LIMIT: u32 = 100;
 /// The feed list filters to the music medium by default. The index also holds
@@ -41,6 +44,25 @@ struct FeedsRecentPagination {
 struct FeedsRecentPage {
     data: Vec<FeedsRecentItem>,
     pagination: FeedsRecentPagination,
+}
+
+/// One count from the `data` object of `/v1/publisher-links/stats`.
+///
+/// A missing count is an error. The route always reports all four counts,
+/// so a partial body is never valid.
+#[derive(Debug, Deserialize)]
+struct PublisherLinkStats {
+    listed_links: u64,
+    resolved_by_guid: u64,
+    resolved_by_feed_url: u64,
+    unresolved: u64,
+}
+
+/// The envelope of `/v1/publisher-links/stats`. The real body also carries
+/// `pagination` and `meta`. Those fields are not read here.
+#[derive(Debug, Deserialize)]
+struct PublisherLinkStatsResponse {
+    data: PublisherLinkStats,
 }
 
 fn ingest_url_from_env() -> String {
@@ -92,6 +114,61 @@ async fn fetch_feeds_recent_page(
         .json::<FeedsRecentPage>()
         .await
         .map_err(|err| format!("GET {FEEDS_RECENT_PATH} returned an unreadable body: {err}"))
+}
+
+/// Decode the body of `GET /v1/publisher-links/stats` into the printed
+/// line. Needs no network, so a test can check it against a fixed body.
+///
+/// # Errors
+///
+/// Returns an error string when the body is not valid JSON, or when a
+/// count field is missing.
+fn format_link_stats(body: &str) -> Result<String, String> {
+    let response: PublisherLinkStatsResponse = serde_json::from_str(body).map_err(|err| {
+        format!("{PUBLISHER_LINKS_STATS_PATH} returned an unreadable body: {err}")
+    })?;
+    let stats = response.data;
+    Ok(format!(
+        "publisher links: listed={} guid={} feed_url={} unresolved={}",
+        stats.listed_links, stats.resolved_by_guid, stats.resolved_by_feed_url, stats.unresolved
+    ))
+}
+
+/// Fetch `GET /v1/publisher-links/stats` from `origin` and decode it into
+/// the printed line.
+async fn fetch_publisher_link_stats(
+    client: &reqwest::Client,
+    origin: &str,
+) -> Result<String, String> {
+    let response = client
+        .get(format!("{origin}{PUBLISHER_LINKS_STATS_PATH}"))
+        .send()
+        .await
+        .map_err(|err| format!("GET {PUBLISHER_LINKS_STATS_PATH} failed: {err}"))?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        format!("GET {PUBLISHER_LINKS_STATS_PATH} returned an unreadable body: {err}")
+    })?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "GET {PUBLISHER_LINKS_STATS_PATH} returned {status}: {body}"
+        ));
+    }
+
+    format_link_stats(&body)
+}
+
+/// Read the publisher link counts and print them, or print one warning.
+///
+/// The corrective pass is already complete when this call runs, so a
+/// failed read here never changes the exit status.
+async fn report_publisher_link_stats(client: &reqwest::Client, origin: &str) {
+    match fetch_publisher_link_stats(client, origin).await {
+        Ok(line) => eprintln!("refresh: {line}"),
+        Err(err) => eprintln!("refresh: could not read publisher link counts: {err}"),
+    }
 }
 
 /// Page through `fetch_page` while `has_more` is true, collecting every
@@ -166,6 +243,8 @@ pub async fn run(concurrency: usize, host_delay_ms: u64, failed_feeds_output: St
     eprintln!("refresh: reading feed list from {origin}{FEEDS_RECENT_PATH}");
 
     let client = reqwest::Client::new();
+    let link_stats_client = client.clone();
+    let link_stats_origin = origin.clone();
     let fetch_page = move |cursor: Option<String>| {
         let client = client.clone();
         let origin = origin.clone();
@@ -180,6 +259,8 @@ pub async fn run(concurrency: usize, host_delay_ms: u64, failed_feeds_output: St
         eprintln!("refresh: failed to read the node's feed list: {err}");
         std::process::exit(1);
     }
+
+    report_publisher_link_stats(&link_stats_client, &link_stats_origin).await;
 }
 
 #[cfg(test)]
@@ -188,8 +269,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        FeedsRecentItem, FeedsRecentPage, FeedsRecentPagination, query_origin_from_ingest_url,
-        run_corrective_pass,
+        FeedsRecentItem, FeedsRecentPage, FeedsRecentPagination, format_link_stats,
+        query_origin_from_ingest_url, run_corrective_pass,
     };
 
     #[test]
@@ -219,6 +300,41 @@ mod tests {
     #[test]
     fn query_origin_rejects_an_unparseable_url() {
         assert!(query_origin_from_ingest_url("not a url").is_err());
+    }
+
+    #[test]
+    fn format_link_stats_decodes_the_real_response_body() {
+        let body = r#"{"data":{"listed_links":709,"resolved_by_guid":693,"resolved_by_feed_url":1,"unresolved":15},"pagination":{"cursor":null,"has_more":false},"meta":{"api_version":"v1","node_pubkey":"fae4b4c8de468abcb430b05efa1d8cfd8b85a3e90d62ca5a5c2c7ed4a56167bd"}}"#;
+        assert_eq!(
+            format_link_stats(body).unwrap(),
+            "publisher links: listed=709 guid=693 feed_url=1 unresolved=15"
+        );
+    }
+
+    #[test]
+    fn format_link_stats_decodes_a_synthetic_response_body() {
+        let body = r#"{"data":{"listed_links":10,"resolved_by_guid":4,"resolved_by_feed_url":5,"unresolved":1}}"#;
+        assert_eq!(
+            format_link_stats(body).unwrap(),
+            "publisher links: listed=10 guid=4 feed_url=5 unresolved=1"
+        );
+    }
+
+    #[test]
+    fn format_link_stats_rejects_a_missing_count_field() {
+        let body = r#"{"data":{"listed_links":10,"resolved_by_guid":4,"resolved_by_feed_url":5}}"#;
+        assert!(
+            format_link_stats(body).is_err(),
+            "a missing count must be an error, not a zero"
+        );
+    }
+
+    #[test]
+    fn format_link_stats_rejects_a_body_that_is_not_json() {
+        assert!(
+            format_link_stats("not json").is_err(),
+            "a non-JSON body must be an error"
+        );
     }
 
     fn page(urls: &[&str], cursor: Option<&str>, has_more: bool) -> FeedsRecentPage {
