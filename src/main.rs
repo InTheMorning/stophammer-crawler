@@ -90,6 +90,77 @@ mod tests {
             "gossip host-delay-ms must read the HOST_DELAY_MS env var"
         );
     }
+
+    /// Proves ADR 0050 §1 and the phase plan decision 7 (`stophammer`
+    /// repository): `feed`, `refresh`, `gossip` and `import` each declare
+    /// `--feed-cache`, with env `FEED_CACHE_DB` and default
+    /// `./feed_cache.db`.
+    #[test]
+    fn feed_cache_flag_has_the_expected_env_and_default_on_each_fetching_mode() {
+        let command = Cli::command();
+        for mode in ["feed", "refresh", "gossip", "import"] {
+            let subcommand = command
+                .find_subcommand(mode)
+                .unwrap_or_else(|| panic!("the {mode} subcommand must exist"));
+            let arg = subcommand
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == "feed_cache")
+                .unwrap_or_else(|| panic!("{mode} must declare a feed-cache argument"));
+            assert_eq!(
+                arg.get_env(),
+                Some(std::ffi::OsStr::new("FEED_CACHE_DB")),
+                "{mode} --feed-cache must read the FEED_CACHE_DB env var"
+            );
+            assert_eq!(
+                arg.get_default_values(),
+                [std::ffi::OsStr::new("./feed_cache.db")],
+                "{mode} --feed-cache must default to ./feed_cache.db"
+            );
+        }
+    }
+
+    /// The `ndjson` mode does not fetch, so it must declare no fetch cache
+    /// (ADR 0050 phase plan, non-goals, `stophammer` repository).
+    #[test]
+    fn ndjson_declares_no_feed_cache_flag() {
+        let command = Cli::command();
+        let ndjson = command
+            .find_subcommand("ndjson")
+            .expect("the ndjson subcommand must exist");
+        assert!(
+            ndjson
+                .get_arguments()
+                .all(|arg| arg.get_id().as_str() != "feed_cache"),
+            "ndjson must not declare a feed-cache argument; it does not fetch"
+        );
+    }
+
+    /// Proves ADR 0050 §5 (`stophammer` repository): `--no-revalidate` is
+    /// global, like `--force`, so every mode can read it.
+    #[test]
+    fn no_revalidate_is_a_global_flag_like_force() {
+        let command = Cli::command();
+        for flag in ["force", "no_revalidate"] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == flag)
+                .unwrap_or_else(|| panic!("Cli must declare a {flag} argument"));
+            assert!(
+                arg.is_global_set(),
+                "--{flag} must be global, so every mode can read it"
+            );
+        }
+    }
+
+    #[test]
+    fn no_revalidate_defaults_to_false() {
+        let cli = Cli::try_parse_from(["stophammer-crawler", "feed"])
+            .expect("feed must parse with no flags");
+        assert!(
+            !cli.no_revalidate,
+            "no_revalidate must default to false, so a plain run still revalidates"
+        );
+    }
 }
 
 fn force_reingest_from_env() -> bool {
@@ -133,6 +204,11 @@ struct Cli {
     #[arg(long, global = true)]
     force: bool,
 
+    /// Send no conditional GET, even when the fetch cache holds a row for
+    /// the URL (ADR 0050 §5, `stophammer` repository)
+    #[arg(long, global = true)]
+    no_revalidate: bool,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -159,6 +235,11 @@ enum Mode {
             default_value = "./failed_feeds.txt"
         )]
         failed_feeds_output: String,
+
+        /// Path to the shared fetch cache (ADR 0050 §1, `stophammer`
+        /// repository)
+        #[arg(long, env = "FEED_CACHE_DB", default_value = "./feed_cache.db")]
+        feed_cache: String,
     },
 
     /// Read the node's feed list, then re-run the crawl pipeline over it
@@ -178,6 +259,11 @@ enum Mode {
             default_value = "./failed_feeds.txt"
         )]
         failed_feeds_output: String,
+
+        /// Path to the shared fetch cache (ADR 0050 §1, `stophammer`
+        /// repository)
+        #[arg(long, env = "FEED_CACHE_DB", default_value = "./feed_cache.db")]
+        feed_cache: String,
     },
 
     /// Import from a `PodcastIndex` snapshot database
@@ -205,6 +291,11 @@ enum Mode {
         /// Path to shared feed skip database (cross-mode skip knowledge)
         #[arg(long, default_value = "./feed_skip.db")]
         skip_db: String,
+
+        /// Path to the shared fetch cache (ADR 0050 §1, `stophammer`
+        /// repository)
+        #[arg(long, env = "FEED_CACHE_DB", default_value = "./feed_cache.db")]
+        feed_cache: String,
 
         /// Feeds per database query batch
         #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
@@ -284,6 +375,11 @@ enum Mode {
         #[arg(long, default_value = "./feed_skip.db")]
         skip_db: String,
 
+        /// Path to the shared fetch cache (ADR 0050 §1, `stophammer`
+        /// repository)
+        #[arg(long, env = "FEED_CACHE_DB", default_value = "./feed_cache.db")]
+        feed_cache: String,
+
         /// SSE endpoint URL (default: <http://localhost:8089/events>)
         #[arg(long)]
         sse_url: Option<String>,
@@ -335,6 +431,9 @@ enum Mode {
 async fn main() {
     let cli = Cli::parse();
     let force = cli.force || force_reingest_from_env();
+    // ADR 0050 §5 (`stophammer` repository): `--no-revalidate` clears
+    // `CrawlConfig::revalidate`, as `--force` sets `force_reingest`.
+    let revalidate = !cli.no_revalidate;
 
     match cli.mode {
         Mode::Feed {
@@ -342,15 +441,34 @@ async fn main() {
             concurrency,
             host_delay_ms,
             failed_feeds_output,
+            feed_cache,
         } => {
-            modes::batch::run(urls, concurrency, host_delay_ms, failed_feeds_output, force).await;
+            modes::batch::run(
+                urls,
+                concurrency,
+                host_delay_ms,
+                failed_feeds_output,
+                force,
+                feed_cache,
+                revalidate,
+            )
+            .await;
         }
         Mode::Refresh {
             concurrency,
             host_delay_ms,
             failed_feeds_output,
+            feed_cache,
         } => {
-            modes::refresh::run(concurrency, host_delay_ms, failed_feeds_output, force).await;
+            modes::refresh::run(
+                concurrency,
+                host_delay_ms,
+                failed_feeds_output,
+                force,
+                feed_cache,
+                revalidate,
+            )
+            .await;
         }
         Mode::Import {
             db,
@@ -358,6 +476,7 @@ async fn main() {
             refresh_db,
             state,
             skip_db,
+            feed_cache,
             batch,
             concurrency,
             audit_output,
@@ -384,6 +503,8 @@ async fn main() {
                 dry_run,
                 cursor,
                 force,
+                feed_cache,
+                revalidate,
             )
             .await;
         }
@@ -411,6 +532,7 @@ async fn main() {
         Mode::Gossip {
             state,
             skip_db,
+            feed_cache,
             sse_url,
             archive_db,
             since_hours,
@@ -425,6 +547,7 @@ async fn main() {
             modes::gossip::run(
                 state,
                 skip_db,
+                feed_cache,
                 sse_url,
                 archive_db,
                 since_hours,
@@ -434,6 +557,7 @@ async fn main() {
                 skip_ttl_days,
                 quiet,
                 force,
+                revalidate,
                 audit_output,
                 audit_replace,
             )

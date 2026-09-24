@@ -3,7 +3,8 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
+use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
+use crate::feed_cache::FeedCacheDb;
 use crate::follow::{FollowLevel, follow_urls_at_level};
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
@@ -154,14 +155,13 @@ async fn crawl_feed_with_retries(
     url: &str,
     config: &CrawlConfig,
     host_throttle: &HostThrottle,
+    cache: Option<&FeedCache>,
 ) -> CrawlReport {
     let mut attempt = 1;
 
     loop {
         let lease = host_throttle.acquire(url).await;
-        // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
-        // with the shared fetch cache.
-        let report = crawl_feed_report(client, url, None, config, None).await;
+        let report = crawl_feed_report(client, url, None, config, cache).await;
         let delay = report
             .outcome
             .retry_delay(attempt)
@@ -377,6 +377,8 @@ pub async fn run(
     host_delay_ms: u64,
     failed_feeds_output: String,
     force: bool,
+    feed_cache: String,
+    revalidate: bool,
 ) {
     let urls = load_urls(&urls_arg);
 
@@ -385,7 +387,16 @@ pub async fn run(
         std::process::exit(1);
     }
 
-    run_urls(urls, concurrency, host_delay_ms, failed_feeds_output, force).await;
+    run_urls(
+        urls,
+        concurrency,
+        host_delay_ms,
+        failed_feeds_output,
+        force,
+        feed_cache,
+        revalidate,
+    )
+    .await;
 }
 
 /// Run the batch pipeline over an already-resolved URL list: interleave by
@@ -393,12 +404,19 @@ pub async fn run(
 ///
 /// A caller that already holds a list calls this directly instead of `run`, so
 /// the host interleave and the rest of the pipeline still apply to it.
+///
+/// `feed_cache` names the shared fetch cache (ADR 0050 §1, `stophammer`
+/// repository). This is the route the cache takes to reach the `step`
+/// closure: opened once here, then cloned into the closure the same way
+/// `client`, `config`, and `host_throttle` already are.
 pub async fn run_urls(
     urls: Vec<String>,
     concurrency: usize,
     host_delay_ms: u64,
     failed_feeds_output: String,
     force: bool,
+    feed_cache: String,
+    revalidate: bool,
 ) {
     let urls = interleave_by_host(urls, |url| host_key(url));
 
@@ -408,16 +426,20 @@ pub async fn run_urls(
         host_delay_ms
     );
 
-    let config = Arc::new(CrawlConfig::from_env_with_force(force));
+    let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
     let client = Arc::new(reqwest::Client::new());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
+    let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&feed_cache)));
 
     let step: Arc<_> = Arc::new(move |url: String| {
         let client = Arc::clone(&client);
         let config = Arc::clone(&config);
         let host_throttle = Arc::clone(&host_throttle);
-        async move { crawl_feed_with_retries(&client, &url, &config, &host_throttle).await }
+        let cache = Arc::clone(&cache);
+        async move {
+            crawl_feed_with_retries(&client, &url, &config, &host_throttle, Some(&cache)).await
+        }
     });
 
     run_waves(urls, concurrency, host_delay_ms, &failed_feeds, &step).await;
@@ -434,14 +456,17 @@ pub async fn run_urls(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        CrawlOutcome, CrawlReport, FollowLevel, exclude_seen_urls, report_follow_urls, run_wave,
-        run_waves,
+        CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, FeedCacheDb, FollowLevel, HostThrottle,
+        crawl_feed_with_retries, exclude_seen_urls, report_follow_urls, run_wave, run_waves,
     };
 
     fn remote_item(position: i64, medium: &str, url: &str) -> IngestRemoteFeedRef {
@@ -785,5 +810,162 @@ mod tests {
             vec!["https://publisher.example/feed.xml".to_string()],
             "a retryable wave-2 failure must land in the same failed-feeds list as wave 1"
         );
+    }
+
+    // ---- stub-server test: the cache reaches `crawl_feed_with_retries` ----
+    //
+    // `run_wave` and `run_waves` take a stub `step` closure, so a test at
+    // that level never sees the cache `run_urls` opens. This test proves
+    // the fact one level down, at `crawl_feed_with_retries` itself. The
+    // stub helper shape is copied from the tests at the end of
+    // `src/crawl.rs`. No test here sends a request to an external host.
+
+    /// One HTTP/1.1 request, captured from a stub connection. This test
+    /// reads only the method; `read_stub_request` still reads the headers,
+    /// to find the body's `Content-Length`.
+    struct StubRequest {
+        method: String,
+    }
+
+    /// Read one HTTP/1.1 request head and body from `stream`, and discard
+    /// the body. This test reads only the method and the headers.
+    async fn read_stub_request(stream: &mut TcpStream) -> StubRequest {
+        let mut reader = BufReader::new(stream);
+
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .await
+            .expect("read stub request line");
+        let method = request_line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read stub header line");
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 {
+            reader
+                .read_exact(&mut body)
+                .await
+                .expect("read stub request body");
+        }
+
+        StubRequest { method }
+    }
+
+    /// Build a fixed HTTP/1.1 response, with `Content-Length` and
+    /// `Connection: close` set from `body`.
+    fn stub_response(status_line: &str, extra_headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut head = format!("{status_line}\r\n");
+        for (name, value) in extra_headers {
+            let _ = writeln!(head, "{name}: {value}\r");
+        }
+        let _ = writeln!(head, "content-length: {}\r", body.len());
+        head.push_str("connection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Start a stub HTTP/1.1 server, on `127.0.0.1`, for exactly one
+    /// request. It answers with `response`, then gives the captured
+    /// request back through the returned handle.
+    async fn spawn_stub(response: Vec<u8>) -> (String, tokio::task::JoinHandle<StubRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept stub connection");
+            let request = read_stub_request(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("write stub response");
+            let _ = stream.shutdown().await;
+            request
+        });
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// A fresh, empty fetch-cache database, at a temporary path that
+    /// outlives the test.
+    fn test_cache() -> FeedCache {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("feed_cache.db");
+        let path = path.to_str().expect("path is valid UTF-8").to_string();
+        // Leak so the directory survives the test.
+        std::mem::forget(dir);
+        Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&path)))
+    }
+
+    /// Proves ADR 0050 §1 (`stophammer` repository): `crawl_feed_with_retries`
+    /// passes its `cache` argument through to `crawl_feed_report`, so a
+    /// `200` fetch writes a cache row. `run_urls` opens the cache and
+    /// clones it into the same closure that calls this function, so this
+    /// proves the cache reaches the step `run_urls` builds.
+    #[tokio::test]
+    async fn crawl_feed_with_retries_passes_the_cache_through_to_crawl_feed_report() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config =
+            CrawlConfig::dry_run("stophammer-crawler-test/1.0", Duration::from_secs(5));
+        config.ingest_url = format!("http://{ingest_addr}/ingest/feed");
+        let cache = test_cache();
+        let host_throttle = HostThrottle::new(Duration::from_millis(0));
+
+        let _report =
+            crawl_feed_with_retries(&client, &feed_url, &config, &host_throttle, Some(&cache))
+                .await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+        assert_eq!(feed_request.method, "GET");
+        assert_eq!(ingest_request.method, "POST");
+
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("crawl_feed_with_retries must pass its cache to crawl_feed_report");
+        assert_eq!(cached.etag.as_deref(), Some("\"v1\""));
     }
 }

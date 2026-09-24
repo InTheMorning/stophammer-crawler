@@ -76,6 +76,20 @@ cargo run -- gossip --help
 The examples below assume `stophammer-crawler` is on your `PATH`. After a local
 source build, use `./target/release/stophammer-crawler` instead.
 
+### Global options
+
+`--force` and `--no-revalidate` apply to every mode. Place each flag before
+the mode name.
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--force` | `FORCE_REINGEST` | off | Force re-ingestion even if content has not changed |
+| `--no-revalidate` | | off | Send no conditional GET, even when the fetch cache holds a row |
+
+```bash
+stophammer-crawler --force --no-revalidate feed https://example.com/feed.xml
+```
+
 ### feed
 
 Fetch and ingest a list of feed URLs:
@@ -118,6 +132,7 @@ stophammer-crawler --force feed https://example.com/feed.xml
 | `--concurrency` | `CONCURRENCY` | `5` | Parallel fetch+ingest workers |
 | `--host-delay-ms` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
 | `--failed-feeds-output` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
+| `--feed-cache` | `FEED_CACHE_DB` | `./feed_cache.db` | Shared cross-mode fetch cache (ADR 0050) |
 
 ### refresh
 
@@ -157,6 +172,7 @@ stophammer-crawler refresh \
 | `--host-delay-ms <ms>` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
 | `--failed-feeds-output <path>` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
 | `--force` | `FORCE_REINGEST` | off | Force re-ingestion even if content has not changed |
+| `--feed-cache <path>` | `FEED_CACHE_DB` | `./feed_cache.db` | Shared cross-mode fetch cache (ADR 0050) |
 
 The mode prints the corpus size before it starts. A page that fails stops the
 whole pass, and the pipeline never runs on a partial corpus.
@@ -219,22 +235,26 @@ for multi-gigabyte snapshots.
 
 #### Import options
 
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--db <path>` | `./podcastindex_feeds.db` | PodcastIndex snapshot path |
-| `--db-url <url>` | (public PI URL) | Snapshot archive URL |
-| `--refresh-db` | off | Conditionally refresh the snapshot if the remote archive changed |
-| `--state <path>` | `./import_state.db` | Progress cursor database |
-| `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
-| `--batch <n>` | `100` | Feeds per DB query batch |
-| `--concurrency <n>` | `5` | Parallel fetch+ingest workers |
-| `--audit-output <path>` | off | Optional cached-feed NDJSON dump of successfully ingested `200 OK` feeds |
-| `--audit-replace` | off | Replace `--audit-output` instead of appending to it |
-| `--dry-run` | off | Log without fetching/ingesting |
-| `--skip-known-non-music` | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
-| `--skip-known-success` | off | Skip rows already known to have reached `accepted`, `no_change`, or `skipped_known_success` in importer memory |
-| `--wavlake-only` | off | Restrict snapshot import to `wavlake.com` / `www.wavlake.com` feeds; without this flag, normal import excludes Wavlake rows |
-| `--cursor <id>` | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
+| Flag | Env | Default | Description |
+| ---- | --- | ------- | ----------- |
+| `--db <path>` | | `./podcastindex_feeds.db` | PodcastIndex snapshot path |
+| `--db-url <url>` | `PODCASTINDEX_DB_URL` | (public PI URL) | Snapshot archive URL |
+| `--refresh-db` | | off | Conditionally refresh the snapshot if the remote archive changed |
+| `--state <path>` | | `./import_state.db` | Progress cursor database |
+| `--skip-db <path>` | | `./feed_skip.db` | Shared cross-mode skip database |
+| `--feed-cache <path>` | `FEED_CACHE_DB` | `./feed_cache.db` | Shared cross-mode fetch cache (ADR 0050) |
+| `--batch <n>` | | `100` | Feeds per DB query batch |
+| `--concurrency <n>` | `CONCURRENCY` | `5` | Parallel fetch+ingest workers |
+| `--audit-output <path>` | | off | Optional cached-feed NDJSON dump of successfully ingested `200 OK` feeds |
+| `--audit-replace` | | off | Replace `--audit-output` instead of appending to it |
+| `--dry-run` | | off | Log without fetching/ingesting |
+| `--skip-known-non-music` | | off | Skip rows already known to fail the music/publisher medium gate, including non-`music` mediums and absent `podcast:medium` |
+| `--skip-known-success` | | off | Skip rows already known to have reached `accepted`, `no_change`, or `skipped_known_success` in importer memory |
+| `--wavlake-only` | | off | Restrict snapshot import to `wavlake.com` / `www.wavlake.com` feeds; without this flag, normal import excludes Wavlake rows |
+| `--cursor <id>` | | stored cursor | Start from an explicit PodcastIndex id instead of the stored cursor |
+
+The importer's `--dry-run` opens no fetch cache, so it never writes
+`feed_cache.db`.
 
 Progress is stored in `--state`. If the process is interrupted,
 the next run resumes from the last completed batch. A crash
@@ -435,18 +455,31 @@ feeds are periodically re-evaluated.
 
 #### Gossip options
 
-| Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--state <path>` | `./gossip_state.db` | Cursor and feed memory database |
-| `--skip-db <path>` | `./feed_skip.db` | Shared cross-mode skip database |
-| `--sse-url <url>` | `http://localhost:8089/events` | SSE endpoint URL |
-| `--archive-db <path>` | off | gossip-listener archive database path |
-| `--since-hours <n>` | off | Bootstrap from N hours ago (requires `--archive-db`) |
-| `--concurrency <n>` | `3` | Parallel fetch+ingest workers |
-| `--host-delay-ms <ms>` | `1500` | Minimum ms between fetches to the same host, for a follow fetch (ADR 0049 §2) |
-| `--skip-known-non-music` | off | Skip feeds proven non-music by prior crawl |
-| `--skip-ttl-days <n>` | off | Re-evaluate skip decisions after N days |
-| `-q, --quiet` | off | Hide non-music medium rejections |
+| Flag | Env | Default | Description |
+| ---- | --- | ------- | ----------- |
+| `--state <path>` | | `./gossip_state.db` | Cursor and feed memory database |
+| `--skip-db <path>` | | `./feed_skip.db` | Shared cross-mode skip database |
+| `--feed-cache <path>` | `FEED_CACHE_DB` | `./feed_cache.db` | Shared cross-mode fetch cache (ADR 0050) |
+| `--sse-url <url>` | | `http://localhost:8089/events` | SSE endpoint URL |
+| `--archive-db <path>` | | off | gossip-listener archive database path |
+| `--since-hours <n>` | | off | Bootstrap from N hours ago (requires `--archive-db`) |
+| `--concurrency <n>` | `CONCURRENCY` | `3` | Parallel fetch+ingest workers |
+| `--host-delay-ms <ms>` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host, for a follow fetch (ADR 0049 §2) |
+| `--skip-known-non-music` | | off | Skip feeds proven non-music by prior crawl |
+| `--skip-ttl-days <n>` | | off | Re-evaluate skip decisions after N days |
+| `-q, --quiet` | | off | Hide non-music medium rejections |
+
+### Fetch cache
+
+`feed`, `refresh`, `gossip`, and `import` share one cache file, `feed_cache.db`
+by default. The file holds the validators and the last body of each URL the
+crawler fetched. The crawler sends a conditional GET when the cache holds a
+row for that URL. A `304` answer skips the ingest POST when the node already
+holds that content.
+
+A forced pass still submits the kept body on a `304`. Pass `--no-revalidate`
+to send no conditional header, for a host that answers with an incorrect
+`ETag`. The `ndjson` mode does not fetch, so it has no `--feed-cache` flag.
 
 ## Environment variables
 
@@ -458,6 +491,9 @@ feeds are periodically re-evaluated.
 - **`FORCE_REINGEST`** --
   Force re-ingestion of feeds even if content has not changed.
   Set to `1` to enable. Can also be passed as `--force` flag at the top level.
+- **`FEED_CACHE_DB`** --
+  Path to the shared fetch cache (ADR 0050).
+  Default: `./feed_cache.db`. Not read by `ndjson` mode, which does not fetch.
 - **`CONCURRENCY`** --
   Worker pool size.
   Default: `5` (feed/import/refresh) / `3` (gossip)

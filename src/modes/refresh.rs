@@ -230,7 +230,18 @@ where
 /// Read the node's feed list from `GET /v1/feeds/recent`, then run the
 /// existing crawl pipeline over it through [`batch::run_urls`]. This is the
 /// `refresh` mode entry point.
-pub async fn run(concurrency: usize, host_delay_ms: u64, failed_feeds_output: String, force: bool) {
+///
+/// `feed_cache` and `revalidate` pass straight through to
+/// [`batch::run_urls`], which opens the shared fetch cache (ADR 0050 §1,
+/// `stophammer` repository) at that path.
+pub async fn run(
+    concurrency: usize,
+    host_delay_ms: u64,
+    failed_feeds_output: String,
+    force: bool,
+    feed_cache: String,
+    revalidate: bool,
+) {
     let ingest_url = ingest_url_from_env();
     let origin = match query_origin_from_ingest_url(&ingest_url) {
         Ok(origin) => origin,
@@ -252,7 +263,15 @@ pub async fn run(concurrency: usize, host_delay_ms: u64, failed_feeds_output: St
     };
 
     let run_pipeline = move |urls: Vec<String>| {
-        batch::run_urls(urls, concurrency, host_delay_ms, failed_feeds_output, force)
+        batch::run_urls(
+            urls,
+            concurrency,
+            host_delay_ms,
+            failed_feeds_output,
+            force,
+            feed_cache,
+            revalidate,
+        )
     };
 
     if let Err(err) = run_corrective_pass(fetch_page, run_pipeline).await {

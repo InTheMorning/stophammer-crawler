@@ -21,7 +21,8 @@ use stophammer_parser::types::{IngestFeedData, IngestPodcastNamespaceSnapshot};
 use tar::Archive;
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
-use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, crawl_feed_report};
+use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
+use crate::feed_cache::FeedCacheDb;
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
 
@@ -1610,6 +1611,8 @@ pub async fn run(
     dry_run: bool,
     cursor_override: Option<i64>,
     force: bool,
+    feed_cache_path: String,
+    revalidate: bool,
 ) {
     let scope = ImportScope::from_wavlake_only(wavlake_only);
     let audit_append = effective_audit_append(audit_replace, audit_output.as_deref());
@@ -1623,6 +1626,11 @@ pub async fn run(
     let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
         &skip_db_path,
     )));
+    // ADR 0050 §1 (`stophammer` repository): the dry run opens no cache and
+    // passes `None` at the fetch call, so a `--dry-run` pass creates no
+    // cache file on disk.
+    let cache: Option<FeedCache> =
+        (!dry_run).then(|| Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&feed_cache_path))));
     let state_writer = (!dry_run).then(|| ImportStateWriter::spawn(&state_path));
     let audit_writer = if dry_run {
         None
@@ -1688,8 +1696,9 @@ pub async fn run(
             "stophammer-crawler/0.1 (dry-run)",
             std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
         )
+        .with_revalidate(revalidate)
     } else {
-        let mut config = CrawlConfig::from_env_with_force(force);
+        let mut config = CrawlConfig::from_env_with_force(force).with_revalidate(revalidate);
         config.fetch_timeout = std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS);
         config
     });
@@ -1771,6 +1780,7 @@ pub async fn run(
                     let known_memory = Arc::clone(&known_memory);
                     let wavlake_throttle = wavlake_throttle.as_ref().map(Arc::clone);
                     let skip_db = Arc::clone(&skip_db);
+                    let cache = cache.clone();
                     move || async move {
                         let attempted_at = Utc::now().timestamp();
                         let task_started_at = Instant::now();
@@ -1825,11 +1835,9 @@ pub async fn run(
                             throttle.wait_for_turn(&row).await;
                         }
                         let fallback = row.podcast_guid.as_deref();
-                        // ADR 0050 task 003 (`stophammer` repository)
-                        // replaces this `None` with the shared fetch cache.
                         let report = if let Ok(report) = tokio::time::timeout(
                             Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
-                            crawl_feed_report(&client, &row.url, fallback, &config, None),
+                            crawl_feed_report(&client, &row.url, fallback, &config, cache.as_ref()),
                         )
                         .await
                         {

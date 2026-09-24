@@ -71,10 +71,6 @@ impl CrawlConfig {
     /// Change whether the crawler sends a conditional GET (ADR 0050 §5,
     /// `stophammer` repository).
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "ADR 0050 task 003 wires --no-revalidate to this method"
-    )]
     pub fn with_revalidate(mut self, revalidate: bool) -> Self {
         self.revalidate = revalidate;
         self

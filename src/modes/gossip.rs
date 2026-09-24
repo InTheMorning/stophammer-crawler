@@ -7,8 +7,9 @@ use rusqlite::{Connection, params};
 use std::sync::mpsc;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::crawl::{CrawlConfig, CrawlReport, crawl_feed_report};
+use crate::crawl::{CrawlConfig, CrawlReport, FeedCache, crawl_feed_report};
 use crate::dedup::Dedup;
+use crate::feed_cache::FeedCacheDb;
 use crate::follow::FollowLevel;
 use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
@@ -413,6 +414,7 @@ async fn process_notification_urls(
     follow_launches: &Arc<std::sync::Mutex<u64>>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: &FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -468,14 +470,13 @@ async fn process_notification_urls(
         let dedup = Arc::clone(dedup);
         let progress = Arc::clone(progress);
         let skip_db = Arc::clone(skip_db);
+        let cache = Arc::clone(cache);
         let audit_tx = audit_tx.cloned();
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let start = Instant::now();
-            // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
-            // with the shared fetch cache.
-            let report = crawl_feed_report(&client, &url, None, &config, None).await;
+            let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
             let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
             // ADR 0049 §2 (`stophammer` repository): read the follow URLs
@@ -523,6 +524,7 @@ async fn process_notification_urls(
                 &follow_launches,
                 &progress,
                 &skip_db,
+                &cache,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -565,6 +567,7 @@ fn spawn_follow_fetches<'a>(
     follow_launches: &'a Arc<std::sync::Mutex<u64>>,
     progress: &'a Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &'a Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: &'a FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -599,6 +602,7 @@ fn spawn_follow_fetches<'a>(
                         Arc::clone(follow_launches),
                         Arc::clone(progress),
                         Arc::clone(skip_db),
+                        Arc::clone(cache),
                         skip_known_non_music,
                         skip_ttl_days,
                         quiet,
@@ -613,6 +617,7 @@ fn spawn_follow_fetches<'a>(
                         Arc::clone(host_throttle),
                         Arc::clone(progress),
                         Arc::clone(skip_db),
+                        Arc::clone(cache),
                         quiet,
                     ));
                 }
@@ -701,6 +706,7 @@ async fn run_follow_fetch(
     follow_launches: Arc<std::sync::Mutex<u64>>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -708,9 +714,7 @@ async fn run_follow_fetch(
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
-    // with the shared fetch cache.
-    let report = crawl_feed_report(&client, &url, None, &config, None).await;
+    let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -737,6 +741,7 @@ async fn run_follow_fetch(
         &follow_launches,
         &progress,
         &skip_db,
+        &cache,
         skip_known_non_music,
         skip_ttl_days,
         quiet,
@@ -766,14 +771,13 @@ async fn run_leaf_follow_fetch(
     host_throttle: Arc<HostThrottle>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: FeedCache,
     quiet: bool,
 ) {
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
-    // with the shared fetch cache.
-    let report = crawl_feed_report(&client, &url, None, &config, None).await;
+    let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -939,6 +943,7 @@ async fn replay_from_archive(
     concurrency: usize,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: &FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -1076,6 +1081,7 @@ async fn replay_from_archive(
                 &follow_launches,
                 progress,
                 skip_db,
+                cache,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -1144,6 +1150,7 @@ async fn stream_sse_events(
     counters: &mut GossipCounters,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: &FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -1197,6 +1204,7 @@ async fn stream_sse_events(
                     follow_launches,
                     progress,
                     skip_db,
+                    cache,
                     skip_known_non_music,
                     skip_ttl_days,
                     quiet,
@@ -1224,6 +1232,7 @@ async fn reconcile_archive_batch(
     follow_sem: &Arc<Semaphore>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: &FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -1307,6 +1316,7 @@ async fn reconcile_archive_batch(
             &follow_launches,
             progress,
             skip_db,
+            cache,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -1345,6 +1355,7 @@ async fn archive_reconciliation_loop(
     follow_sem: Arc<Semaphore>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    cache: FeedCache,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -1365,6 +1376,7 @@ async fn archive_reconciliation_loop(
             &follow_sem,
             &progress,
             &skip_db,
+            &cache,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -1394,6 +1406,7 @@ async fn archive_reconciliation_loop(
 pub async fn run(
     state_path: String,
     skip_db_path: String,
+    feed_cache_path: String,
     sse_url: Option<String>,
     archive_db: Option<String>,
     since_hours: Option<u64>,
@@ -1403,12 +1416,13 @@ pub async fn run(
     skip_ttl_days: Option<u64>,
     quiet: bool,
     force: bool,
+    revalidate: bool,
     audit_output: Option<String>,
     audit_replace: bool,
 ) {
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
 
-    let config = Arc::new(CrawlConfig::from_env_with_force(force));
+    let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
     let client = Arc::new(create_async_client());
     let sem = Arc::new(Semaphore::new(concurrency));
     // ADR 0049 §2 (`stophammer` repository): one host throttle, shared by
@@ -1426,6 +1440,11 @@ pub async fn run(
     let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
         &skip_db_path,
     )));
+    // ADR 0050 §1 (`stophammer` repository): the shared fetch cache, opened
+    // once beside the skip database, and passed by reference to each of
+    // the three fetch call sites (the notification fetch, and the two
+    // follow-fetch levels).
+    let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&feed_cache_path)));
 
     let archive_cursor = progress_store.get_archive_cursor();
 
@@ -1554,6 +1573,7 @@ pub async fn run(
             concurrency,
             &progress,
             &skip_db,
+            &cache,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -1571,6 +1591,7 @@ pub async fn run(
         let recon_follow_sem = Arc::clone(&follow_sem);
         let recon_progress = Arc::clone(&progress);
         let recon_skip_db = Arc::clone(&skip_db);
+        let recon_cache = Arc::clone(&cache);
         let recon_audit_tx = audit_tx.clone();
         tokio::spawn(async move {
             archive_reconciliation_loop(
@@ -1583,6 +1604,7 @@ pub async fn run(
                 recon_follow_sem,
                 recon_progress,
                 recon_skip_db,
+                recon_cache,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,
@@ -1617,6 +1639,7 @@ pub async fn run(
             &mut session_counters,
             &progress,
             &skip_db,
+            &cache,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -1909,6 +1932,10 @@ mod tests {
         let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
             skip_db_path.to_str().expect("utf-8 path"),
         )));
+        let cache_path = tempdir.path().join("feed_cache.db");
+        let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(
+            cache_path.to_str().expect("utf-8 path"),
+        )));
         let dedup = Arc::new(Mutex::new(Dedup::new()));
         let client = Arc::new(create_async_client());
         let config = Arc::new(CrawlConfig::dry_run(
@@ -1937,6 +1964,7 @@ mod tests {
             1,
             &progress,
             &skip_db,
+            &cache,
             false,
             None,
             true,
@@ -2262,6 +2290,13 @@ mod tests {
                 .to_str()
                 .expect("utf-8 path"),
         )));
+        let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(
+            tempdir
+                .path()
+                .join("feed_cache.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
         let client = Arc::new(create_async_client());
         let config = Arc::new(CrawlConfig::dry_run(
             "stophammer-crawler/test",
@@ -2291,6 +2326,7 @@ mod tests {
             follow_launches,
             progress,
             skip_db,
+            cache,
             false,
             None,
             true,

@@ -96,13 +96,6 @@ impl FeedCacheDb {
     /// Open (or create) the shared fetch cache at `path`.
     /// Use WAL journal mode and a 5-second busy timeout, for safe
     /// concurrent access from more than one crawler process.
-    // Tests call `open` directly, so the expectation below applies only
-    // outside a test build. Outside a test build, no mode opens the cache
-    // yet. ADR 0050 task 003 wires that call.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "ADR 0050 task 003 opens the cache from each mode")
-    )]
     pub fn open(path: &str) -> Self {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
