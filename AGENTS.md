@@ -21,6 +21,14 @@ Accepted and implemented. The `refresh` mode in `src/modes/refresh.rs` takes
 its corpus from the feed list of the node. The index is what defines the feeds
 the node holds. The pass has run.
 
+[stophammer ADR 0049](../docs/adr/0049-publisher-relationships-are-rss-facts.md)
+is Accepted and implemented here. `feed` and `refresh` follow a publisher
+link, through `src/follow.rs` and `src/modes/batch.rs`. The walk has three
+waves: the input feeds, the feeds they name, and the album list of a
+publisher found through an album. `gossip` follows in two levels, in
+`src/modes/gossip.rs`, with its own follow semaphore and host throttle.
+Deployed on 2026-09-24.
+
 `FORCE_REINGEST` and `--force` stay global to a run. `src/crawl.rs:350` adds
 `force_reingest` to each `/ingest/feed` payload, whatever the mode. Thus a
 forced pass must use `refresh`, which reads only feeds the index holds. A
@@ -34,6 +42,8 @@ during a corrective pass.
 - **Five modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip` and
   `refresh`. `crawl` is an alias of `feed`. There is no `podping` mode. The
   `gossip` mode consumes the stream that carries podping notifications.
+- **`feed`, `refresh` and `gossip` follow a publisher link.** ADR 0049 section
+  2 owns the rule.
 - **The node owns the index.** Local SQLite holds progress and memory of
   attempts only.
 - Lints are `[lints.clippy] pedantic = "deny"` and nothing more.
