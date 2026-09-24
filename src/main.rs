@@ -1,5 +1,6 @@
 mod crawl;
 mod dedup;
+mod feed_cache;
 mod feed_skip;
 mod follow;
 mod modes;
