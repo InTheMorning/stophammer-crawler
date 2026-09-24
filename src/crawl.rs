@@ -572,18 +572,6 @@ pub async fn crawl_feed_report(
     .await
 }
 
-/// Fetch → SHA-256 → parse → POST. Never panics.
-pub async fn crawl_feed(
-    client: &reqwest::Client,
-    url: &str,
-    fallback_guid: Option<&str>,
-    config: &CrawlConfig,
-) -> CrawlOutcome {
-    crawl_feed_report(client, url, fallback_guid, config)
-        .await
-        .outcome
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

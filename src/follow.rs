@@ -1,0 +1,316 @@
+//! Finds the feed the crawler follows next after a publisher link.
+//!
+//! ADR 0049 §2 (in the `stophammer` repository) owns this decision. A music
+//! feed names its publisher feed. A publisher feed lists its music feeds.
+//! [`follow_urls`] gives the URLs on the other side of that link, for one
+//! feed. It reads only channel-level `podcast:remoteItem` references; an
+//! item-level reference, on a track, never comes back.
+
+use std::collections::HashSet;
+
+use stophammer_parser::types::IngestFeedData;
+
+/// Gives the follow URLs of `feed`.
+///
+/// A feed whose `raw_medium` is `music`, ignoring ASCII case, gives the
+/// `remote_feed_url` of each channel-level remote item whose `medium` is
+/// `publisher`. A feed whose `raw_medium` is `publisher` gives the
+/// `remote_feed_url` of each channel-level remote item whose `medium` is
+/// `music`. Any other medium, including none, gives nothing.
+///
+/// An item's own `medium` comparison also ignores ASCII case, so
+/// `medium="Music"` counts. An item with no URL, or a URL whose scheme is
+/// not `http` or `https`, is skipped. The URL is never changed, and none is
+/// made from a GUID. Duplicates are removed; the first position is kept.
+#[must_use]
+pub fn follow_urls(feed: &IngestFeedData) -> Vec<String> {
+    let target_medium = match feed.raw_medium.as_deref() {
+        Some(medium) if medium.eq_ignore_ascii_case("music") => "publisher",
+        Some(medium) if medium.eq_ignore_ascii_case("publisher") => "music",
+        _ => return Vec::new(),
+    };
+
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+
+    for item in &feed.remote_items {
+        let Some(medium) = item.medium.as_deref() else {
+            continue;
+        };
+        if !medium.eq_ignore_ascii_case(target_medium) {
+            continue;
+        }
+        let Some(url) = item.remote_feed_url.as_deref() else {
+            continue;
+        };
+        if !is_followable_url(url) {
+            continue;
+        }
+        if seen.insert(url.to_string()) {
+            urls.push(url.to_string());
+        }
+    }
+
+    urls
+}
+
+/// Returns `true` for a URL whose scheme is `http` or `https`.
+fn is_followable_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+#[cfg(test)]
+mod tests {
+    use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef, IngestTrackData};
+
+    use super::follow_urls;
+
+    fn remote_item(position: i64, medium: Option<&str>, url: Option<&str>) -> IngestRemoteFeedRef {
+        IngestRemoteFeedRef {
+            position,
+            medium: medium.map(ToString::to_string),
+            remote_feed_guid: format!("guid-{position}"),
+            remote_feed_url: url.map(ToString::to_string),
+            rel: None,
+        }
+    }
+
+    fn feed(raw_medium: Option<&str>, remote_items: Vec<IngestRemoteFeedRef>) -> IngestFeedData {
+        IngestFeedData {
+            feed_guid: "feed-guid".to_string(),
+            title: "Feed".to_string(),
+            description: None,
+            image_url: None,
+            language: None,
+            explicit: false,
+            itunes_type: None,
+            raw_medium: raw_medium.map(ToString::to_string),
+            author_name: None,
+            owner_name: None,
+            pub_date: None,
+            last_build_date: None,
+            remote_items,
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            podcast_namespace: None,
+            feed_payment_routes: Vec::new(),
+            live_items: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
+
+    fn empty_track_with_remote_items(remote_items: Vec<IngestRemoteFeedRef>) -> IngestTrackData {
+        IngestTrackData {
+            track_guid: "track-guid".to_string(),
+            title: "Track".to_string(),
+            pub_date: None,
+            duration_secs: None,
+            image_url: None,
+            language: None,
+            enclosure_url: None,
+            enclosure_type: None,
+            enclosure_bytes: None,
+            alternate_enclosures: Vec::new(),
+            track_number: None,
+            season: None,
+            explicit: false,
+            description: None,
+            author_name: None,
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            payment_routes: Vec::new(),
+            value_time_splits: Vec::new(),
+            transcripts: Vec::new(),
+            remote_items,
+        }
+    }
+
+    #[test]
+    fn a_music_feed_gives_its_publisher_url() {
+        let data = feed(
+            Some("music"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            vec!["https://publisher.example/feed.xml".to_string()],
+            "a music feed must give the URL of its publisher item"
+        );
+    }
+
+    #[test]
+    fn a_publisher_feed_gives_its_music_urls() {
+        let data = feed(
+            Some("publisher"),
+            vec![
+                remote_item(0, Some("music"), Some("https://a.example/feed.xml")),
+                remote_item(1, Some("music"), Some("https://b.example/feed.xml")),
+            ],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            vec![
+                "https://a.example/feed.xml".to_string(),
+                "https://b.example/feed.xml".to_string(),
+            ],
+            "a publisher feed must give the URL of each music item"
+        );
+    }
+
+    #[test]
+    fn the_feed_medium_comparison_ignores_ascii_case() {
+        let data = feed(
+            Some("MUSIC"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            vec!["https://publisher.example/feed.xml".to_string()],
+            "raw_medium comparison must ignore ASCII case"
+        );
+    }
+
+    #[test]
+    fn an_item_medium_of_music_counts() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(
+                0,
+                Some("Music"),
+                Some("https://a.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            vec!["https://a.example/feed.xml".to_string()],
+            "medium=\"Music\" must count, since the comparison ignores ASCII case"
+        );
+    }
+
+    #[test]
+    fn a_medium_l_feed_gives_nothing() {
+        let data = feed(
+            Some("musicL"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "a musicL feed is a different medium and must give nothing"
+        );
+    }
+
+    #[test]
+    fn a_feed_with_no_medium_gives_nothing() {
+        let data = feed(
+            None,
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "a feed with no medium must give nothing"
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_url_is_skipped() {
+        let data = feed(Some("music"), vec![remote_item(0, Some("publisher"), None)]);
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "an item with no URL must be skipped, not turned into a URL from its GUID"
+        );
+    }
+
+    #[test]
+    fn an_ftp_url_is_skipped() {
+        let data = feed(
+            Some("music"),
+            vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("ftp://publisher.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "a non-http(s) URL must be skipped"
+        );
+    }
+
+    #[test]
+    fn duplicates_give_one_url() {
+        let data = feed(
+            Some("publisher"),
+            vec![
+                remote_item(0, Some("music"), Some("https://a.example/feed.xml")),
+                remote_item(1, Some("music"), Some("https://a.example/feed.xml")),
+            ],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            vec!["https://a.example/feed.xml".to_string()],
+            "a duplicate URL must give one entry, keeping the first position"
+        );
+    }
+
+    #[test]
+    fn a_publisher_item_with_no_medium_is_not_followed() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(0, None, Some("https://a.example/feed.xml"))],
+        );
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "a remote item with no medium is not a listed album and must not be followed"
+        );
+    }
+
+    #[test]
+    fn an_item_level_remote_item_on_a_track_is_not_followed() {
+        let mut data = feed(Some("music"), Vec::new());
+        data.tracks
+            .push(empty_track_with_remote_items(vec![remote_item(
+                0,
+                Some("publisher"),
+                Some("https://publisher.example/feed.xml"),
+            )]));
+
+        assert_eq!(
+            follow_urls(&data),
+            Vec::<String>::new(),
+            "an item-level remote item, on a track, must not be followed"
+        );
+    }
+}

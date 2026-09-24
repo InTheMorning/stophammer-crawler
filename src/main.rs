@@ -1,6 +1,7 @@
 mod crawl;
 mod dedup;
 mod feed_skip;
+mod follow;
 mod modes;
 mod pool;
 mod url_queue;
