@@ -473,7 +473,9 @@ async fn process_notification_urls(
         tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let start = Instant::now();
-            let report = crawl_feed_report(&client, &url, None, &config).await;
+            // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
+            // with the shared fetch cache.
+            let report = crawl_feed_report(&client, &url, None, &config, None).await;
             let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
             // ADR 0049 §2 (`stophammer` repository): read the follow URLs
@@ -706,7 +708,9 @@ async fn run_follow_fetch(
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    let report = crawl_feed_report(&client, &url, None, &config).await;
+    // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
+    // with the shared fetch cache.
+    let report = crawl_feed_report(&client, &url, None, &config, None).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -767,7 +771,9 @@ async fn run_leaf_follow_fetch(
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    let report = crawl_feed_report(&client, &url, None, &config).await;
+    // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
+    // with the shared fetch cache.
+    let report = crawl_feed_report(&client, &url, None, &config, None).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 

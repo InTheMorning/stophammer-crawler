@@ -1,11 +1,23 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{
+    ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER,
+};
 use sha2::{Digest, Sha256};
 use stophammer_parser::profile;
 use stophammer_parser::types::IngestFeedData;
 
+use crate::feed_cache::{CachedFeed, FeedCacheDb, FetchedFeed, unix_now};
+
 const HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
+
+/// Shared fetch cache handle (ADR 0050 §1, `stophammer` repository).
+///
+/// A mode opens one `FeedCacheDb` and shares this handle with every task
+/// that fetches a feed. Each use of the store takes the lock for one call
+/// only, and releases it before any `.await`.
+pub type FeedCache = Arc<Mutex<FeedCacheDb>>;
 
 /// Configuration shared by all crawl modes.
 pub struct CrawlConfig {
@@ -16,6 +28,10 @@ pub struct CrawlConfig {
     pub ingest_timeout: Duration,
     /// When true, the ingest server skips the content-hash dedup check.
     pub force_reingest: bool,
+    /// When true, the crawler sends a conditional GET for a URL the cache
+    /// already holds (ADR 0050 §2 and §5, `stophammer` repository). A pass
+    /// with `--no-revalidate` sets this to `false`.
+    pub revalidate: bool,
     /// Dedicated HTTP client for ingest POSTs, built with connection pooling
     /// disabled so stale keep-alive sockets never cause spurious failures.
     ingest_client: reqwest::Client,
@@ -32,6 +48,7 @@ impl CrawlConfig {
             fetch_timeout: Duration::from_secs(20),
             ingest_timeout,
             force_reingest,
+            revalidate: true,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -46,8 +63,21 @@ impl CrawlConfig {
             fetch_timeout,
             ingest_timeout,
             force_reingest: false,
+            revalidate: true,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
+    }
+
+    /// Change whether the crawler sends a conditional GET (ADR 0050 §5,
+    /// `stophammer` repository).
+    #[must_use]
+    #[expect(
+        dead_code,
+        reason = "ADR 0050 task 003 wires --no-revalidate to this method"
+    )]
+    pub fn with_revalidate(mut self, revalidate: bool) -> Self {
+        self.revalidate = revalidate;
+        self
     }
 
     fn build_ingest_client(timeout: Duration) -> reqwest::Client {
@@ -487,14 +517,163 @@ pub async fn ingest_cached_feed(
     .outcome
 }
 
-/// Fetch → SHA-256 → parse → POST. Never panics.
-pub async fn crawl_feed_report(
+/// The action to take after a fetch response (ADR 0050 §3, `stophammer`
+/// repository).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchAction {
+    /// A `200` body. Parse it, POST it, and cache it.
+    IngestFresh,
+    /// A `304` this crawl must still submit: a forced pass, or a row whose
+    /// last node answer does not prove the node holds the content.
+    IngestKept,
+    /// A `304` the node has already seen and answered. No POST.
+    SkipIngest,
+    /// A `304` with no kept body to trust. Fetch once more, unconditionally.
+    RefetchUnconditional,
+    /// Any other status. As today: a retryable or a final fetch error.
+    FetchError,
+}
+
+/// Decide what a fetch response means, from ADR 0050 §3 (`stophammer`
+/// repository). A pure function: it reads no clock and no store.
+fn plan_after_response(status: u16, cached: Option<&CachedFeed>, force: bool) -> FetchAction {
+    if status == 200 {
+        return FetchAction::IngestFresh;
+    }
+    if status != 304 {
+        return FetchAction::FetchError;
+    }
+
+    let Some(cached) = cached else {
+        return FetchAction::RefetchUnconditional;
+    };
+
+    if force {
+        return FetchAction::IngestKept;
+    }
+
+    match cached.node_answer.as_deref() {
+        Some("accepted" | "no_change" | "rejected" | "parse_error") => FetchAction::SkipIngest,
+        // A null answer, or `ingest_error`, means the node does not yet
+        // hold this content. Submit the kept body so it does.
+        None | Some(_) => FetchAction::IngestKept,
+    }
+}
+
+/// Read one header's value as owned text, when it is present and valid
+/// UTF-8.
+fn header_str(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Read the cached row for `url`, if a cache is given (ADR 0050 §2,
+/// `stophammer` repository). A poisoned lock counts as no row. It does not
+/// panic the crawl.
+fn read_cached_row(cache: Option<&FeedCache>, url: &str) -> Option<CachedFeed> {
+    let cache = cache?;
+    match cache.lock() {
+        Ok(guard) => guard.get(url),
+        Err(e) => {
+            eprintln!("crawl: WARNING: feed cache lock poisoned; treating {url} as uncached: {e}");
+            None
+        }
+    }
+}
+
+/// Write a fresh cache row, then record the node's answer for it. Each
+/// step takes its own lock, and neither is held across an `.await` (ADR
+/// 0050 §2, `stophammer` repository). A poisoned lock skips that one
+/// write. It does not panic the crawl.
+fn write_cache_row(
+    cache: &FeedCache,
+    url: &str,
+    entry: &FetchedFeed<'_>,
+    label: &str,
+    reason: Option<&str>,
+    at: i64,
+) {
+    match cache.lock() {
+        Ok(guard) => guard.put(url, entry),
+        Err(e) => {
+            eprintln!(
+                "crawl: WARNING: feed cache lock poisoned; skipped writing cache row for {url}: {e}"
+            );
+        }
+    }
+    match cache.lock() {
+        Ok(guard) => guard.record_node_answer(url, label, reason, at),
+        Err(e) => {
+            eprintln!(
+                "crawl: WARNING: feed cache lock poisoned; skipped recording node answer for {url}: {e}"
+            );
+        }
+    }
+}
+
+/// Parse, POST, and cache a freshly fetched `200` body (ADR 0050 §3,
+/// `stophammer` repository).
+async fn ingest_fresh_and_cache(
+    url: &str,
+    final_url: Option<String>,
+    headers: &HeaderMap,
+    body: &[u8],
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    cache: Option<&FeedCache>,
+) -> CrawlReport {
+    let hash = hex::encode(Sha256::digest(body));
+    let xml = String::from_utf8_lossy(body);
+    let canonical_url = final_url.as_deref().unwrap_or(url);
+
+    let report = ingest_cached_feed_report(
+        url,
+        canonical_url,
+        200,
+        &xml,
+        Some(&hash),
+        fallback_guid,
+        config,
+    )
+    .await;
+
+    if let Some(cache) = cache {
+        let etag = header_str(headers, ETAG);
+        let last_modified = header_str(headers, LAST_MODIFIED);
+        let fetched_at = unix_now();
+        let entry = FetchedFeed {
+            final_url: canonical_url,
+            etag: etag.as_deref(),
+            last_modified: last_modified.as_deref(),
+            content_sha256: &hash,
+            body: &xml,
+            fetched_at,
+        };
+        write_cache_row(
+            cache,
+            url,
+            &entry,
+            report.outcome.label(),
+            report.outcome.reason(),
+            fetched_at,
+        );
+    }
+
+    report
+}
+
+/// Fetch a URL with no conditional header, after a `304` this crawl cannot
+/// trust (ADR 0050 §3, `stophammer` repository). Sends exactly one more
+/// GET, then continues as for `200`. Never loops.
+async fn refetch_unconditional(
     client: &reqwest::Client,
     url: &str,
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
+    cache: Option<&FeedCache>,
 ) -> CrawlReport {
-    // 1. Fetch
     let resp = match client
         .get(url)
         .header("User-Agent", &config.user_agent)
@@ -556,33 +735,226 @@ pub async fn crawl_feed_report(
         );
     }
 
-    // 2. SHA-256 hash of raw bytes
-    let hash = hex::encode(Sha256::digest(&body));
-    let xml = String::from_utf8_lossy(&body);
-
-    ingest_cached_feed_report(
+    ingest_fresh_and_cache(
         url,
-        final_url.as_deref().unwrap_or(url),
-        status,
-        &xml,
-        Some(&hash),
+        final_url,
+        &headers,
+        &body,
+        fallback_guid,
+        config,
+        cache,
+    )
+    .await
+}
+
+/// Submit the kept body for a `304` that must still reach the node (ADR
+/// 0050 §3, `stophammer` repository): a forced pass, or a row whose last
+/// answer does not prove the node holds this content.
+async fn ingest_kept_body(
+    url: &str,
+    cached: &CachedFeed,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    cache: Option<&FeedCache>,
+) -> CrawlReport {
+    let mut report = ingest_cached_feed_report(
+        url,
+        &cached.final_url,
+        200,
+        &cached.body,
+        Some(&cached.content_sha256),
         fallback_guid,
         config,
     )
-    .await
+    .await;
+    // The node saw an ingest, but the crawler's own fetch answered `304`.
+    report.fetch_http_status = Some(304);
+
+    if let Some(cache) = cache {
+        let at = unix_now();
+        match cache.lock() {
+            Ok(guard) => {
+                guard.record_node_answer(url, report.outcome.label(), report.outcome.reason(), at);
+            }
+            Err(e) => {
+                eprintln!(
+                    "crawl: WARNING: feed cache lock poisoned; skipped recording node answer for {url}: {e}"
+                );
+            }
+        }
+    }
+
+    report
+}
+
+/// Build a `NoChange` report from the kept body, with no ingest POST (ADR
+/// 0050 §3, `stophammer` repository). The node has already answered for
+/// this content.
+fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) -> CrawlReport {
+    let feed_data = match parse_feed_xml(&cached.body, fallback_guid) {
+        Ok(data) => data,
+        Err(e) => {
+            return build_crawl_report(
+                CrawlOutcome::ParseError(e),
+                Some(304),
+                None,
+                Some(cached.final_url.clone()),
+                Some(cached.content_sha256.clone()),
+                Some(cached.body.clone()),
+            );
+        }
+    };
+
+    build_crawl_report(
+        CrawlOutcome::NoChange,
+        Some(304),
+        feed_data.as_ref(),
+        Some(cached.final_url.clone()),
+        Some(cached.content_sha256.clone()),
+        Some(cached.body.clone()),
+    )
+}
+
+/// Fetch → SHA-256 → parse → POST. Never panics.
+///
+/// With `cache: None`, this behaves exactly as it did before ADR 0050
+/// (`stophammer` repository). With a cache, it sends a conditional GET for
+/// a URL the cache already holds, and follows `plan_after_response` for
+/// the answer.
+pub async fn crawl_feed_report(
+    client: &reqwest::Client,
+    url: &str,
+    fallback_guid: Option<&str>,
+    config: &CrawlConfig,
+    cache: Option<&FeedCache>,
+) -> CrawlReport {
+    // Read the cached row before the request, and release the lock right
+    // away. No lock is held across an `.await` (ADR 0050 §2, `stophammer`
+    // repository).
+    let cached = read_cached_row(cache, url);
+    let send_conditional = config.revalidate && cached.is_some();
+
+    // 1. Fetch
+    let mut request = client
+        .get(url)
+        .header("User-Agent", &config.user_agent)
+        .timeout(config.fetch_timeout);
+    if send_conditional {
+        let row = cached
+            .as_ref()
+            .expect("send_conditional is true only when a cached row exists");
+        if let Some(etag) = &row.etag {
+            request = request.header(IF_NONE_MATCH, etag.as_str());
+        }
+        if let Some(last_modified) = &row.last_modified {
+            request = request.header(IF_MODIFIED_SINCE, last_modified.as_str());
+        }
+    }
+
+    let resp = match request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return build_crawl_report(
+                CrawlOutcome::FetchError {
+                    reason: e.to_string(),
+                    retryable: true,
+                    retry_after_secs: None,
+                },
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let final_url = Some(resp.url().to_string());
+    let headers = resp.headers().clone();
+
+    let body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return build_crawl_report(
+                CrawlOutcome::FetchError {
+                    reason: e.to_string(),
+                    retryable: true,
+                    retry_after_secs: None,
+                },
+                Some(status),
+                None,
+                final_url,
+                None,
+                None,
+            );
+        }
+    };
+
+    match plan_after_response(status, cached.as_ref(), config.force_reingest) {
+        FetchAction::IngestFresh => {
+            ingest_fresh_and_cache(
+                url,
+                final_url,
+                &headers,
+                &body,
+                fallback_guid,
+                config,
+                cache,
+            )
+            .await
+        }
+        // A `304` to a request with no conditional header is a server
+        // fault. Report it as before ADR 0050. Only a conditional request
+        // earns the one unconditional refetch.
+        FetchAction::RefetchUnconditional if send_conditional => {
+            refetch_unconditional(client, url, fallback_guid, config, cache).await
+        }
+        FetchAction::IngestKept => {
+            let row = cached
+                .as_ref()
+                .expect("plan_after_response gives IngestKept only with a cached row");
+            ingest_kept_body(url, row, fallback_guid, config, cache).await
+        }
+        FetchAction::SkipIngest => {
+            let row = cached
+                .as_ref()
+                .expect("plan_after_response gives SkipIngest only with a cached row");
+            skip_ingest_with_kept_body(row, fallback_guid)
+        }
+        FetchAction::FetchError | FetchAction::RefetchUnconditional => build_crawl_report(
+            CrawlOutcome::FetchError {
+                reason: format_http_fetch_error(status, &headers, &body),
+                retryable: is_retryable_http_status(status),
+                retry_after_secs: parse_retry_after_secs(&headers),
+            },
+            Some(status),
+            None,
+            final_url,
+            None,
+            None,
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CrawlOutcome, body_preview, build_crawl_report, format_http_fetch_error,
-        format_ingest_http_error, is_retryable_http_status, is_retryable_ingest_status,
-        normalize_rejection_reason, parse_feed_xml,
+        CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, body_preview,
+        build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
+        is_retryable_http_status, is_retryable_ingest_status, normalize_rejection_reason,
+        parse_feed_xml, plan_after_response,
     };
+    use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use sha2::Digest;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use stophammer_parser::types::IngestFeedData;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn sample_feed_data() -> IngestFeedData {
         IngestFeedData {
@@ -778,5 +1150,562 @@ mod tests {
         assert_eq!(report.fetch_http_status, Some(200));
         assert_eq!(report.raw_medium, None);
         assert_eq!(report.outcome.reason(), Some("invalid xml"));
+    }
+
+    // ---- `plan_after_response`: one test for each ADR 0050 §3 rule ----
+
+    fn cached_with_answer(node_answer: Option<&str>) -> CachedFeed {
+        CachedFeed {
+            url: "https://example.com/feed.xml".to_string(),
+            final_url: "https://example.com/feed.xml".to_string(),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: None,
+            content_sha256: "deadbeef".to_string(),
+            body: "<rss/>".to_string(),
+            fetched_at: 0,
+            node_answer: node_answer.map(ToOwned::to_owned),
+            node_reason: None,
+            answered_at: None,
+        }
+    }
+
+    #[test]
+    fn plan_after_response_200_is_always_ingest_fresh() {
+        assert_eq!(
+            plan_after_response(200, None, false),
+            FetchAction::IngestFresh
+        );
+        let cached = cached_with_answer(Some("accepted"));
+        assert_eq!(
+            plan_after_response(200, Some(&cached), true),
+            FetchAction::IngestFresh,
+            "a 200 body is always fresh, even with a cached row and force set"
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_with_force_ingests_kept_body() {
+        let cached = cached_with_answer(Some("accepted"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), true),
+            FetchAction::IngestKept,
+            "a force pass must submit the kept body on a 304"
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_accepted_skips_ingest() {
+        let cached = cached_with_answer(Some("accepted"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::SkipIngest
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_no_change_skips_ingest() {
+        let cached = cached_with_answer(Some("no_change"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::SkipIngest
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_rejected_skips_ingest() {
+        let cached = cached_with_answer(Some("rejected"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::SkipIngest
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_parse_error_skips_ingest() {
+        let cached = cached_with_answer(Some("parse_error"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::SkipIngest
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_null_answer_ingests_kept_body() {
+        let cached = cached_with_answer(None);
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::IngestKept,
+            "a null node answer means the node may not hold this content yet"
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_no_force_ingest_error_ingests_kept_body() {
+        let cached = cached_with_answer(Some("ingest_error"));
+        assert_eq!(
+            plan_after_response(304, Some(&cached), false),
+            FetchAction::IngestKept,
+            "an ingest_error answer means the node does not hold this content"
+        );
+    }
+
+    #[test]
+    fn plan_after_response_304_with_no_kept_body_refetches_unconditionally() {
+        assert_eq!(
+            plan_after_response(304, None, false),
+            FetchAction::RefetchUnconditional
+        );
+        assert_eq!(
+            plan_after_response(304, None, true),
+            FetchAction::RefetchUnconditional,
+            "a force pass with no kept body still cannot trust the 304"
+        );
+    }
+
+    #[test]
+    fn plan_after_response_other_status_is_fetch_error() {
+        assert_eq!(
+            plan_after_response(429, None, false),
+            FetchAction::FetchError
+        );
+        let cached = cached_with_answer(Some("accepted"));
+        assert_eq!(
+            plan_after_response(500, Some(&cached), false),
+            FetchAction::FetchError
+        );
+    }
+
+    // ---- stub-server tests for `crawl_feed_report` ----
+    //
+    // Each stub is a plain TCP listener on `127.0.0.1`. It reads one
+    // request head (and body, for a POST), then writes back a fixed
+    // HTTP/1.1 response with `Content-Length` and `Connection: close`. No
+    // test sends a request to an external host.
+
+    /// One HTTP/1.1 request, captured from a stub connection.
+    struct StubRequest {
+        method: String,
+        body: Vec<u8>,
+        headers: HashMap<String, String>,
+    }
+
+    impl StubRequest {
+        /// Read one header's value, by a case-insensitive name.
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .get(&name.to_ascii_lowercase())
+                .map(String::as_str)
+        }
+    }
+
+    /// Read one HTTP/1.1 request head and body from `stream`.
+    async fn read_stub_request(stream: &mut TcpStream) -> StubRequest {
+        let mut reader = BufReader::new(stream);
+
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .await
+            .expect("read stub request line");
+        let method = request_line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read stub header line");
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 {
+            reader
+                .read_exact(&mut body)
+                .await
+                .expect("read stub request body");
+        }
+
+        StubRequest {
+            method,
+            body,
+            headers,
+        }
+    }
+
+    /// Build a fixed HTTP/1.1 response, with `Content-Length` and
+    /// `Connection: close` set from `body`.
+    fn stub_response(status_line: &str, extra_headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut head = format!("{status_line}\r\n");
+        for (name, value) in extra_headers {
+            let _ = writeln!(head, "{name}: {value}\r");
+        }
+        let _ = writeln!(head, "content-length: {}\r", body.len());
+        head.push_str("connection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Start a stub HTTP/1.1 server, on `127.0.0.1`, for exactly one
+    /// request. It answers with `response`, then gives the captured
+    /// request back through the returned handle.
+    async fn spawn_stub(response: Vec<u8>) -> (String, tokio::task::JoinHandle<StubRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept stub connection");
+            let request = read_stub_request(&mut stream).await;
+            stream
+                .write_all(&response)
+                .await
+                .expect("write stub response");
+            let _ = stream.shutdown().await;
+            request
+        });
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// A fresh, empty fetch-cache database, at a temporary path that
+    /// outlives the test.
+    fn test_cache() -> FeedCache {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("feed_cache.db");
+        let path = path.to_str().expect("path is valid UTF-8").to_string();
+        // Leak so the directory survives the test.
+        std::mem::forget(dir);
+        Arc::new(Mutex::new(FeedCacheDb::open(&path)))
+    }
+
+    /// A `CrawlConfig` for a stub test. Never reads the environment.
+    fn test_config(ingest_url: String) -> CrawlConfig {
+        let mut config =
+            CrawlConfig::dry_run("stophammer-crawler-test/1.0", Duration::from_secs(5));
+        config.ingest_url = ingest_url;
+        config
+    }
+
+    /// A minimal feed that `parse_feed_xml` turns into `Some(..)`.
+    const KEPT_BODY: &str = r#"<?xml version="1.0"?>
+<rss xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>Cached Feed</title>
+    <podcast:guid>cached-feed-guid</podcast:guid>
+    <podcast:medium>music</podcast:medium>
+  </channel>
+</rss>"#;
+
+    fn kept_body_hash() -> String {
+        hex::encode(sha2::Sha256::digest(KEPT_BODY.as_bytes()))
+    }
+
+    /// Seed a cache row for `url`, with the kept body and its hash. Also
+    /// record `node_answer`, when one is given.
+    fn seed_cached_row(cache: &FeedCache, url: &str, node_answer: Option<&str>) {
+        let db = cache.lock().expect("cache lock");
+        db.put(
+            url,
+            &FetchedFeed {
+                final_url: url,
+                etag: Some("\"v1\""),
+                last_modified: None,
+                content_sha256: &kept_body_hash(),
+                body: KEPT_BODY,
+                fetched_at: 0,
+            },
+        );
+        if let Some(node_answer) = node_answer {
+            db.record_node_answer(url, node_answer, None, 0);
+        }
+    }
+
+    /// Proves ADR 0050 §3 (`stophammer` repository), the `200` row: a `200`
+    /// still parses and POSTs the body, and now also writes the cache row
+    /// with the response's `ETag`, the body hash, and the node's answer.
+    #[tokio::test]
+    async fn stub_200_caches_the_row_and_posts_the_ingest() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(feed_request.method, "GET");
+        assert_eq!(
+            ingest_request.method, "POST",
+            "a 200 fetch must still POST the ingest, as before ADR 0050"
+        );
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            }
+        );
+        assert_eq!(report.fetch_http_status, Some(200));
+
+        let expected_hash = hex::encode(sha2::Sha256::digest(body));
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 200 fetch must write a cache row");
+        assert_eq!(cached.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(cached.content_sha256, expected_hash);
+        assert_eq!(
+            cached.node_answer.as_deref(),
+            Some("accepted"),
+            "the row must carry the node's answer to the fresh submission"
+        );
+    }
+
+    /// Proves ADR 0050 §3 (`stophammer` repository), the `304` normal row:
+    /// the crawler sends the stored `ETag`, and a `304` from a row the node
+    /// already answered sends no ingest.
+    #[tokio::test]
+    async fn stub_304_normal_skips_ingest_and_reports_no_change() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let client = reqwest::Client::new();
+        // No ingest stub: a SkipIngest report must send no POST.
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        assert_eq!(
+            feed_request.header("if-none-match"),
+            Some("\"v1\""),
+            "the request must carry the stored ETag"
+        );
+
+        assert_eq!(report.outcome, CrawlOutcome::NoChange);
+        assert_eq!(report.fetch_http_status, Some(304));
+        assert!(
+            report.parsed_feed.is_some(),
+            "a SkipIngest report must still carry the parsed feed"
+        );
+    }
+
+    /// Proves ADR 0050 §3 (`stophammer` repository), the `304` force row: a
+    /// forced pass submits the kept body, with its kept hash, and updates
+    /// the row's node answer.
+    #[tokio::test]
+    async fn stub_304_force_ingests_kept_body_and_updates_the_answer() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        config.force_reingest = true;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+        feed_handle.await.expect("feed stub task");
+
+        assert_eq!(ingest_request.method, "POST");
+        let ingest_body: serde_json::Value =
+            serde_json::from_slice(&ingest_request.body).expect("ingest body is JSON");
+        assert_eq!(
+            ingest_body["content_hash"].as_str(),
+            Some(kept_body_hash().as_str()),
+            "a forced pass must submit the kept body's hash"
+        );
+
+        assert_eq!(report.fetch_http_status, Some(304));
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            }
+        );
+
+        let updated = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("row must still exist");
+        assert_eq!(
+            updated.node_answer.as_deref(),
+            Some("accepted"),
+            "the row's answer must be updated after the forced submission"
+        );
+    }
+
+    /// Proves ADR 0050 §3 (`stophammer` repository), the `304` null-answer
+    /// row: a row the node has never answered still needs an ingest.
+    #[tokio::test]
+    async fn stub_304_with_null_answer_ingests_the_kept_body() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        // No `record_node_answer` call: the row's answer stays null.
+        seed_cached_row(&cache, &feed_url, None);
+
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+        feed_handle.await.expect("feed stub task");
+
+        assert_eq!(
+            ingest_request.method, "POST",
+            "a null node answer means the node may not hold this content yet"
+        );
+        assert_eq!(report.fetch_http_status, Some(304));
+    }
+
+    /// Proves ADR 0050 §3 (`stophammer` repository), the `429` row: any
+    /// other status behaves as it did before ADR 0050, and writes no row.
+    #[tokio::test]
+    async fn stub_429_is_a_retryable_fetch_error_and_the_row_is_unchanged() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 429 Too Many Requests",
+            &[],
+            b"slow down",
+        ))
+        .await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        feed_handle.await.expect("feed stub task");
+
+        match &report.outcome {
+            CrawlOutcome::FetchError { retryable, .. } => {
+                assert!(*retryable, "a 429 must be a retryable fetch error");
+            }
+            other => panic!("expected a retryable FetchError, got {other:?}"),
+        }
+        assert_eq!(report.fetch_http_status, Some(429));
+        assert_eq!(
+            cache.lock().expect("cache lock").get(&feed_url),
+            None,
+            "a non-200/304 status must not write a cache row"
+        );
+    }
+
+    /// With no cache, a `304` stays a fetch error, as before ADR 0050
+    /// (`stophammer` repository). The crawler sends no second GET: the stub
+    /// accepts one connection, and a second one would fail and give a
+    /// report with no status.
+    #[tokio::test]
+    async fn stub_304_with_no_cache_is_a_fetch_error_and_sends_one_request() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let request = feed_handle.await.expect("feed stub task");
+
+        assert!(
+            !request.headers.contains_key("if-none-match"),
+            "a request with no cache must carry no conditional header"
+        );
+        assert!(
+            matches!(report.outcome, CrawlOutcome::FetchError { .. }),
+            "a 304 to an unconditional request must be a FetchError, got {:?}",
+            report.outcome
+        );
+        assert_eq!(
+            report.fetch_http_status,
+            Some(304),
+            "the report must carry the status of the one request that was sent"
+        );
+    }
+
+    /// Proves ADR 0050 §5 (`stophammer` repository): `revalidate = false`
+    /// sends no conditional header, even when the cache holds a row.
+    #[tokio::test]
+    async fn stub_revalidate_false_sends_no_conditional_header() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(String::new());
+        config.revalidate = false;
+
+        let _report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        assert_eq!(
+            feed_request.header("if-none-match"),
+            None,
+            "revalidate = false must send no conditional header"
+        );
     }
 }

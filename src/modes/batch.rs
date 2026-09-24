@@ -159,7 +159,9 @@ async fn crawl_feed_with_retries(
 
     loop {
         let lease = host_throttle.acquire(url).await;
-        let report = crawl_feed_report(client, url, None, config).await;
+        // ADR 0050 task 003 (`stophammer` repository) replaces this `None`
+        // with the shared fetch cache.
+        let report = crawl_feed_report(client, url, None, config, None).await;
         let delay = report
             .outcome
             .retry_delay(attempt)

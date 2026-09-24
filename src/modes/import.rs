@@ -1825,9 +1825,11 @@ pub async fn run(
                             throttle.wait_for_turn(&row).await;
                         }
                         let fallback = row.podcast_guid.as_deref();
+                        // ADR 0050 task 003 (`stophammer` repository)
+                        // replaces this `None` with the shared fetch cache.
                         let report = if let Ok(report) = tokio::time::timeout(
                             Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
-                            crawl_feed_report(&client, &row.url, fallback, &config),
+                            crawl_feed_report(&client, &row.url, fallback, &config, None),
                         )
                         .await
                         {

@@ -3,15 +3,7 @@
 //! The store keeps one row for each URL that the crawler has fetched. A row
 //! holds the validators from the last `200` answer, the compressed body, the
 //! hash, the final URL after redirects, the fetch time, and the last node
-//! answer. Task 002 adds the caller. This task adds only the store.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "ADR 0050 task 002 wires the caller for this store"
-    )
-)]
+//! answer. Task 002 wires `crawl_feed_report` as the caller.
 
 use std::io::{Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +13,8 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use rusqlite::{Connection, OptionalExtension, params};
 
-fn unix_now() -> i64 {
+/// The current time, as Unix seconds.
+pub(crate) fn unix_now() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -103,6 +96,13 @@ impl FeedCacheDb {
     /// Open (or create) the shared fetch cache at `path`.
     /// Use WAL journal mode and a 5-second busy timeout, for safe
     /// concurrent access from more than one crawler process.
+    // Tests call `open` directly, so the expectation below applies only
+    // outside a test build. Outside a test build, no mode opens the cache
+    // yet. ADR 0050 task 003 wires that call.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "ADR 0050 task 003 opens the cache from each mode")
+    )]
     pub fn open(path: &str) -> Self {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
