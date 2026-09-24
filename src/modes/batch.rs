@@ -201,10 +201,55 @@ pub(crate) fn report_follow_urls(report: &CrawlReport, level: FollowLevel) -> Ve
     follow_urls_at_level(feed, level)
 }
 
+/// The fetch counts of one batch pass, added up over every wave (ADR 0050
+/// §6, `stophammer` repository).
+///
+/// `crawl_feed_with_retries` retries inside one call and gives back one
+/// final report for a URL. A wave task sees only that report, so
+/// [`FetchCounts::note`] reads one `fetch_http_status` for each URL in each
+/// wave. A retry never adds a second count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FetchCounts {
+    ok: u32,
+    not_modified: u32,
+    rate_limited: u32,
+    other: u32,
+}
+
+impl FetchCounts {
+    /// Add one fetch to its bucket, by the final HTTP status of the fetch.
+    ///
+    /// `Some(200)` counts as `ok`. `Some(304)` counts as `not_modified`.
+    /// `Some(429)` counts as `rate_limited`. Any other status, and `None`,
+    /// count as `other`.
+    fn note(&mut self, status: Option<u16>) {
+        match status {
+            Some(200) => self.ok += 1,
+            Some(304) => self.not_modified += 1,
+            Some(429) => self.rate_limited += 1,
+            _ => self.other += 1,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchCounts {
+    /// Print the line ADR 0050 §6 asks for.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fetch: ok={} not_modified={} rate_limited={} other={}",
+            self.ok, self.not_modified, self.rate_limited, self.other
+        )
+    }
+}
+
 /// Runs `urls` through `step` with bounded `concurrency`.
 ///
-/// A report whose outcome is retryable adds its URL to `failed_feeds`.
-/// Prints one line per URL, in the style [`run_urls`] already uses.
+/// A report whose outcome is retryable adds its URL to `failed_feeds`. Each
+/// report also notes its `fetch_http_status` into `fetch_counts`, under the
+/// same rule that keeps only the follow URLs: the count is read from the
+/// report before the task drops it. Prints one line per URL, in the style
+/// [`run_urls`] already uses.
 ///
 /// When `follow_level` is `Some`, each task reads its own report's follow
 /// URLs through [`report_follow_urls`], at that level, as soon as the
@@ -220,6 +265,7 @@ async fn run_wave<S, Fut>(
     urls: Vec<String>,
     concurrency: usize,
     failed_feeds: &Arc<std::sync::Mutex<Vec<String>>>,
+    fetch_counts: &Arc<std::sync::Mutex<FetchCounts>>,
     step: &Arc<S>,
     follow_level: Option<FollowLevel>,
 ) -> Vec<String>
@@ -236,6 +282,7 @@ where
         .map(|(index, url)| {
             let step = Arc::clone(step);
             let failed_feeds = Arc::clone(failed_feeds);
+            let fetch_counts = Arc::clone(fetch_counts);
             let follow_by_index = Arc::clone(&follow_by_index);
             move || async move {
                 let report = step(url.clone()).await;
@@ -245,6 +292,10 @@ where
                         .expect("failed feed retry list mutex poisoned")
                         .push(url.clone());
                 }
+                fetch_counts
+                    .lock()
+                    .expect("fetch counts mutex poisoned")
+                    .note(report.fetch_http_status);
                 eprintln!("  {}: {url}", report.outcome);
 
                 if let Some(level) = follow_level {
@@ -304,6 +355,10 @@ fn exclude_seen_urls(collected: &[String], seen: &HashSet<String>) -> Vec<String
 /// it, because wave 3 runs with `follow_level: None`. No task in wave 3
 /// reads a follow URL.
 ///
+/// `fetch_counts` is the same shared counter across all three waves, so its
+/// value after this call is the total over the whole pass. This is the
+/// smaller change: `run_wave` already takes `failed_feeds` the same way.
+///
 /// `step` fetches and ingests one URL and gives its crawl report. A test
 /// gives a stub `step` and needs no network.
 async fn run_waves<S, Fut>(
@@ -311,6 +366,7 @@ async fn run_waves<S, Fut>(
     concurrency: usize,
     host_delay_ms: u64,
     failed_feeds: &Arc<std::sync::Mutex<Vec<String>>>,
+    fetch_counts: &Arc<std::sync::Mutex<FetchCounts>>,
     step: &Arc<S>,
 ) where
     S: Fn(String) -> Fut + Send + Sync + 'static,
@@ -322,6 +378,7 @@ async fn run_waves<S, Fut>(
         wave1_urls,
         concurrency,
         failed_feeds,
+        fetch_counts,
         step,
         Some(FollowLevel::Input),
     )
@@ -349,6 +406,7 @@ async fn run_waves<S, Fut>(
         wave2_urls,
         concurrency,
         failed_feeds,
+        fetch_counts,
         step,
         Some(FollowLevel::Publisher),
     )
@@ -366,7 +424,15 @@ async fn run_waves<S, Fut>(
         wave3_urls.len()
     );
 
-    run_wave(wave3_urls, concurrency, failed_feeds, step, None).await;
+    run_wave(
+        wave3_urls,
+        concurrency,
+        failed_feeds,
+        fetch_counts,
+        step,
+        None,
+    )
+    .await;
 }
 
 /// Resolve URLs from args, `FEED_URLS`, or stdin, then hand them to
@@ -429,6 +495,7 @@ pub async fn run_urls(
     let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
     let client = Arc::new(reqwest::Client::new());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
     let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
     let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&feed_cache)));
 
@@ -442,7 +509,20 @@ pub async fn run_urls(
         }
     });
 
-    run_waves(urls, concurrency, host_delay_ms, &failed_feeds, &step).await;
+    run_waves(
+        urls,
+        concurrency,
+        host_delay_ms,
+        &failed_feeds,
+        &fetch_counts,
+        &step,
+    )
+    .await;
+
+    // ADR 0050 §6 (`stophammer` repository): one line, printed once, after
+    // every wave has run. Always printed, even when every count is zero.
+    let counts = *fetch_counts.lock().expect("fetch counts mutex poisoned");
+    eprintln!("{counts}");
 
     let mut failed_urls = failed_feeds
         .lock()
@@ -465,8 +545,9 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, FeedCacheDb, FollowLevel, HostThrottle,
-        crawl_feed_with_retries, exclude_seen_urls, report_follow_urls, run_wave, run_waves,
+        CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, FeedCacheDb, FetchCounts, FollowLevel,
+        HostThrottle, crawl_feed_with_retries, exclude_seen_urls, report_follow_urls, run_wave,
+        run_waves,
     };
 
     fn remote_item(position: i64, medium: &str, url: &str) -> IngestRemoteFeedRef {
@@ -534,6 +615,63 @@ mod tests {
             },
             ..accepted_report(feed)
         }
+    }
+
+    #[test]
+    fn fetch_counts_note_200_counts_as_ok() {
+        let mut counts = FetchCounts::default();
+        counts.note(Some(200));
+        assert_eq!(
+            counts,
+            FetchCounts {
+                ok: 1,
+                ..FetchCounts::default()
+            },
+            "status 200 must count as ok"
+        );
+    }
+
+    #[test]
+    fn fetch_counts_note_304_counts_as_not_modified() {
+        let mut counts = FetchCounts::default();
+        counts.note(Some(304));
+        assert_eq!(
+            counts,
+            FetchCounts {
+                not_modified: 1,
+                ..FetchCounts::default()
+            },
+            "status 304 must count as not_modified"
+        );
+    }
+
+    #[test]
+    fn fetch_counts_note_429_counts_as_rate_limited() {
+        let mut counts = FetchCounts::default();
+        counts.note(Some(429));
+        assert_eq!(
+            counts,
+            FetchCounts {
+                rate_limited: 1,
+                ..FetchCounts::default()
+            },
+            "status 429 must count as rate_limited"
+        );
+    }
+
+    #[test]
+    fn fetch_counts_note_an_unlisted_status_and_no_status_count_as_other() {
+        let mut counts = FetchCounts::default();
+        counts.note(Some(500));
+        counts.note(None);
+        assert_eq!(
+            counts,
+            FetchCounts {
+                other: 2,
+                ..FetchCounts::default()
+            },
+            "a status outside 200, 304 and 429, and a fetch with no status, must count as other"
+        );
     }
 
     #[test]
@@ -657,6 +795,7 @@ mod tests {
         });
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
 
         // The binding's type is `Vec<String>`, not `Vec<CrawlReport>`. A
         // regression that made `run_wave` collect reports again would fail
@@ -666,6 +805,7 @@ mod tests {
             vec!["https://music.example/feed.xml".to_string()],
             1,
             &failed_feeds,
+            &fetch_counts,
             &step,
             Some(FollowLevel::Input),
         )
@@ -736,12 +876,14 @@ mod tests {
         });
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
 
         run_waves(
             vec!["https://music.example/feed.xml".to_string()],
             2,
             0,
             &failed_feeds,
+            &fetch_counts,
             &step,
         )
         .await;
@@ -795,12 +937,14 @@ mod tests {
         });
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
 
         run_waves(
             vec!["https://music.example/feed.xml".to_string()],
             2,
             0,
             &failed_feeds,
+            &fetch_counts,
             &step,
         )
         .await;
@@ -809,6 +953,95 @@ mod tests {
             failed_feeds.lock().expect("mutex poisoned").clone(),
             vec!["https://publisher.example/feed.xml".to_string()],
             "a retryable wave-2 failure must land in the same failed-feeds list as wave 1"
+        );
+    }
+
+    /// Proves ADR 0050 §6 (`stophammer` repository): the fetch counts add up
+    /// over every wave, through the same `fetch_counts` argument `run_wave`
+    /// takes alongside `failed_feeds`.
+    ///
+    /// Wave 1 holds two feeds, each naming its own publisher, so wave 2 runs
+    /// for both. Wave 1 gives the `200` and the `304`. Wave 2 gives the
+    /// `429` and the fetch with no status at all. Neither wave-2 report
+    /// parses as an accepted or unchanged feed, so wave 3 never starts, and
+    /// this proves the total over exactly two waves.
+    #[tokio::test]
+    async fn fetch_counts_add_up_over_both_waves() {
+        let feed_a = feed(
+            "music",
+            vec![remote_item(0, "publisher", "https://pub1.example/feed.xml")],
+        );
+        let feed_b = feed(
+            "music",
+            vec![remote_item(0, "publisher", "https://pub2.example/feed.xml")],
+        );
+
+        let step: Arc<_> = Arc::new(move |url: String| {
+            let report = match url.as_str() {
+                "https://a.example/feed.xml" => accepted_report(feed_a.clone()),
+                "https://b.example/feed.xml" => CrawlReport {
+                    fetch_http_status: Some(304),
+                    ..no_change_report(feed_b.clone())
+                },
+                "https://pub1.example/feed.xml" => CrawlReport {
+                    outcome: CrawlOutcome::FetchError {
+                        reason: "http 429 Too Many Requests".to_string(),
+                        retryable: false,
+                        retry_after_secs: None,
+                    },
+                    fetch_http_status: Some(429),
+                    raw_medium: None,
+                    parsed_feed_guid: None,
+                    final_url: None,
+                    content_sha256: None,
+                    raw_xml: None,
+                    parsed_feed: None,
+                },
+                "https://pub2.example/feed.xml" => CrawlReport {
+                    outcome: CrawlOutcome::FetchError {
+                        reason: "connection reset".to_string(),
+                        retryable: false,
+                        retry_after_secs: None,
+                    },
+                    fetch_http_status: None,
+                    raw_medium: None,
+                    parsed_feed_guid: None,
+                    final_url: None,
+                    content_sha256: None,
+                    raw_xml: None,
+                    parsed_feed: None,
+                },
+                other => panic!("unexpected fetch of {other}"),
+            };
+            async move { report }
+        });
+
+        let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+
+        run_waves(
+            vec![
+                "https://a.example/feed.xml".to_string(),
+                "https://b.example/feed.xml".to_string(),
+            ],
+            2,
+            0,
+            &failed_feeds,
+            &fetch_counts,
+            &step,
+        )
+        .await;
+
+        assert_eq!(
+            *fetch_counts.lock().expect("fetch counts mutex poisoned"),
+            FetchCounts {
+                ok: 1,
+                not_modified: 1,
+                rate_limited: 1,
+                other: 1,
+            },
+            "the fetch counts must add up over both waves: one 200, one 304, \
+             one 429 and one fetch with no status"
         );
     }
 
