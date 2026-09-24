@@ -443,6 +443,7 @@ feeds are periodically re-evaluated.
 | `--archive-db <path>` | off | gossip-listener archive database path |
 | `--since-hours <n>` | off | Bootstrap from N hours ago (requires `--archive-db`) |
 | `--concurrency <n>` | `3` | Parallel fetch+ingest workers |
+| `--host-delay-ms <ms>` | `1500` | Minimum ms between fetches to the same host, for a follow fetch (ADR 0049 §2) |
 | `--skip-known-non-music` | off | Skip feeds proven non-music by prior crawl |
 | `--skip-ttl-days <n>` | off | Re-evaluate skip decisions after N days |
 | `-q, --quiet` | off | Hide non-music medium rejections |
@@ -461,7 +462,9 @@ feeds are periodically re-evaluated.
   Worker pool size.
   Default: `5` (feed/import/refresh) / `3` (gossip)
 - **`HOST_DELAY_MS`** --
-  Minimum spacing between fetches to the same host (feed and refresh modes).
+  Minimum distance between fetches to the same host. Feed and refresh modes
+  always apply it. Gossip mode applies it to a follow fetch only (ADR 0049
+  §2).
   Default: `1500`
 - **`FEED_URLS`** --
   Comma- or newline-separated URLs (feed mode only).

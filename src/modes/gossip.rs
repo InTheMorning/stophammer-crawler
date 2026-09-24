@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::crawl::{CrawlConfig, CrawlReport, crawl_feed_report};
 use crate::dedup::Dedup;
+use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
 };
@@ -331,6 +332,9 @@ struct GossipCounters {
     urls_launched: u64,
     urls_dedup_skipped: u64,
     urls_feed_memory_skipped: u64,
+    /// Follow fetches launched for a publisher link (ADR 0049 §2,
+    /// `stophammer` repository). Never counts a URL from a notification.
+    follow_fetches_launched: u64,
 }
 
 /// Maximum bytes buffered in a single SSE line before it is discarded.
@@ -402,6 +406,9 @@ async fn process_notification_urls(
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    host_throttle: &Arc<HostThrottle>,
+    follow_sem: &Arc<Semaphore>,
+    follow_launches: &Arc<std::sync::Mutex<u64>>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
@@ -453,6 +460,10 @@ async fn process_notification_urls(
         let client = Arc::clone(client);
         let config = Arc::clone(config);
         let sem = Arc::clone(sem);
+        let host_throttle = Arc::clone(host_throttle);
+        let follow_sem = Arc::clone(follow_sem);
+        let follow_launches = Arc::clone(follow_launches);
+        let dedup = Arc::clone(dedup);
         let progress = Arc::clone(progress);
         let skip_db = Arc::clone(skip_db);
         let audit_tx = audit_tx.cloned();
@@ -462,6 +473,12 @@ async fn process_notification_urls(
             let start = Instant::now();
             let report = crawl_feed_report(&client, &url, None, &config).await;
             let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+            // ADR 0049 §2 (`stophammer` repository): read the follow URLs
+            // as soon as the report arrives, so `report` (which carries
+            // `raw_xml` and the full parsed feed) can drop at the end of
+            // this task instead of living through the follow fetches.
+            let follow = report_follow_urls(&report);
 
             if !(quiet && report.outcome.is_medium_rejection()) {
                 eprintln!("  {}: {url}", report.outcome);
@@ -486,8 +503,185 @@ async fn process_notification_urls(
                 .lock()
                 .unwrap()
                 .upsert_feed_memory(&url, &report, duration_ms);
+
+            spawn_follow_fetches(
+                follow,
+                &client,
+                &config,
+                &dedup,
+                &follow_sem,
+                &host_throttle,
+                &follow_launches,
+                &progress,
+                &skip_db,
+                skip_known_non_music,
+                skip_ttl_days,
+                quiet,
+            )
+            .await;
         });
     }
+}
+
+/// Spawns a follow fetch for each URL in `follow` that passes
+/// [`should_launch_follow_url`] (ADR 0049 §2, `stophammer` repository).
+///
+/// The notification fetch's own task calls this when its `CrawlReport` is
+/// done. It counts each launch in `follow_launches`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a follow fetch needs the same shared resources as a notification fetch"
+)]
+async fn spawn_follow_fetches(
+    follow: Vec<String>,
+    client: &Arc<Client>,
+    config: &Arc<CrawlConfig>,
+    dedup: &Arc<Mutex<Dedup>>,
+    follow_sem: &Arc<Semaphore>,
+    host_throttle: &Arc<HostThrottle>,
+    follow_launches: &Arc<std::sync::Mutex<u64>>,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
+    quiet: bool,
+) {
+    for follow_url in follow {
+        let launch = should_launch_follow_url(
+            &follow_url,
+            dedup,
+            skip_db,
+            progress,
+            skip_known_non_music,
+            skip_ttl_days,
+            quiet,
+        )
+        .await;
+        if !launch {
+            continue;
+        }
+
+        *follow_launches.lock().unwrap() += 1;
+
+        tokio::spawn(run_follow_fetch(
+            follow_url,
+            Arc::clone(client),
+            Arc::clone(config),
+            Arc::clone(follow_sem),
+            Arc::clone(host_throttle),
+            Arc::clone(progress),
+            Arc::clone(skip_db),
+            quiet,
+        ));
+    }
+}
+
+/// Decides whether a follow URL should be fetched (ADR 0049 §2, `stophammer`
+/// repository).
+///
+/// Applies the same dedup and skip checks that a notification URL gets in
+/// [`process_notification_urls`]: the dedup store, the shared cross-mode
+/// skip database, and the mode-specific feed memory. Gives `false`, and
+/// prints a skip message unless `quiet`, for a URL that any of the three
+/// checks refuses.
+async fn should_launch_follow_url(
+    url: &str,
+    dedup: &Arc<Mutex<Dedup>>,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+    skip_known_non_music: bool,
+    skip_ttl_days: Option<u64>,
+    quiet: bool,
+) -> bool {
+    if !dedup.lock().await.should_process(url) {
+        return false;
+    }
+
+    if skip_known_non_music {
+        if let Some(reason) = skip_db.lock().unwrap().should_skip(url, skip_ttl_days) {
+            if !quiet {
+                eprintln!("  skipped follow (shared: {reason}): {url}");
+            }
+            return false;
+        }
+
+        if let Some(reason) = progress
+            .lock()
+            .unwrap()
+            .should_skip_feed(url, skip_ttl_days)
+        {
+            if !quiet {
+                eprintln!("  skipped follow ({reason}): {url}");
+            }
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Fetches one follow URL (ADR 0049 §2, `stophammer` repository).
+///
+/// Acquires a permit from `follow_sem`, its own `Semaphore`, not the
+/// notification `Semaphore`. Then it waits for the host throttle, then it
+/// calls [`crawl_feed_report`]. It records the outcome through
+/// [`record_follow_outcome`], as a notification fetch does. It does not
+/// read the report's follow URLs: the walk stops at one level.
+///
+/// A second semaphore stops a slow run of follow fetches from holding a
+/// notification permit for minutes. A Wavlake publisher feed can name
+/// more than one hundred albums. The host throttle passes one fetch each
+/// `host_delay_ms`, so such a run takes minutes. Without its own
+/// semaphore, that run would delay real-time notification crawls.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a follow fetch needs the same shared resources as a notification fetch"
+)]
+async fn run_follow_fetch(
+    url: String,
+    client: Arc<Client>,
+    config: Arc<CrawlConfig>,
+    follow_sem: Arc<Semaphore>,
+    host_throttle: Arc<HostThrottle>,
+    progress: Arc<std::sync::Mutex<ProgressStore>>,
+    skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    quiet: bool,
+) {
+    let _permit = follow_sem.acquire().await.expect("semaphore closed");
+    let lease = host_throttle.acquire(&url).await;
+    let start = Instant::now();
+    let report = crawl_feed_report(&client, &url, None, &config).await;
+    host_throttle.release(&lease, Duration::ZERO).await;
+    let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+
+    record_follow_outcome(&url, &report, duration_ms, quiet, &skip_db, &progress);
+}
+
+/// Records a follow fetch's `report` in `skip_db` and the progress store,
+/// exactly as a notification fetch records its own report.
+///
+/// Never reads `report.parsed_feed` and never collects its follow URLs
+/// (ADR 0049 §2, `stophammer` repository): the walk stops at one level.
+fn record_follow_outcome(
+    url: &str,
+    report: &CrawlReport,
+    duration_ms: i64,
+    quiet: bool,
+    skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+) {
+    if !(quiet && report.outcome.is_medium_rejection()) {
+        eprintln!("  follow {}: {url}", report.outcome);
+    }
+
+    skip_db
+        .lock()
+        .unwrap()
+        .record_outcome(url, report, "gossip");
+    progress
+        .lock()
+        .unwrap()
+        .upsert_feed_memory(url, report, duration_ms);
 }
 
 /// Validate that `archive.db` has the expected `messages(hash, payload, created_at)` schema.
@@ -615,6 +809,8 @@ async fn replay_from_archive(
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    host_throttle: &Arc<HostThrottle>,
+    follow_sem: &Arc<Semaphore>,
     concurrency: usize,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
@@ -623,6 +819,7 @@ async fn replay_from_archive(
     quiet: bool,
     audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> GossipCounters {
+    let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
     let conn = match Connection::open_with_flags(
         archive_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -749,6 +946,9 @@ async fn replay_from_archive(
                 client,
                 config,
                 sem,
+                host_throttle,
+                follow_sem,
+                &follow_launches,
                 progress,
                 skip_db,
                 skip_known_non_music,
@@ -785,9 +985,11 @@ async fn replay_from_archive(
         }
     }
 
+    total_counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+
     eprintln!(
         "gossip: replay complete ({batch_number} batches): seen={} accepted={} filtered={} \
-         urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
+         urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={}",
         total_counters.notifications_seen,
         total_counters.notifications_accepted,
         total_counters.notifications_filtered,
@@ -795,6 +997,7 @@ async fn replay_from_archive(
         total_counters.urls_launched,
         total_counters.urls_dedup_skipped,
         total_counters.urls_feed_memory_skipped,
+        total_counters.follow_fetches_launched,
     );
 
     total_counters
@@ -810,6 +1013,9 @@ async fn stream_sse_events(
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    host_throttle: &Arc<HostThrottle>,
+    follow_sem: &Arc<Semaphore>,
+    follow_launches: &Arc<std::sync::Mutex<u64>>,
     counters: &mut GossipCounters,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
@@ -861,6 +1067,9 @@ async fn stream_sse_events(
                     client,
                     config,
                     sem,
+                    host_throttle,
+                    follow_sem,
+                    follow_launches,
                     progress,
                     skip_db,
                     skip_known_non_music,
@@ -886,6 +1095,8 @@ async fn reconcile_archive_batch(
     client: &Arc<Client>,
     config: &Arc<CrawlConfig>,
     sem: &Arc<Semaphore>,
+    host_throttle: &Arc<HostThrottle>,
+    follow_sem: &Arc<Semaphore>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
@@ -944,6 +1155,7 @@ async fn reconcile_archive_batch(
 
     let count = messages.len() as u64;
     let mut counters = GossipCounters::default();
+    let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
     let mut last_cursor: Option<ArchiveCursor> = None;
 
     for msg in &messages {
@@ -965,6 +1177,9 @@ async fn reconcile_archive_batch(
             client,
             config,
             sem,
+            host_throttle,
+            follow_sem,
+            &follow_launches,
             progress,
             skip_db,
             skip_known_non_music,
@@ -979,10 +1194,13 @@ async fn reconcile_archive_batch(
         progress.lock().unwrap().set_archive_cursor(cur);
     }
 
+    counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+
     eprintln!(
-        "gossip: reconciliation: {count} rows, launched={}, skipped={}",
+        "gossip: reconciliation: {count} rows, launched={}, skipped={}, follow_launched={}",
         counters.urls_launched,
         counters.urls_dedup_skipped + counters.urls_feed_memory_skipped,
+        counters.follow_fetches_launched,
     );
 
     count
@@ -998,6 +1216,8 @@ async fn archive_reconciliation_loop(
     client: Arc<Client>,
     config: Arc<CrawlConfig>,
     sem: Arc<Semaphore>,
+    host_throttle: Arc<HostThrottle>,
+    follow_sem: Arc<Semaphore>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     skip_known_non_music: bool,
@@ -1016,6 +1236,8 @@ async fn archive_reconciliation_loop(
             &client,
             &config,
             &sem,
+            &host_throttle,
+            &follow_sem,
             &progress,
             &skip_db,
             skip_known_non_music,
@@ -1051,6 +1273,7 @@ pub async fn run(
     archive_db: Option<String>,
     since_hours: Option<u64>,
     concurrency: usize,
+    host_delay_ms: u64,
     skip_known_non_music: bool,
     skip_ttl_days: Option<u64>,
     quiet: bool,
@@ -1063,6 +1286,16 @@ pub async fn run(
     let config = Arc::new(CrawlConfig::from_env_with_force(force));
     let client = Arc::new(create_async_client());
     let sem = Arc::new(Semaphore::new(concurrency));
+    // ADR 0049 §2 (`stophammer` repository): one host throttle, shared by
+    // every follow fetch. The gossip mode has no other host pacing.
+    let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
+    // A follow fetch does not acquire a permit from `sem`. A Wavlake
+    // publisher feed can name more than one hundred albums. The host
+    // throttle passes one fetch each `host_delay_ms`. A follow fetch that
+    // shared `sem` could hold a notification permit for minutes. That
+    // could delay real-time notification crawls. `follow_sem` gives a
+    // follow fetch its own permit pool, the same permit count as `sem`.
+    let follow_sem = Arc::new(Semaphore::new(concurrency));
     let dedup = Arc::new(Mutex::new(Dedup::new()));
     let progress_store = ProgressStore::open(&state_path);
     let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
@@ -1191,6 +1424,8 @@ pub async fn run(
             &client,
             &config,
             &sem,
+            &host_throttle,
+            &follow_sem,
             concurrency,
             &progress,
             &skip_db,
@@ -1207,6 +1442,8 @@ pub async fn run(
         let recon_client = Arc::clone(&client);
         let recon_config = Arc::clone(&config);
         let recon_sem = Arc::clone(&sem);
+        let recon_host_throttle = Arc::clone(&host_throttle);
+        let recon_follow_sem = Arc::clone(&follow_sem);
         let recon_progress = Arc::clone(&progress);
         let recon_skip_db = Arc::clone(&skip_db);
         let recon_audit_tx = audit_tx.clone();
@@ -1217,6 +1454,8 @@ pub async fn run(
                 recon_client,
                 recon_config,
                 recon_sem,
+                recon_host_throttle,
+                recon_follow_sem,
                 recon_progress,
                 recon_skip_db,
                 skip_known_non_music,
@@ -1239,6 +1478,7 @@ pub async fn run(
 
     loop {
         let mut session_counters = GossipCounters::default();
+        let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
 
         match stream_sse_events(
             &sse_url,
@@ -1246,6 +1486,9 @@ pub async fn run(
             &client,
             &config,
             &sem,
+            &host_throttle,
+            &follow_sem,
+            &follow_launches,
             &mut session_counters,
             &progress,
             &skip_db,
@@ -1265,16 +1508,19 @@ pub async fn run(
             }
         }
 
+        session_counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+
         if session_counters.notifications_seen > 0 || session_counters.urls_launched > 0 {
             eprintln!(
-                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={}",
+                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={}",
                 session_counters.notifications_seen,
                 session_counters.notifications_accepted,
                 session_counters.notifications_filtered,
                 session_counters.urls_seen,
                 session_counters.urls_launched,
                 session_counters.urls_dedup_skipped,
-                session_counters.urls_feed_memory_skipped
+                session_counters.urls_feed_memory_skipped,
+                session_counters.follow_fetches_launched
             );
         }
     }
@@ -1284,6 +1530,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef};
 
     fn create_test_archive(messages: &[(&str, &str, i64)]) -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -1544,6 +1791,8 @@ mod tests {
             Duration::from_secs(1),
         ));
         let sem = Arc::new(Semaphore::new(1));
+        let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(1500)));
+        let follow_sem = Arc::new(Semaphore::new(1));
         let high_water = ArchiveCursor {
             created_at: 1000,
             hash: "hash_a".to_string(),
@@ -1558,6 +1807,8 @@ mod tests {
             &client,
             &config,
             &sem,
+            &host_throttle,
+            &follow_sem,
             1,
             &progress,
             &skip_db,
@@ -1638,6 +1889,315 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
         }
+    }
+
+    /// Gives a publisher feed whose one remote item names a music feed at
+    /// `url`. Following this feed again would give `url` as a further
+    /// follow URL, which is what [`a_follow_fetch_does_not_collect_follow_urls`]
+    /// must prove [`record_follow_outcome`] never does.
+    fn feed_with_music_remote_item(url: &str) -> IngestFeedData {
+        IngestFeedData {
+            feed_guid: "publisher-guid".to_string(),
+            title: "Publisher Feed".to_string(),
+            description: None,
+            image_url: None,
+            language: None,
+            explicit: false,
+            itunes_type: None,
+            raw_medium: Some("publisher".to_string()),
+            author_name: None,
+            owner_name: None,
+            pub_date: None,
+            last_build_date: None,
+            remote_items: vec![IngestRemoteFeedRef {
+                position: 0,
+                medium: Some("music".to_string()),
+                remote_feed_guid: "album-guid".to_string(),
+                remote_feed_url: Some(url.to_string()),
+                rel: None,
+            }],
+            persons: Vec::new(),
+            entity_ids: Vec::new(),
+            links: Vec::new(),
+            podcast_namespace: None,
+            feed_payment_routes: Vec::new(),
+            live_items: Vec::new(),
+            tracks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_rejected_notification_report_gives_no_follow_fetch() {
+        let mut report = make_report(
+            "rejected",
+            Some("bad medium"),
+            Some(200),
+            Some("music"),
+            None,
+        );
+        report.parsed_feed = Some(feed_with_music_remote_item(
+            "https://third-level.example/feed.xml",
+        ));
+
+        assert!(
+            report_follow_urls(&report).is_empty(),
+            "a rejected report must give no follow URLs, so process_notification_urls \
+             launches no follow fetch for it"
+        );
+    }
+
+    #[test]
+    fn a_follow_fetch_does_not_collect_follow_urls() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+
+        let mut report = make_report(
+            "accepted",
+            None,
+            Some(200),
+            Some("publisher"),
+            Some("publisher-guid"),
+        );
+        report.parsed_feed = Some(feed_with_music_remote_item(
+            "https://second-level.example/feed.xml",
+        ));
+
+        // The stub report carries its own follow URLs, so this proves the
+        // omission below is a choice, not a coincidence of empty data.
+        assert!(
+            !report_follow_urls(&report).is_empty(),
+            "the stub report must itself carry a follow URL"
+        );
+
+        record_follow_outcome(
+            "https://follow-fetch.example/feed.xml",
+            &report,
+            10,
+            true,
+            &skip_db,
+            &progress,
+        );
+
+        let recorded_urls: i64 = progress
+            .lock()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM gossip_feed_memory", [], |row| {
+                row.get(0)
+            })
+            .expect("count feed memory rows");
+        assert_eq!(
+            recorded_urls, 1,
+            "a follow fetch must record only the URL it fetched, never a second level"
+        );
+    }
+
+    /// Proves a follow fetch cannot delay real-time notification crawls
+    /// (ADR 0049 task 012).
+    ///
+    /// `run_follow_fetch` acquires its permit from `follow_sem` only. This
+    /// test holds the one `follow_sem` permit, then spawns
+    /// `run_follow_fetch` with that empty semaphore. `run_follow_fetch`
+    /// blocks at its first line, `follow_sem.acquire()`. It does not call
+    /// `crawl_feed_report`, and it does not touch the network.
+    ///
+    /// This test's `sem` stands in for the notification semaphore. The
+    /// test checks that `sem` keeps all its permits, and that a new
+    /// `try_acquire` on it succeeds, while the follow fetch waits. A
+    /// version of `run_follow_fetch` written to use `sem` rather than
+    /// `follow_sem` would not compile. A version that gave it the same
+    /// `Semaphore` object as `sem` would not pass the `try_acquire` check
+    /// below.
+    #[tokio::test]
+    async fn a_follow_fetch_never_blocks_the_notification_semaphore() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let client = Arc::new(create_async_client());
+        let config = Arc::new(CrawlConfig::dry_run(
+            "stophammer-crawler/test",
+            Duration::from_secs(1),
+        ));
+        let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(0)));
+
+        // Stands in for the notification semaphore. It must stay untouched.
+        let sem = Arc::new(Semaphore::new(3));
+        // The follow semaphore: its one permit is held for the whole test,
+        // so `run_follow_fetch` can never get past its first line.
+        let follow_sem = Arc::new(Semaphore::new(1));
+        let held_follow_permit = Arc::clone(&follow_sem)
+            .acquire_owned()
+            .await
+            .expect("acquire the only follow permit");
+
+        let handle = tokio::spawn(run_follow_fetch(
+            "https://example.com/follow.xml".to_string(),
+            client,
+            config,
+            Arc::clone(&follow_sem),
+            host_throttle,
+            progress,
+            skip_db,
+            true,
+        ));
+
+        // Give the spawned task every chance to run. It can only ever
+        // block on `follow_sem.acquire()`, since that permit is held.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !handle.is_finished(),
+            "a follow fetch with no follow permit available must still be waiting, not fetching"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            3,
+            "a follow fetch waiting on follow_sem must never touch the notification semaphore"
+        );
+        assert!(
+            sem.try_acquire().is_ok(),
+            "the notification semaphore must stay acquirable while a follow fetch waits on its own semaphore"
+        );
+
+        handle.abort();
+        drop(held_follow_permit);
+    }
+
+    #[tokio::test]
+    async fn a_deduped_follow_url_is_not_launched() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let url = "https://example.com/already-seen.xml";
+
+        // The first pass over `url` marks it seen in the dedup store.
+        assert!(dedup.lock().await.should_process(url));
+
+        let should_launch =
+            should_launch_follow_url(url, &dedup, &skip_db, &progress, false, None, true).await;
+
+        assert!(
+            !should_launch,
+            "a follow URL the dedup store already saw must not be launched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skip_db_refused_follow_url_is_not_launched() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let url = "https://example.com/known-podcast.xml";
+
+        // A prior crawl (of any mode) recorded this URL as a non-music feed.
+        let prior_report = make_report("accepted", None, Some(200), Some("podcast"), None);
+        skip_db
+            .lock()
+            .unwrap()
+            .record_outcome(url, &prior_report, "gossip");
+
+        let should_launch =
+            should_launch_follow_url(url, &dedup, &skip_db, &progress, true, None, true).await;
+
+        assert!(
+            !should_launch,
+            "a follow URL the shared skip database refuses must not be launched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_progress_store_refused_follow_url_is_not_launched() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let url = "https://example.com/rejected-medium.xml";
+
+        // The gossip mode's own feed memory recorded a medium-gate rejection.
+        let prior_report = make_report(
+            "rejected",
+            Some("[medium_music] medium is absent"),
+            Some(200),
+            None,
+            None,
+        );
+        progress
+            .lock()
+            .unwrap()
+            .upsert_feed_memory(url, &prior_report, 100);
+
+        let should_launch =
+            should_launch_follow_url(url, &dedup, &skip_db, &progress, true, None, true).await;
+
+        assert!(
+            !should_launch,
+            "a follow URL the progress store's feed memory refuses must not be launched"
+        );
     }
 
     #[test]

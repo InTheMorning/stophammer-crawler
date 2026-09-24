@@ -32,7 +32,9 @@ fn parse_force_reingest_value(raw: &str) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_force_reingest_value;
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Mode, parse_force_reingest_value};
 
     #[test]
     fn force_reingest_env_accepts_boolish_values() {
@@ -55,6 +57,36 @@ mod tests {
         assert!(
             parse_force_reingest_value("maybe").is_err(),
             "unexpected FORCE_REINGEST value should be rejected"
+        );
+    }
+
+    #[test]
+    fn gossip_host_delay_ms_defaults_to_1500() {
+        let cli = Cli::try_parse_from(["stophammer-crawler", "gossip"])
+            .expect("gossip must parse with no flags");
+        let Mode::Gossip { host_delay_ms, .. } = cli.mode else {
+            panic!("expected the gossip subcommand");
+        };
+        assert_eq!(
+            host_delay_ms, 1500,
+            "the default host_delay_ms must be 1500"
+        );
+    }
+
+    #[test]
+    fn gossip_host_delay_ms_reads_the_host_delay_ms_env_var() {
+        let command = Cli::command();
+        let gossip = command
+            .find_subcommand("gossip")
+            .expect("the gossip subcommand must exist");
+        let arg = gossip
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "host_delay_ms")
+            .expect("gossip must declare a host-delay-ms argument");
+        assert_eq!(
+            arg.get_env(),
+            Some(std::ffi::OsStr::new("HOST_DELAY_MS")),
+            "gossip host-delay-ms must read the HOST_DELAY_MS env var"
         );
     }
 }
@@ -267,6 +299,11 @@ enum Mode {
         #[arg(long, env = "CONCURRENCY", default_value_t = 3, value_parser = parse_positive_usize)]
         concurrency: usize,
 
+        /// Minimum spacing between fetches to the same host, for a follow
+        /// fetch (ADR 0049 §2, `stophammer` repository)
+        #[arg(long, env = "HOST_DELAY_MS", default_value_t = 1500)]
+        host_delay_ms: u64,
+
         /// Skip feeds already known to be non-music based on prior crawl results
         #[arg(long)]
         skip_known_non_music: bool,
@@ -377,6 +414,7 @@ async fn main() {
             archive_db,
             since_hours,
             concurrency,
+            host_delay_ms,
             skip_known_non_music,
             skip_ttl_days,
             quiet,
@@ -390,6 +428,7 @@ async fn main() {
                 archive_db,
                 since_hours,
                 concurrency,
+                host_delay_ms,
                 skip_known_non_music,
                 skip_ttl_days,
                 quiet,

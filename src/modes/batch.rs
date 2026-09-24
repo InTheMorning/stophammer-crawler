@@ -79,7 +79,7 @@ fn write_failed_feeds(path: &str, urls: &[String]) {
     std::fs::write(path, content).expect("failed to write failed feed file");
 }
 
-struct HostThrottle {
+pub(crate) struct HostThrottle {
     slots: Mutex<std::collections::HashMap<String, Arc<HostSlot>>>,
     host_delay: Duration,
 }
@@ -89,20 +89,20 @@ struct HostSlot {
     next_allowed_at: Mutex<Instant>,
 }
 
-struct HostLease {
+pub(crate) struct HostLease {
     slot: Option<Arc<HostSlot>>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl HostThrottle {
-    fn new(host_delay: Duration) -> Self {
+    pub(crate) fn new(host_delay: Duration) -> Self {
         Self {
             slots: Mutex::new(std::collections::HashMap::new()),
             host_delay,
         }
     }
 
-    async fn acquire(&self, url: &str) -> HostLease {
+    pub(crate) async fn acquire(&self, url: &str) -> HostLease {
         let Some(host) = host_key(url) else {
             return HostLease {
                 slot: None,
@@ -139,7 +139,7 @@ impl HostThrottle {
         }
     }
 
-    async fn release(&self, lease: &HostLease, delay: Duration) {
+    pub(crate) async fn release(&self, lease: &HostLease, delay: Duration) {
         let Some(slot) = &lease.slot else {
             return;
         };
@@ -185,7 +185,7 @@ async fn crawl_feed_with_retries(
 /// report can be dropped right after the call, and a wave never has to hold
 /// more than [`run_pool`]'s in-flight reports (bounded by `concurrency`) at
 /// one time.
-fn report_follow_urls(report: &CrawlReport) -> Vec<String> {
+pub(crate) fn report_follow_urls(report: &CrawlReport) -> Vec<String> {
     if !matches!(
         report.outcome,
         CrawlOutcome::Accepted { .. } | CrawlOutcome::NoChange
