@@ -245,6 +245,18 @@ impl FeedCacheDb {
             eprintln!("feed_cache: WARNING: failed to record node answer for {url}: {e}");
         }
     }
+
+    /// Clear the node's answer for `url`, so a later `304` submits the kept
+    /// body again (`stophammer` ADR 0051 §5). Do nothing when no row exists.
+    pub fn clear_node_answer(&self, url: &str) {
+        if let Err(e) = self.conn.execute(
+            "UPDATE feed_cache SET node_answer = NULL, node_reason = NULL, answered_at = NULL
+             WHERE url = ?1",
+            params![url],
+        ) {
+            eprintln!("feed_cache: WARNING: failed to clear node answer for {url}: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

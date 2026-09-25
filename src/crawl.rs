@@ -556,6 +556,24 @@ fn plan_after_response(status: u16, cached: Option<&CachedFeed>, force: bool) ->
     }
 }
 
+/// The three rejection reasons that mean the node holds no content for this
+/// URL under its own source URL (`stophammer` ADR 0051 §5). The crawler must
+/// not cache one of these as the node's answer, so a later `304` submits the
+/// kept body again and an operator decision takes effect with no changed
+/// body.
+const NODE_CONFLICT_REASONS: [&str; 3] =
+    ["source_conflict", "record_conflict", "guid_change_pending"];
+
+/// Returns `true` when `outcome` is a rejection for exactly one of the three
+/// reasons in `NODE_CONFLICT_REASONS` (`stophammer` ADR 0051 §5).
+#[must_use]
+fn is_node_conflict(outcome: &CrawlOutcome) -> bool {
+    matches!(
+        outcome,
+        CrawlOutcome::Rejected { reason, .. } if NODE_CONFLICT_REASONS.contains(&reason.as_str())
+    )
+}
+
 /// Read one header's value as owned text, when it is present and valid
 /// UTF-8.
 fn header_str(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
@@ -579,16 +597,17 @@ fn read_cached_row(cache: Option<&FeedCache>, url: &str) -> Option<CachedFeed> {
     }
 }
 
-/// Write a fresh cache row, then record the node's answer for it. Each
-/// step takes its own lock, and neither is held across an `.await` (ADR
-/// 0050 §2, `stophammer` repository). A poisoned lock skips that one
-/// write. It does not panic the crawl.
+/// Write a fresh cache row, then record the node's answer for it. Skips the
+/// answer when `outcome` is a node conflict (`stophammer` ADR 0051 §5): the
+/// row then keeps a null answer, so a later `304` submits the kept body
+/// again. Each step takes its own lock, and neither is held across an
+/// `.await` (ADR 0050 §2, `stophammer` repository). A poisoned lock skips
+/// that one write. It does not panic the crawl.
 fn write_cache_row(
     cache: &FeedCache,
     url: &str,
     entry: &FetchedFeed<'_>,
-    label: &str,
-    reason: Option<&str>,
+    outcome: &CrawlOutcome,
     at: i64,
 ) {
     match cache.lock() {
@@ -599,8 +618,11 @@ fn write_cache_row(
             );
         }
     }
+    if is_node_conflict(outcome) {
+        return;
+    }
     match cache.lock() {
-        Ok(guard) => guard.record_node_answer(url, label, reason, at),
+        Ok(guard) => guard.record_node_answer(url, outcome.label(), outcome.reason(), at),
         Err(e) => {
             eprintln!(
                 "crawl: WARNING: feed cache lock poisoned; skipped recording node answer for {url}: {e}"
@@ -647,14 +669,7 @@ async fn ingest_fresh_and_cache(
             body: &xml,
             fetched_at,
         };
-        write_cache_row(
-            cache,
-            url,
-            &entry,
-            report.outcome.label(),
-            report.outcome.reason(),
-            fetched_at,
-        );
+        write_cache_row(cache, url, &entry, &report.outcome, fetched_at);
     }
 
     report
@@ -767,8 +782,11 @@ async fn ingest_kept_body(
     report.fetch_http_status = Some(304);
 
     if let Some(cache) = cache {
+        // ADR 0051 §5 (`stophammer` repository): a node conflict clears the
+        // earlier answer, so a later `304` submits this kept body again.
         let at = unix_now();
         match cache.lock() {
+            Ok(guard) if is_node_conflict(&report.outcome) => guard.clear_node_answer(url),
             Ok(guard) => {
                 guard.record_node_answer(url, report.outcome.label(), report.outcome.reason(), at);
             }
@@ -938,8 +956,8 @@ mod tests {
     use super::{
         CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, body_preview,
         build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
-        is_retryable_http_status, is_retryable_ingest_status, normalize_rejection_reason,
-        parse_feed_xml, plan_after_response,
+        is_node_conflict, is_retryable_http_status, is_retryable_ingest_status,
+        normalize_rejection_reason, parse_feed_xml, plan_after_response,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -1271,6 +1289,43 @@ mod tests {
         );
     }
 
+    // ---- `is_node_conflict` (`stophammer` ADR 0051 §5) ----
+
+    #[test]
+    fn is_node_conflict_is_true_for_each_of_the_three_node_reasons() {
+        for reason in ["source_conflict", "record_conflict", "guid_change_pending"] {
+            let outcome = CrawlOutcome::Rejected {
+                reason: reason.to_string(),
+                warnings: Vec::new(),
+            };
+            assert!(
+                is_node_conflict(&outcome),
+                "{reason} must be a node conflict under ADR 0051 §5"
+            );
+        }
+    }
+
+    #[test]
+    fn is_node_conflict_is_false_for_a_non_matching_reason_or_outcome() {
+        for reason in ["[medium_music] absent", "source_conflict_extra"] {
+            let outcome = CrawlOutcome::Rejected {
+                reason: reason.to_string(),
+                warnings: Vec::new(),
+            };
+            assert!(
+                !is_node_conflict(&outcome),
+                "{reason} must not be treated as a node conflict"
+            );
+        }
+
+        assert!(
+            !is_node_conflict(&CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            }),
+            "an accepted outcome is never a node conflict"
+        );
+    }
+
     // ---- stub-server tests for `crawl_feed_report` ----
     //
     // Each stub is a plain TCP listener on `127.0.0.1`. It reads one
@@ -1491,6 +1546,106 @@ mod tests {
         );
     }
 
+    /// Proves `stophammer` ADR 0051 §5, the `200` node-conflict row: the row
+    /// is still written for the fresh body, but the crawler does not cache
+    /// `source_conflict` as the node's answer. The row keeps a null answer,
+    /// so a later `304` submits the kept body again.
+    #[tokio::test]
+    async fn stub_200_with_a_source_conflict_leaves_the_row_with_no_node_answer() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"source_conflict"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "source_conflict".to_string(),
+                warnings: Vec::new(),
+            },
+            "the run summary must still report the rejection and its reason"
+        );
+
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 200 fetch must still write a cache row");
+        assert_eq!(
+            cached.node_answer, None,
+            "ADR 0051 §5: a node conflict must leave no cached node answer"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0051 §5 does not change an ordinary
+    /// rejection: the node answer is still cached as `rejected`, so a `304`
+    /// after it still skips the ingest (see
+    /// `plan_after_response_304_no_force_rejected_skips_ingest`).
+    #[tokio::test]
+    async fn stub_200_with_an_ordinary_rejection_still_caches_the_node_answer() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"[medium_music] absent"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "[medium_music] absent".to_string(),
+                warnings: Vec::new(),
+            }
+        );
+
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 200 fetch must still write a cache row");
+        assert_eq!(
+            cached.node_answer.as_deref(),
+            Some("rejected"),
+            "an ordinary rejection is not a node conflict, so it is still cached"
+        );
+    }
+
     /// Proves ADR 0050 §3 (`stophammer` repository), the `304` normal row:
     /// the crawler sends the stored `ETag`, and a `304` from a row the node
     /// already answered sends no ingest.
@@ -1578,6 +1733,55 @@ mod tests {
             updated.node_answer.as_deref(),
             Some("accepted"),
             "the row's answer must be updated after the forced submission"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0051 §5, the `304` force node-conflict row: a
+    /// forced pass that resubmits the kept body and gets a node conflict
+    /// clears the row's earlier answer. A later normal `304` then submits the
+    /// kept body again, after an operator decision.
+    #[tokio::test]
+    async fn stub_304_force_with_a_node_conflict_clears_the_earlier_answer() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"record_conflict"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        config.force_reingest = true;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        ingest_handle.await.expect("ingest stub task");
+        feed_handle.await.expect("feed stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "record_conflict".to_string(),
+                warnings: Vec::new(),
+            },
+            "the run summary must still report the rejection and its reason"
+        );
+
+        let updated = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("row must still exist");
+        assert_eq!(
+            updated.node_answer, None,
+            "ADR 0051 §5: a node conflict must clear an earlier answer"
         );
     }
 
