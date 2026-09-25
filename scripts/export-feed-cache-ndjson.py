@@ -12,6 +12,14 @@ feed in the node database. That URL is the source URL, and it is the URL that
 the `refresh` mode requested. A row for any other URL, for example a URL from
 a publisher-link wave, is skipped.
 
+With `--self-links`, the script exports a different set of rows. It exports
+a row only when its URL is the `declared_self_url` of a feed, and that value is
+not the stored `feed_url`. stophammer ADR 0052 section 2 moves such a record
+when a submission comes from its declared self link. The replay of these rows
+moves each record with no request to a feed host, and it follows no link. The
+`--self-links` rows need `--force`, because the node answers `no_change` for an
+unchanged body, and that answer does not move a record.
+
 Both databases are opened read-only. The script writes only the output file.
 
 Usage:
@@ -19,7 +27,7 @@ Usage:
       --cache /data/feed_cache.db \\
       --node-db /data/stophammer.db \\
       --output /data/repair.ndjson \\
-      [--since UNIX_SECONDS]
+      [--since UNIX_SECONDS] [--self-links]
 
 Then:
   stophammer-crawler --force ndjson --input /data/repair.ndjson \\
@@ -50,6 +58,18 @@ def load_source_feeds(node_db):
     return {url: (guid, title) for url, guid, title in rows}
 
 
+def load_self_link_feeds(node_db):
+    """Map each declared_self_url that is not the feed_url to (feed_guid, title).
+
+    stophammer ADR 0052 section 2. A submission from this URL moves the record.
+    """
+    rows = node_db.execute(
+        "SELECT declared_self_url, feed_guid, title FROM feeds "
+        "WHERE declared_self_url IS NOT NULL AND declared_self_url <> feed_url"
+    )
+    return {url: (guid, title) for url, guid, title in rows}
+
+
 def cache_rows(cache_db, since):
     """Yield (url, final_url, content_sha256, body_gzip, fetched_at), by URL."""
     query = (
@@ -59,7 +79,7 @@ def cache_rows(cache_db, since):
     yield from cache_db.execute(query, (since,))
 
 
-def export(cache_path, node_db_path, output_path, since):
+def export(cache_path, node_db_path, output_path, since, self_links=False):
     """Write one NDJSON row for each cache row at a source URL. Return counts."""
     counts = {
         "cache_rows": 0,
@@ -70,7 +90,7 @@ def export(cache_path, node_db_path, output_path, since):
     }
     node_db = open_read_only(node_db_path)
     cache_db = open_read_only(cache_path)
-    sources = load_source_feeds(node_db)
+    sources = load_self_link_feeds(node_db) if self_links else load_source_feeds(node_db)
     node_db.close()
 
     with open(output_path, "w", encoding="utf-8") as out:
@@ -124,9 +144,14 @@ def main():
         default=0,
         help="export only rows fetched at or after this Unix time (default: all)",
     )
+    parser.add_argument(
+        "--self-links",
+        action="store_true",
+        help="export the rows at a declared self link that is not the feed_url (ADR 0052)",
+    )
     args = parser.parse_args()
 
-    counts = export(args.cache, args.node_db, args.output, args.since)
+    counts = export(args.cache, args.node_db, args.output, args.since, args.self_links)
     for key, value in counts.items():
         print(f"{key}: {value}", file=sys.stderr)
     if counts["exported"] == 0:
