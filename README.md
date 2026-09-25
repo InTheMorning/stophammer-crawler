@@ -481,6 +481,22 @@ A forced pass still submits the kept body on a `304`. Pass `--no-revalidate`
 to send no conditional header, for a host that answers with an incorrect
 `ETag`. The `ndjson` mode does not fetch, so it has no `--feed-cache` flag.
 
+#### Replay the cache
+
+`scripts/export-feed-cache-ndjson.py` writes the cache rows of the stored feed
+URLs as `ndjson` input. The repair of stophammer ADR 0051 section 6 then
+applies each source body again with no request to a feed host:
+
+```bash
+./scripts/export-feed-cache-ndjson.py --cache /data/feed_cache.db \
+    --node-db /data/stophammer.db --output /data/repair.ndjson --since <unix>
+stophammer-crawler --force ndjson --input /data/repair.ndjson \
+    --state /data/repair_state.db --reset
+```
+
+The script opens both databases read-only. stophammer
+`docs/tasks/adr-0051-task-006-replay-fetch-cache.md` gives the procedure.
+
 ## Environment variables
 
 - **`CRAWL_TOKEN`** (required) --
