@@ -29,6 +29,15 @@ publisher found through an album. `gossip` follows in two levels, in
 `src/modes/gossip.rs`, with its own follow semaphore and host throttle.
 Deployed on 2026-09-24.
 
+[stophammer ADR 0052](../docs/adr/0052-a-source-moves-its-own-feed.md) task
+005 is complete on 2026-09-25 and not deployed. Each feed fetch client uses
+`redirect::Policy::none()`, and `fetch_following_redirects` in `src/crawl.rs`
+follows at most 10 hops. The ingest request carries `redirects`, one entry for
+each hop with its status. `follow_urls` also returns a declared
+`itunes:new-feed-url`. The gossip SSE stream keeps its own client with the
+default redirect policy. The node deploys first, because it accepts the new
+field as optional.
+
 `FORCE_REINGEST` and `--force` stay global to a run. `src/crawl.rs:350` adds
 `force_reingest` to each `/ingest/feed` payload, whatever the mode. Thus a
 forced pass must use `refresh`, which reads only feeds the index holds. A

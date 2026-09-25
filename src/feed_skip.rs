@@ -195,6 +195,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         }
     }
 

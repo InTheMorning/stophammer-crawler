@@ -34,22 +34,30 @@ pub enum FollowLevel {
 /// Gives the follow URLs of `feed`, filtered by the level it was fetched at
 /// (ADR 0049 §2, `stophammer` repository).
 ///
+/// `fetched_url` is the URL the crawler fetched to get `feed`. [`follow_urls`]
+/// needs it to skip a declared `itunes:new-feed-url` that names this same
+/// URL (`stophammer` ADR 0052 §2).
+///
 /// [`FollowLevel::Input`] gives every URL [`follow_urls`] gives.
 /// [`FollowLevel::Publisher`] gives those URLs only when `feed`'s
 /// `raw_medium` is `publisher`, ASCII case ignored. A feed that does not
 /// parse as a publisher feed gives nothing at this level, even when it
 /// carries a link of its own. [`FollowLevel::Listed`] always gives nothing.
 #[must_use]
-pub fn follow_urls_at_level(feed: &IngestFeedData, level: FollowLevel) -> Vec<String> {
+pub fn follow_urls_at_level(
+    feed: &IngestFeedData,
+    level: FollowLevel,
+    fetched_url: &str,
+) -> Vec<String> {
     match level {
-        FollowLevel::Input => follow_urls(feed),
+        FollowLevel::Input => follow_urls(feed, fetched_url),
         FollowLevel::Publisher => {
             let is_publisher_feed = feed
                 .raw_medium
                 .as_deref()
                 .is_some_and(|medium| medium.eq_ignore_ascii_case("publisher"));
             if is_publisher_feed {
-                follow_urls(feed)
+                follow_urls(feed, fetched_url)
             } else {
                 Vec::new()
             }
@@ -64,39 +72,54 @@ pub fn follow_urls_at_level(feed: &IngestFeedData, level: FollowLevel) -> Vec<St
 /// `remote_feed_url` of each channel-level remote item whose `medium` is
 /// `publisher`. A feed whose `raw_medium` is `publisher` gives the
 /// `remote_feed_url` of each channel-level remote item whose `medium` is
-/// `music`. Any other medium, including none, gives nothing.
+/// `music`. Any other medium, including none, gives none of these links.
 ///
 /// An item's own `medium` comparison also ignores ASCII case, so
 /// `medium="Music"` counts. An item with no URL, or a URL whose scheme is
 /// not `http` or `https`, is skipped. The URL is never changed, and none is
 /// made from a GUID. Duplicates are removed; the first position is kept.
+///
+/// `feed`'s own `itunes:new-feed-url` (`stophammer` ADR 0052 §2) is added
+/// last, when it is present, it is a followable URL, and it is not
+/// `fetched_url`, the URL the crawler fetched to get `feed`. This check runs
+/// whatever `feed`'s medium is.
 #[must_use]
-pub fn follow_urls(feed: &IngestFeedData) -> Vec<String> {
-    let target_medium = match feed.raw_medium.as_deref() {
-        Some(medium) if medium.eq_ignore_ascii_case("music") => "publisher",
-        Some(medium) if medium.eq_ignore_ascii_case("publisher") => "music",
-        _ => return Vec::new(),
-    };
-
+pub fn follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
-    for item in &feed.remote_items {
-        let Some(medium) = item.medium.as_deref() else {
-            continue;
-        };
-        if !medium.eq_ignore_ascii_case(target_medium) {
-            continue;
+    let target_medium = match feed.raw_medium.as_deref() {
+        Some(medium) if medium.eq_ignore_ascii_case("music") => Some("publisher"),
+        Some(medium) if medium.eq_ignore_ascii_case("publisher") => Some("music"),
+        _ => None,
+    };
+
+    if let Some(target_medium) = target_medium {
+        for item in &feed.remote_items {
+            let Some(medium) = item.medium.as_deref() else {
+                continue;
+            };
+            if !medium.eq_ignore_ascii_case(target_medium) {
+                continue;
+            }
+            let Some(url) = item.remote_feed_url.as_deref() else {
+                continue;
+            };
+            if !is_followable_url(url) {
+                continue;
+            }
+            if seen.insert(url.to_string()) {
+                urls.push(url.to_string());
+            }
         }
-        let Some(url) = item.remote_feed_url.as_deref() else {
-            continue;
-        };
-        if !is_followable_url(url) {
-            continue;
-        }
-        if seen.insert(url.to_string()) {
-            urls.push(url.to_string());
-        }
+    }
+
+    if let Some(new_feed_url) = feed.new_feed_url.as_deref()
+        && new_feed_url != fetched_url
+        && is_followable_url(new_feed_url)
+        && seen.insert(new_feed_url.to_string())
+    {
+        urls.push(new_feed_url.to_string());
     }
 
     urls
@@ -112,6 +135,11 @@ mod tests {
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef, IngestTrackData};
 
     use super::{FollowLevel, follow_urls, follow_urls_at_level};
+
+    /// The URL these tests treat as the one the crawler fetched. None of
+    /// the feeds these tests build declares this as its `new_feed_url`,
+    /// except where a test says so.
+    const FETCHED_URL: &str = "https://fetched.example/feed.xml";
 
     fn remote_item(position: i64, medium: Option<&str>, url: Option<&str>) -> IngestRemoteFeedRef {
         IngestRemoteFeedRef {
@@ -137,6 +165,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items,
             persons: Vec::new(),
             entity_ids: Vec::new(),
@@ -187,7 +218,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             vec!["https://publisher.example/feed.xml".to_string()],
             "a music feed must give the URL of its publisher item"
         );
@@ -204,7 +235,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             vec![
                 "https://a.example/feed.xml".to_string(),
                 "https://b.example/feed.xml".to_string(),
@@ -225,7 +256,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             vec!["https://publisher.example/feed.xml".to_string()],
             "raw_medium comparison must ignore ASCII case"
         );
@@ -243,7 +274,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             vec!["https://a.example/feed.xml".to_string()],
             "medium=\"Music\" must count, since the comparison ignores ASCII case"
         );
@@ -261,7 +292,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "a musicL feed is a different medium and must give nothing"
         );
@@ -279,7 +310,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "a feed with no medium must give nothing"
         );
@@ -290,7 +321,7 @@ mod tests {
         let data = feed(Some("music"), vec![remote_item(0, Some("publisher"), None)]);
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "an item with no URL must be skipped, not turned into a URL from its GUID"
         );
@@ -308,7 +339,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "a non-http(s) URL must be skipped"
         );
@@ -325,7 +356,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             vec!["https://a.example/feed.xml".to_string()],
             "a duplicate URL must give one entry, keeping the first position"
         );
@@ -339,7 +370,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "a remote item with no medium is not a listed album and must not be followed"
         );
@@ -356,9 +387,33 @@ mod tests {
             )]));
 
         assert_eq!(
-            follow_urls(&data),
+            follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
             "an item-level remote item, on a track, must not be followed"
+        );
+    }
+
+    #[test]
+    fn a_declared_new_feed_url_is_followed() {
+        let mut data = feed(None, Vec::new());
+        data.new_feed_url = Some("https://moved.example/feed.xml".to_string());
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec!["https://moved.example/feed.xml".to_string()],
+            "a declared new_feed_url must be followed (stophammer ADR 0052 §2)"
+        );
+    }
+
+    #[test]
+    fn a_new_feed_url_equal_to_the_fetched_url_is_not_followed() {
+        let mut data = feed(None, Vec::new());
+        data.new_feed_url = Some(FETCHED_URL.to_string());
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            Vec::<String>::new(),
+            "a new_feed_url that names the fetched URL must not be followed (stophammer ADR 0052 §2)"
         );
     }
 
@@ -374,7 +429,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls_at_level(&data, FollowLevel::Input),
+            follow_urls_at_level(&data, FollowLevel::Input, FETCHED_URL),
             vec!["https://publisher.example/feed.xml".to_string()],
             "FollowLevel::Input must give every follow_urls link"
         );
@@ -392,7 +447,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls_at_level(&data, FollowLevel::Publisher),
+            follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
             vec!["https://a.example/feed.xml".to_string()],
             "FollowLevel::Publisher must give the music links of a feed that parses as publisher"
         );
@@ -410,7 +465,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls_at_level(&data, FollowLevel::Publisher),
+            follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
             Vec::<String>::new(),
             "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed"
         );
@@ -428,7 +483,7 @@ mod tests {
         );
 
         assert_eq!(
-            follow_urls_at_level(&data, FollowLevel::Listed),
+            follow_urls_at_level(&data, FollowLevel::Listed, FETCHED_URL),
             Vec::<String>::new(),
             "FollowLevel::Listed must always give nothing, so the walk stops at one level (ADR 0049 §2 step 3)"
         );

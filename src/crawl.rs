@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::header::{
-    ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER,
+    ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
 };
 use sha2::{Digest, Sha256};
 use stophammer_parser::profile;
@@ -202,6 +202,80 @@ impl CrawlOutcome {
     }
 }
 
+/// One redirect hop of a feed fetch (`stophammer` ADR 0052 §2).
+///
+/// `url` is the URL that answered with the redirect. `status` is its HTTP
+/// status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RedirectHop {
+    pub url: String,
+    pub status: u16,
+}
+
+/// The redirect statuses this crawler follows itself (`stophammer` ADR 0052
+/// §2). Each feed fetch client turns its own redirect policy off, so the
+/// crawler can put a conditional header on every hop.
+const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
+
+/// The most redirect hops one fetch follows (`stophammer` ADR 0052 §2). This
+/// is the limit `reqwest`'s own default redirect policy used before this
+/// change.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// Sends a request, and follows each redirect answer to its `Location`
+/// header (`stophammer` ADR 0052 §2).
+///
+/// `build_request` builds the request for one URL. The helper calls it
+/// again for each hop, with that hop's URL. A caller puts the same headers
+/// on every request this way, for example the conditional headers of ADR
+/// 0050.
+///
+/// Gives the last response, and the hops in order. `url` on a hop is the
+/// URL that answered with the redirect. A relative `Location` resolves
+/// against the current URL. A redirect answer with no `Location` header, or
+/// with one that does not parse, stops the chain there: that answer becomes
+/// the last response. More than 10 hops gives a fetch error, the same limit
+/// `reqwest`'s own default policy gave before this change.
+async fn fetch_following_redirects(
+    start_url: &str,
+    build_request: impl Fn(&str) -> reqwest::RequestBuilder,
+) -> Result<(reqwest::Response, Vec<RedirectHop>), String> {
+    let mut current_url = start_url.to_string();
+    let mut hops = Vec::new();
+
+    loop {
+        let resp = build_request(&current_url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        if !REDIRECT_STATUSES.contains(&status) {
+            return Ok((resp, hops));
+        }
+
+        if hops.len() >= MAX_REDIRECT_HOPS {
+            return Err(format!(
+                "too many redirects (more than {MAX_REDIRECT_HOPS} hops)"
+            ));
+        }
+
+        let Some(location) = header_str(resp.headers(), LOCATION) else {
+            return Ok((resp, hops));
+        };
+        let Ok(next_url) = reqwest::Url::parse(&current_url).and_then(|base| base.join(&location))
+        else {
+            return Ok((resp, hops));
+        };
+
+        hops.push(RedirectHop {
+            url: current_url,
+            status,
+        });
+        current_url = next_url.to_string();
+    }
+}
+
 /// Importer-facing details preserved from the shared crawl pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrawlReport {
@@ -213,6 +287,10 @@ pub struct CrawlReport {
     pub content_sha256: Option<String>,
     pub raw_xml: Option<String>,
     pub parsed_feed: Option<IngestFeedData>,
+    /// The redirect hops of the fetch that produced this report
+    /// (`stophammer` ADR 0052 §2). Empty when the fetch had no redirect, or
+    /// when the report did not come from a live fetch.
+    pub redirects: Vec<RedirectHop>,
 }
 
 impl CrawlReport {
@@ -344,6 +422,7 @@ fn build_crawl_report(
     final_url: Option<String>,
     content_sha256: Option<String>,
     raw_xml: Option<String>,
+    redirects: Vec<RedirectHop>,
 ) -> CrawlReport {
     CrawlReport {
         outcome,
@@ -354,6 +433,7 @@ fn build_crawl_report(
         content_sha256,
         raw_xml,
         parsed_feed: feed_data.cloned(),
+        redirects,
     }
 }
 
@@ -364,6 +444,7 @@ async fn post_ingest_payload(
     content_hash: &str,
     feed_data: Option<IngestFeedData>,
     config: &CrawlConfig,
+    redirects: &[RedirectHop],
 ) -> CrawlOutcome {
     let mut payload = serde_json::json!({
         "canonical_url": canonical_url,
@@ -372,6 +453,7 @@ async fn post_ingest_payload(
         "http_status": http_status,
         "content_hash": content_hash,
         "feed_data": feed_data,
+        "redirects": redirects,
     });
     if config.force_reingest {
         payload["force_reingest"] = serde_json::json!(true);
@@ -442,6 +524,10 @@ async fn post_ingest_payload(
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
+)]
 pub async fn ingest_cached_feed_report(
     source_url: &str,
     canonical_url: &str,
@@ -450,6 +536,7 @@ pub async fn ingest_cached_feed_report(
     content_hash: Option<&str>,
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
+    redirects: &[RedirectHop],
 ) -> CrawlReport {
     let content_hash = content_hash.map_or_else(
         || hex::encode(Sha256::digest(raw_xml.as_bytes())),
@@ -466,6 +553,7 @@ pub async fn ingest_cached_feed_report(
                 Some(canonical_url.to_string()),
                 Some(content_hash),
                 Some(raw_xml.to_string()),
+                redirects.to_vec(),
             );
         }
     };
@@ -477,6 +565,7 @@ pub async fn ingest_cached_feed_report(
         &content_hash,
         feed_data.clone(),
         config,
+        redirects,
     )
     .await;
 
@@ -487,10 +576,15 @@ pub async fn ingest_cached_feed_report(
         Some(canonical_url.to_string()),
         Some(content_hash),
         Some(raw_xml.to_string()),
+        redirects.to_vec(),
     )
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
+)]
 pub async fn ingest_cached_feed(
     source_url: &str,
     canonical_url: &str,
@@ -499,6 +593,7 @@ pub async fn ingest_cached_feed(
     content_hash: Option<&str>,
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
+    redirects: &[RedirectHop],
 ) -> CrawlOutcome {
     ingest_cached_feed_report(
         source_url,
@@ -508,6 +603,7 @@ pub async fn ingest_cached_feed(
         content_hash,
         fallback_guid,
         config,
+        redirects,
     )
     .await
     .outcome
@@ -638,6 +734,10 @@ fn write_cache_row(
 
 /// Parse, POST, and cache a freshly fetched `200` body (ADR 0050 §3,
 /// `stophammer` repository).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
+)]
 async fn ingest_fresh_and_cache(
     url: &str,
     final_url: Option<String>,
@@ -646,6 +746,7 @@ async fn ingest_fresh_and_cache(
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
+    redirects: &[RedirectHop],
 ) -> CrawlReport {
     let hash = hex::encode(Sha256::digest(body));
     let xml = String::from_utf8_lossy(body);
@@ -659,6 +760,7 @@ async fn ingest_fresh_and_cache(
         Some(&hash),
         fallback_guid,
         config,
+        redirects,
     )
     .await;
 
@@ -683,6 +785,9 @@ async fn ingest_fresh_and_cache(
 /// Fetch a URL with no conditional header, after a `304` this crawl cannot
 /// trust (ADR 0050 §3, `stophammer` repository). Sends exactly one more
 /// GET, then continues as for `200`. Never loops.
+///
+/// Follows its own redirect chain (`stophammer` ADR 0052 §2), and gives its
+/// hops to the report, as any other feed fetch does.
 async fn refetch_unconditional(
     client: &reqwest::Client,
     url: &str,
@@ -690,18 +795,14 @@ async fn refetch_unconditional(
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
 ) -> CrawlReport {
-    let resp = match client
-        .get(url)
-        .header("User-Agent", &config.user_agent)
-        .timeout(config.fetch_timeout)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
+    let build_request = |hop_url: &str| build_hop_request(client, hop_url, config, None);
+
+    let (resp, redirects) = match fetch_following_redirects(url, build_request).await {
+        Ok(pair) => pair,
+        Err(reason) => {
             return build_crawl_report(
                 CrawlOutcome::FetchError {
-                    reason: e.to_string(),
+                    reason,
                     retryable: true,
                     retry_after_secs: None,
                 },
@@ -710,6 +811,7 @@ async fn refetch_unconditional(
                 None,
                 None,
                 None,
+                Vec::new(),
             );
         }
     };
@@ -732,6 +834,7 @@ async fn refetch_unconditional(
                 final_url,
                 None,
                 None,
+                redirects,
             );
         }
     };
@@ -748,6 +851,7 @@ async fn refetch_unconditional(
             final_url,
             None,
             None,
+            redirects,
         );
     }
 
@@ -759,6 +863,7 @@ async fn refetch_unconditional(
         fallback_guid,
         config,
         cache,
+        &redirects,
     )
     .await
 }
@@ -772,6 +877,7 @@ async fn ingest_kept_body(
     fallback_guid: Option<&str>,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
+    redirects: &[RedirectHop],
 ) -> CrawlReport {
     let mut report = ingest_cached_feed_report(
         url,
@@ -781,6 +887,7 @@ async fn ingest_kept_body(
         Some(&cached.content_sha256),
         fallback_guid,
         config,
+        redirects,
     )
     .await;
     // The node saw an ingest, but the crawler's own fetch answered `304`.
@@ -821,6 +928,7 @@ fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) 
                 Some(cached.final_url.clone()),
                 Some(cached.content_sha256.clone()),
                 Some(cached.body.clone()),
+                Vec::new(),
             );
         }
     };
@@ -832,7 +940,32 @@ fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) 
         Some(cached.final_url.clone()),
         Some(cached.content_sha256.clone()),
         Some(cached.body.clone()),
+        Vec::new(),
     )
+}
+
+/// Builds one hop's request (`stophammer` ADR 0052 §2). Adds the
+/// conditional headers of ADR 0050 when `row` is given.
+fn build_hop_request(
+    client: &reqwest::Client,
+    hop_url: &str,
+    config: &CrawlConfig,
+    row: Option<&CachedFeed>,
+) -> reqwest::RequestBuilder {
+    let mut request = client
+        .get(hop_url)
+        .header("User-Agent", &config.user_agent)
+        .timeout(config.fetch_timeout);
+    let Some(row) = row else {
+        return request;
+    };
+    if let Some(etag) = &row.etag {
+        request = request.header(IF_NONE_MATCH, etag.as_str());
+    }
+    if let Some(last_modified) = &row.last_modified {
+        request = request.header(IF_MODIFIED_SINCE, last_modified.as_str());
+    }
+    request
 }
 
 /// Fetch → SHA-256 → parse → POST. Never panics.
@@ -853,30 +986,23 @@ pub async fn crawl_feed_report(
     // repository).
     let cached = read_cached_row(cache, url);
     let send_conditional = config.revalidate && cached.is_some();
-
-    // 1. Fetch
-    let mut request = client
-        .get(url)
-        .header("User-Agent", &config.user_agent)
-        .timeout(config.fetch_timeout);
-    if send_conditional {
-        let row = cached
+    let conditional_row = send_conditional.then(|| {
+        cached
             .as_ref()
-            .expect("send_conditional is true only when a cached row exists");
-        if let Some(etag) = &row.etag {
-            request = request.header(IF_NONE_MATCH, etag.as_str());
-        }
-        if let Some(last_modified) = &row.last_modified {
-            request = request.header(IF_MODIFIED_SINCE, last_modified.as_str());
-        }
-    }
+            .expect("send_conditional is true only when a cached row exists")
+    });
 
-    let resp = match request.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // 1. Fetch, following each redirect hop by hand (`stophammer` ADR 0052
+    // §2). The conditional headers of ADR 0050 go on every hop, since
+    // `build_hop_request` runs again for each one.
+    let build_request = |hop_url: &str| build_hop_request(client, hop_url, config, conditional_row);
+
+    let (resp, redirects) = match fetch_following_redirects(url, build_request).await {
+        Ok(pair) => pair,
+        Err(reason) => {
             return build_crawl_report(
                 CrawlOutcome::FetchError {
-                    reason: e.to_string(),
+                    reason,
                     retryable: true,
                     retry_after_secs: None,
                 },
@@ -885,6 +1011,7 @@ pub async fn crawl_feed_report(
                 None,
                 None,
                 None,
+                Vec::new(),
             );
         }
     };
@@ -907,6 +1034,7 @@ pub async fn crawl_feed_report(
                 final_url,
                 None,
                 None,
+                redirects,
             );
         }
     };
@@ -921,6 +1049,7 @@ pub async fn crawl_feed_report(
                 fallback_guid,
                 config,
                 cache,
+                &redirects,
             )
             .await
         }
@@ -934,7 +1063,7 @@ pub async fn crawl_feed_report(
             let row = cached
                 .as_ref()
                 .expect("plan_after_response gives IngestKept only with a cached row");
-            ingest_kept_body(url, row, fallback_guid, config, cache).await
+            ingest_kept_body(url, row, fallback_guid, config, cache, &redirects).await
         }
         FetchAction::SkipIngest => {
             let row = cached
@@ -953,6 +1082,7 @@ pub async fn crawl_feed_report(
             final_url,
             None,
             None,
+            redirects,
         ),
     }
 }
@@ -960,7 +1090,7 @@ pub async fn crawl_feed_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, body_preview,
+        CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, RedirectHop, body_preview,
         build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
         is_retryable_http_status, is_retryable_ingest_status, is_uncached_node_answer,
         normalize_rejection_reason, parse_feed_xml, plan_after_response,
@@ -990,6 +1120,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items: Vec::new(),
             persons: Vec::new(),
             entity_ids: Vec::new(),
@@ -1123,6 +1256,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
 
         assert_eq!(report.fetch_http_status, Some(404));
@@ -1143,6 +1277,7 @@ mod tests {
             Some("https://example.com/feed.xml".to_string()),
             Some("abc123".to_string()),
             Some("<rss/>".to_string()),
+            Vec::new(),
         );
 
         assert_eq!(report.fetch_http_status, Some(200));
@@ -1165,6 +1300,7 @@ mod tests {
             Some("https://example.com/feed.xml".to_string()),
             Some("abc123".to_string()),
             Some("<rss/>".to_string()),
+            Vec::new(),
         );
 
         assert_eq!(report.fetch_http_status, Some(200));
@@ -1450,6 +1586,49 @@ mod tests {
             request
         });
         (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// Start a stub HTTP/1.1 server, on `127.0.0.1`, for exactly
+    /// `responses.len()` requests, in order. Each request, in turn, gets
+    /// the matching answer from `responses`. Gives back the captured
+    /// requests, in the order they arrived.
+    ///
+    /// A test that follows a redirect on the same host uses this, since
+    /// the crawler sends each hop of a chain as its own request, and
+    /// [`spawn_stub`] answers only one.
+    async fn spawn_multi_stub(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<Vec<StubRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept stub connection");
+                let request = read_stub_request(&mut stream).await;
+                stream
+                    .write_all(&response)
+                    .await
+                    .expect("write stub response");
+                let _ = stream.shutdown().await;
+                requests.push(request);
+            }
+            requests
+        });
+        (format!("127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// A fetch client with no redirect policy of its own (`stophammer` ADR
+    /// 0052 §2), the same as every feed fetch client in production. A test
+    /// that answers a redirect needs this, or `reqwest` follows the
+    /// redirect itself, and the crawler never sees the hop.
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to build stub-test HTTP client")
     }
 
     /// A fresh, empty fetch-cache database, at a temporary path that
@@ -1972,6 +2151,262 @@ mod tests {
             feed_request.header("if-none-match"),
             None,
             "revalidate = false must send no conditional header"
+        );
+    }
+
+    // ---- redirect hops (`stophammer` ADR 0052 §2) ----
+
+    /// Builds an ingest stub that accepts one POST, for a test that fetches
+    /// a redirect chain and does not check the ingest body.
+    async fn spawn_accepting_ingest_stub() -> (String, tokio::task::JoinHandle<StubRequest>) {
+        spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_second_url_gives_one_hop_and_that_url_as_the_final_url() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (addr_b, handle_b) = spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.redirects,
+            vec![RedirectHop {
+                url: url_a.clone(),
+                status: 301,
+            }],
+            "the report must carry one hop, naming the URL that answered with the redirect"
+        );
+        assert_eq!(
+            report.final_url.as_deref(),
+            Some(url_b.as_str()),
+            "the final URL must be the URL the redirect named"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_302_then_a_301_gives_two_hops_in_order() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (addr_c, handle_c) = spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let url_c = format!("http://{addr_c}/feed.xml");
+
+        let (addr_b, handle_b) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", &url_c)],
+            b"",
+        ))
+        .await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 302 Found",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+        handle_c.await.expect("stub c task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.redirects,
+            vec![
+                RedirectHop {
+                    url: url_a.clone(),
+                    status: 302,
+                },
+                RedirectHop {
+                    url: url_b.clone(),
+                    status: 301,
+                },
+            ],
+            "the hops must appear in the order the crawler followed them"
+        );
+        assert_eq!(report.final_url.as_deref(), Some(url_c.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_relative_location_resolves_against_the_current_url() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let responses = vec![
+            stub_response(
+                "HTTP/1.1 301 Moved Permanently",
+                &[("location", "/moved.xml")],
+                b"",
+            ),
+            stub_response("HTTP/1.1 200 OK", &[], body),
+        ];
+        let (feed_addr, feed_handle) = spawn_multi_stub(responses).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+        let expected_final_url = format!("http://{feed_addr}/moved.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        let requests = feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            requests.len(),
+            2,
+            "a relative Location must be followed with one more request"
+        );
+        assert_eq!(
+            report.final_url.as_deref(),
+            Some(expected_final_url.as_str()),
+            "a relative Location must resolve against the current URL"
+        );
+    }
+
+    /// More than 10 redirect hops is a fetch error, the same limit
+    /// `reqwest`'s own default policy gave before this change. The stub
+    /// answers 11 redirects in a row, each pointing to itself by a relative
+    /// `Location`, and never a `200`.
+    #[tokio::test]
+    async fn eleven_redirects_in_a_row_give_a_fetch_error() {
+        let redirect = stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", "/loop")],
+            b"",
+        );
+        let responses = (0..11).map(|_| redirect.clone()).collect();
+        let (addr, handle) = spawn_multi_stub(responses).await;
+        let url = format!("http://{addr}/start");
+
+        let client = no_redirect_client();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &url, None, &config, None).await;
+
+        let requests = handle.await.expect("stub task");
+
+        assert_eq!(
+            requests.len(),
+            11,
+            "the crawler must stop after the 11th redirect answer"
+        );
+        assert!(
+            matches!(
+                report.outcome,
+                CrawlOutcome::FetchError {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "more than 10 redirect hops must be a retryable fetch error, got {:?}",
+            report.outcome
+        );
+        assert!(
+            report
+                .outcome
+                .reason()
+                .is_some_and(|r| r.contains("too many redirects")),
+            "the reason must name the redirect limit, got {:?}",
+            report.outcome.reason()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_301_then_a_304_puts_the_hop_in_the_ingest_payload() {
+        let (addr_b, handle_b) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        seed_cached_row(&cache, &url_a, None);
+
+        let _report = crawl_feed_report(&client, &url_a, None, &config, Some(&cache)).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&ingest_request.body).expect("ingest payload must be JSON");
+        assert_eq!(
+            payload["redirects"],
+            serde_json::json!([{"url": url_a, "status": 301}]),
+            "the ingest payload must carry the hop of the conditional request that answered 304"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fetch_with_no_redirect_sends_an_empty_redirects_list() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.redirects,
+            Vec::new(),
+            "a fetch with no redirect must report no hop"
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&ingest_request.body).expect("ingest payload must be JSON");
+        assert_eq!(
+            payload["redirects"],
+            serde_json::json!([]),
+            "the ingest payload must send an empty redirects list when there was no redirect"
         );
     }
 }

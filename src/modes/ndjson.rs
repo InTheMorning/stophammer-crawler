@@ -167,6 +167,8 @@ async fn ingest_with_retries(
     let mut attempt = 1;
 
     loop {
+        // ADR 0052 §2 (`stophammer` repository): a replay has no live
+        // fetch, so it has no redirect hop.
         let outcome = ingest_cached_feed(
             source_url,
             canonical_url,
@@ -175,6 +177,7 @@ async fn ingest_with_retries(
             content_hash,
             fallback_guid,
             config,
+            &[],
         )
         .await;
 

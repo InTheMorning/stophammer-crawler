@@ -16,7 +16,25 @@ use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
 };
 
+/// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
+///
+/// Redirects are off. The crawler follows a redirect chain itself, so it
+/// can put a conditional header on every hop, and record each hop.
 fn create_async_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to create async HTTP client")
+}
+
+/// Builds a client for the gossip-listener SSE stream.
+///
+/// This request must follow its own redirect, so it does not share
+/// [`create_async_client`]'s policy. That policy turns redirects off, for
+/// the manual chain a feed fetch builds (`stophammer` ADR 0052 §2).
+fn create_sse_client() -> reqwest::Client {
     reqwest::Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
@@ -1158,7 +1176,7 @@ async fn stream_sse_events(
 ) -> Result<(), String> {
     eprintln!("gossip: connecting to SSE at {sse_url}");
 
-    let async_client = create_async_client();
+    let async_client = create_sse_client();
     let response = async_client
         .get(sse_url)
         .header("Accept", "text/event-stream")
@@ -2041,6 +2059,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         }
     }
 
@@ -2064,6 +2083,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items: vec![IngestRemoteFeedRef {
                 position: 0,
                 medium: Some("music".to_string()),
@@ -2099,6 +2121,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items: vec![IngestRemoteFeedRef {
                 position: 0,
                 medium: Some("publisher".to_string()),

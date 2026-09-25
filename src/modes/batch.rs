@@ -12,6 +12,18 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const CRAWL_ATTEMPTS: u32 = 3;
 
+/// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
+///
+/// Redirects are off. The crawler follows a redirect chain itself, through
+/// [`crate::crawl::crawl_feed_report`], so it can put a conditional header
+/// on every hop, and record each hop.
+pub(crate) fn build_feed_fetch_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build feed fetch HTTP client")
+}
+
 /// A wave's collected follow URLs, indexed by each task's position in the
 /// URL list it was given. The index lets [`run_wave`] put the URLs back in
 /// submission order once every task has finished, since tasks themselves
@@ -198,7 +210,10 @@ pub(crate) fn report_follow_urls(report: &CrawlReport, level: FollowLevel) -> Ve
     let Some(feed) = &report.parsed_feed else {
         return Vec::new();
     };
-    follow_urls_at_level(feed, level)
+    // ADR 0052 §2 (`stophammer` repository): `follow_urls` needs the
+    // fetched URL, to skip a `new_feed_url` that names it.
+    let fetched_url = report.final_url.as_deref().unwrap_or_default();
+    follow_urls_at_level(feed, level, fetched_url)
 }
 
 /// The fetch counts of one batch pass, added up over every wave (ADR 0050
@@ -493,7 +508,7 @@ pub async fn run_urls(
     );
 
     let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(build_feed_fetch_client());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
     let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
@@ -574,6 +589,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items,
             persons: Vec::new(),
             entity_ids: Vec::new(),
@@ -597,6 +615,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: Some(feed),
+            redirects: Vec::new(),
         }
     }
 
@@ -748,6 +767,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         };
 
         assert_eq!(
@@ -930,6 +950,7 @@ mod tests {
                     content_sha256: None,
                     raw_xml: None,
                     parsed_feed: None,
+                    redirects: Vec::new(),
                 },
                 other => panic!("unexpected fetch of {other}"),
             };
@@ -996,6 +1017,7 @@ mod tests {
                     content_sha256: None,
                     raw_xml: None,
                     parsed_feed: None,
+                    redirects: Vec::new(),
                 },
                 "https://pub2.example/feed.xml" => CrawlReport {
                     outcome: CrawlOutcome::FetchError {
@@ -1010,6 +1032,7 @@ mod tests {
                     content_sha256: None,
                     raw_xml: None,
                     parsed_feed: None,
+                    redirects: Vec::new(),
                 },
                 other => panic!("unexpected fetch of {other}"),
             };

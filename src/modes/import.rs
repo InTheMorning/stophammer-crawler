@@ -23,6 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
 use crate::feed_cache::FeedCacheDb;
+use crate::modes::batch::build_feed_fetch_client;
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
 
@@ -946,6 +947,7 @@ fn build_import_timeout_report(timeout_secs: u64) -> CrawlReport {
         content_sha256: None,
         raw_xml: None,
         parsed_feed: None,
+        redirects: Vec::new(),
     }
 }
 
@@ -1703,7 +1705,7 @@ pub async fn run(
         config
     });
 
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(build_feed_fetch_client());
     let wavlake_throttle =
         (scope == ImportScope::WavlakeOnly && !dry_run).then(|| Arc::new(WavlakeThrottle::new()));
     let mut total_processed: u64 = 0;
@@ -2019,6 +2021,9 @@ mod tests {
             owner_name: None,
             pub_date: None,
             last_build_date: None,
+            new_feed_url: None,
+            locked: None,
+            locked_owner: None,
             remote_items: Vec::new(),
             persons: Vec::new(),
             entity_ids: Vec::new(),
@@ -2042,6 +2047,7 @@ mod tests {
             content_sha256: Some("abc123".to_string()),
             raw_xml: Some("<rss/>".to_string()),
             parsed_feed: Some(sample_parsed_feed()),
+            redirects: Vec::new(),
         }
     }
 
@@ -2351,6 +2357,7 @@ mod tests {
             content_sha256: Some("abc123".to_string()),
             raw_xml: Some("<rss/>".to_string()),
             parsed_feed: None,
+            redirects: Vec::new(),
         };
 
         assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
@@ -2372,6 +2379,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         };
 
         assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
@@ -2818,6 +2826,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         };
 
         assert_eq!(wavlake_throttle_delay(&report, 1), Duration::from_secs(301));
@@ -2834,6 +2843,7 @@ mod tests {
             content_sha256: None,
             raw_xml: None,
             parsed_feed: None,
+            redirects: Vec::new(),
         };
 
         assert_eq!(
