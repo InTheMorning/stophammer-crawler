@@ -2,6 +2,7 @@ mod crawl;
 mod dedup;
 mod feed_cache;
 mod feed_skip;
+mod fetch_guard;
 mod follow;
 mod modes;
 mod pool;

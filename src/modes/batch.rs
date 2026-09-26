@@ -12,14 +12,19 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const CRAWL_ATTEMPTS: u32 = 3;
 
-/// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
+/// Builds a client for a feed fetch (`stophammer` ADR 0052 §2). `import`
+/// uses this client too.
 ///
 /// Redirects are off. The crawler follows a redirect chain itself, through
 /// [`crate::crawl::crawl_feed_report`], so it can put a conditional header
 /// on every hop, and record each hop.
+///
+/// The DNS resolver accepts only a public answer (`stophammer` ADR 0054
+/// §1). It pins the client to the address it resolved.
 pub(crate) fn build_feed_fetch_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(crate::fetch_guard::PublicOnlyResolver))
         .build()
         .expect("failed to build feed fetch HTTP client")
 }
@@ -1205,6 +1210,10 @@ mod tests {
         let mut config =
             CrawlConfig::dry_run("stophammer-crawler-test/1.0", Duration::from_secs(5));
         config.ingest_url = format!("http://{ingest_addr}/ingest/feed");
+        // This test fetches its own stub server on a loopback address (ADR
+        // 0054 §1, `stophammer` repository). Production code must never
+        // set this.
+        config.allow_private_targets = true;
         let cache = test_cache();
         let host_throttle = HostThrottle::new(Duration::from_millis(0));
 

@@ -25,6 +25,9 @@ fn create_async_client() -> reqwest::Client {
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
+        // The DNS resolver accepts only a public answer. It pins the
+        // client to the address it resolved (`stophammer` ADR 0054 §1).
+        .dns_resolver(Arc::new(crate::fetch_guard::PublicOnlyResolver))
         .build()
         .expect("failed to create async HTTP client")
 }

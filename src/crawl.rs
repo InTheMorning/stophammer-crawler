@@ -9,6 +9,7 @@ use stophammer_parser::profile;
 use stophammer_parser::types::IngestFeedData;
 
 use crate::feed_cache::{CachedFeed, FeedCacheDb, FetchedFeed, unix_now};
+use crate::fetch_guard;
 
 const HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
 
@@ -32,6 +33,13 @@ pub struct CrawlConfig {
     /// already holds (ADR 0050 §2 and §5, `stophammer` repository). A pass
     /// with `--no-revalidate` sets this to `false`.
     pub revalidate: bool,
+    /// When true, the redirect loop skips the address check of ADR 0054 §1
+    /// (`stophammer` repository). The check runs before each request.
+    /// Production code must always keep this `false`. A test that fetches
+    /// a local stub server sets it to `true`. The resolver does not run
+    /// for an IP literal. Without this switch, the loop would reject the
+    /// stub's own loopback address.
+    pub allow_private_targets: bool,
     /// Dedicated HTTP client for ingest POSTs, built with connection pooling
     /// disabled so stale keep-alive sockets never cause spurious failures.
     ingest_client: reqwest::Client,
@@ -49,6 +57,7 @@ impl CrawlConfig {
             ingest_timeout,
             force_reingest,
             revalidate: true,
+            allow_private_targets: false,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -64,6 +73,7 @@ impl CrawlConfig {
             ingest_timeout,
             force_reingest: false,
             revalidate: true,
+            allow_private_targets: false,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -235,6 +245,31 @@ const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 /// change.
 const MAX_REDIRECT_HOPS: usize = 10;
 
+/// One failed attempt of [`fetch_following_redirects`]. It holds a reason,
+/// and whether the crawler should retry the fetch later. A rejection of
+/// ADR 0054 §1 (`stophammer` repository) is never retryable. A later
+/// attempt would see the same address.
+struct FetchLoopError {
+    reason: String,
+    retryable: bool,
+}
+
+impl FetchLoopError {
+    fn retryable(reason: String) -> Self {
+        Self {
+            reason,
+            retryable: true,
+        }
+    }
+
+    fn not_public(reason: String) -> Self {
+        Self {
+            reason,
+            retryable: false,
+        }
+    }
+}
+
 /// Sends a request, and follows each redirect answer to its `Location`
 /// header (`stophammer` ADR 0052 §2).
 ///
@@ -242,6 +277,12 @@ const MAX_REDIRECT_HOPS: usize = 10;
 /// again for each hop, with that hop's URL. A caller puts the same headers
 /// on every request this way, for example the conditional headers of ADR
 /// 0050.
+///
+/// Before each request, this checks the target against ADR 0054 §1
+/// (`stophammer` repository). It rejects a target that is not public,
+/// unless `allow_private_targets` is `true`. The client's own resolver can
+/// also reject a target. This function finds that rejection in the error
+/// chain of the failed request.
 ///
 /// Gives the last response, and the hops in order. `url` on a hop is the
 /// URL that answered with the redirect. A relative `Location` resolves
@@ -251,16 +292,28 @@ const MAX_REDIRECT_HOPS: usize = 10;
 /// `reqwest`'s own default policy gave before this change.
 async fn fetch_following_redirects(
     start_url: &str,
+    allow_private_targets: bool,
     build_request: impl Fn(&str) -> reqwest::RequestBuilder,
-) -> Result<(reqwest::Response, Vec<RedirectHop>), String> {
+) -> Result<(reqwest::Response, Vec<RedirectHop>), FetchLoopError> {
     let mut current_url = start_url.to_string();
     let mut hops = Vec::new();
 
     loop {
-        let resp = build_request(&current_url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        if !allow_private_targets {
+            let target = reqwest::Url::parse(&current_url)
+                .map_err(|e| FetchLoopError::retryable(format!("invalid URL: {e}")))?;
+            fetch_guard::check_target(&target).map_err(FetchLoopError::not_public)?;
+        }
+
+        let resp = match build_request(&current_url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(match fetch_guard::non_public_rejection(&e) {
+                    Some(reason) => FetchLoopError::not_public(reason),
+                    None => FetchLoopError::retryable(e.to_string()),
+                });
+            }
+        };
 
         let status = resp.status().as_u16();
         if !REDIRECT_STATUSES.contains(&status) {
@@ -268,9 +321,9 @@ async fn fetch_following_redirects(
         }
 
         if hops.len() >= MAX_REDIRECT_HOPS {
-            return Err(format!(
+            return Err(FetchLoopError::retryable(format!(
                 "too many redirects (more than {MAX_REDIRECT_HOPS} hops)"
-            ));
+            )));
         }
 
         let Some(location) = header_str(resp.headers(), LOCATION) else {
@@ -829,24 +882,25 @@ async fn refetch_unconditional(
 ) -> CrawlReport {
     let build_request = |hop_url: &str| build_hop_request(client, hop_url, config, None);
 
-    let (resp, redirects) = match fetch_following_redirects(url, build_request).await {
-        Ok(pair) => pair,
-        Err(reason) => {
-            return build_crawl_report(
-                CrawlOutcome::FetchError {
-                    reason,
-                    retryable: true,
-                    retry_after_secs: None,
-                },
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-            );
-        }
-    };
+    let (resp, redirects) =
+        match fetch_following_redirects(url, config.allow_private_targets, build_request).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                return build_crawl_report(
+                    CrawlOutcome::FetchError {
+                        reason: err.reason,
+                        retryable: err.retryable,
+                        retry_after_secs: None,
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                );
+            }
+        };
 
     let status = resp.status().as_u16();
     let final_url = Some(resp.url().to_string());
@@ -1030,24 +1084,25 @@ pub async fn crawl_feed_report(
     // `build_hop_request` runs again for each one.
     let build_request = |hop_url: &str| build_hop_request(client, hop_url, config, conditional_row);
 
-    let (resp, redirects) = match fetch_following_redirects(url, build_request).await {
-        Ok(pair) => pair,
-        Err(reason) => {
-            return build_crawl_report(
-                CrawlOutcome::FetchError {
-                    reason,
-                    retryable: true,
-                    retry_after_secs: None,
-                },
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-            );
-        }
-    };
+    let (resp, redirects) =
+        match fetch_following_redirects(url, config.allow_private_targets, build_request).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                return build_crawl_report(
+                    CrawlOutcome::FetchError {
+                        reason: err.reason,
+                        retryable: err.retryable,
+                        retry_after_secs: None,
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                );
+            }
+        };
 
     let status = resp.status().as_u16();
     let final_url = Some(resp.url().to_string());
@@ -1708,10 +1763,18 @@ mod tests {
     }
 
     /// A `CrawlConfig` for a stub test. Never reads the environment.
+    ///
+    /// Every stub server in this module runs on a loopback address (ADR
+    /// 0054 §1, `stophammer` repository). Production code must never turn
+    /// off the address check. This helper turns it off here, for tests
+    /// that fetch such a stub. One test turns the check back on, to test
+    /// the check itself. See
+    /// `a_private_target_fails_before_any_request_reaches_it`.
     fn test_config(ingest_url: String) -> CrawlConfig {
         let mut config =
             CrawlConfig::dry_run("stophammer-crawler-test/1.0", Duration::from_secs(5));
         config.ingest_url = ingest_url;
+        config.allow_private_targets = true;
         config
     }
 
@@ -2514,6 +2577,46 @@ mod tests {
             payload["redirects"],
             serde_json::json!([]),
             "the ingest payload must send an empty redirects list when there was no redirect"
+        );
+    }
+
+    /// `stophammer` ADR 0054 §1: the loop rejects a private target before
+    /// it sends the request. The stub answers `301` to itself. A guard
+    /// that ran only after a response would still see a hit. This test
+    /// proves the guard runs first. The stub never receives a connection.
+    #[tokio::test]
+    async fn a_private_target_fails_before_any_request_reaches_it() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", "/")],
+            b"",
+        ))
+        .await;
+        let feed_url = format!("http://{feed_addr}/");
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(String::new());
+        config.allow_private_targets = false;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), feed_handle)
+                .await
+                .is_err(),
+            "the guard must reject the target before any connection reaches the stub"
+        );
+        assert!(
+            matches!(
+                &report.outcome,
+                CrawlOutcome::FetchError {
+                    reason,
+                    retryable: false,
+                    ..
+                } if reason.starts_with("fetch_target_not_public")
+            ),
+            "a private target must be a non-retryable fetch_target_not_public error, got {:?}",
+            report.outcome
         );
     }
 }

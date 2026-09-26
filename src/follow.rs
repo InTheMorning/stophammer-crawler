@@ -125,9 +125,10 @@ pub fn follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     urls
 }
 
-/// Returns `true` for a URL whose scheme is `http` or `https`.
+/// Returns `true` for a URL whose scheme is `http` or `https`. The URL's
+/// target must also be public (`stophammer` ADR 0054 §1).
 fn is_followable_url(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+    reqwest::Url::parse(url).is_ok_and(|parsed| crate::fetch_guard::check_target(&parsed).is_ok())
 }
 
 #[cfg(test)]
