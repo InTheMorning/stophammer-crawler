@@ -2028,6 +2028,7 @@ mod tests {
             persons: Vec::new(),
             entity_ids: Vec::new(),
             links: Vec::new(),
+            blocks: Vec::new(),
             podcast_namespace: None,
             feed_payment_routes: Vec::new(),
             live_items: Vec::new(),

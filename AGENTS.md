@@ -59,6 +59,14 @@ each channel remote item with the `medium` `music` or with no `medium` (ADR
 `FollowLevel::Publisher`. A music feed gives no follow URL at that level, so
 the walk stops after one level.
 
+[stophammer ADR 0057](../docs/adr/0057-a-feed-can-block-this-index.md) task 003
+is complete. The parser sends the `blocks` field in `IngestFeedData`. The
+crawler submits it unchanged. `source_blocked` is not in
+`UNCACHED_NODE_REASONS` (ADR 0051 §5, ADR 0053 §1), so the crawler keeps it as
+the cached node answer, and a later `304` skips the ingest. When the publisher
+removes the tag, the body changes, and the next `200` is submitted. A feed
+with a `source_blocked` answer gives no follow URL.
+
 The fetch cache keeps no row for a medium rejection or for an ingest answer
 of `413` (`CrawlOutcome::keeps_no_cache_row`). The skip list stops the next
 fetch of a non-music feed, and the node refuses a request body over 2 MiB each

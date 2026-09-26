@@ -1267,6 +1267,7 @@ mod tests {
             persons: Vec::new(),
             entity_ids: Vec::new(),
             links: Vec::new(),
+            blocks: Vec::new(),
             podcast_namespace: None,
             feed_payment_routes: Vec::new(),
             live_items: Vec::new(),
@@ -2830,5 +2831,168 @@ mod tests {
             .get(&feed_url)
             .expect("a 1 MiB body must still write a cache row");
         assert_eq!(cached.content_sha256, expected_hash);
+    }
+
+    /// Proves ADR 0057 task 003: a feed with a `podcast:block` tag in the
+    /// channel sends the tag in the ingest payload. The payload carries a
+    /// `blocks` key with an array of block tags.
+    #[tokio::test]
+    async fn stub_200_with_podcast_block_sends_blocks_in_payload() {
+        let body = br#"<?xml version="1.0"?>
+<rss xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>Feed</title>
+    <podcast:guid>test-feed-guid</podcast:guid>
+    <podcast:block id="musicindex">yes</podcast:block>
+  </channel>
+</rss>"#;
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+
+        let payload_str =
+            String::from_utf8(ingest_request.body).expect("parse ingest body as utf8");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_str).expect("parse ingest body as json");
+
+        assert!(
+            payload.get("feed_data").is_some(),
+            "payload must have feed_data"
+        );
+        let feed_data = &payload["feed_data"];
+        assert!(
+            feed_data.get("blocks").is_some(),
+            "feed_data must have blocks key"
+        );
+        let blocks = feed_data["blocks"]
+            .as_array()
+            .expect("blocks must be an array");
+        assert_eq!(blocks.len(), 1, "feed must have one block tag");
+        assert_eq!(blocks[0]["id"], "musicindex", "block id must be musicindex");
+        assert_eq!(blocks[0]["value"], "yes", "block value must be yes");
+    }
+
+    /// Proves `stophammer` ADR 0057 task 003: a `source_blocked` rejection
+    /// from the node is kept as the cached node answer, because the reason is
+    /// not in `UNCACHED_NODE_REASONS`. A later `304` skips the ingest. When
+    /// the publisher removes the tag, the body changes, the fetch gives `200`,
+    /// and the crawler submits the new body.
+    #[tokio::test]
+    async fn stub_200_with_source_blocked_keeps_node_answer_in_cache() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"source_blocked"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "source_blocked".to_string(),
+                warnings: Vec::new(),
+            },
+            "the run summary must report the rejection and its reason"
+        );
+
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 200 fetch must still write a cache row");
+        assert_eq!(
+            cached.node_answer.as_deref(),
+            Some("rejected"),
+            "a rejection must cache the label 'rejected'"
+        );
+        assert_eq!(
+            cached.node_reason.as_deref(),
+            Some("source_blocked"),
+            "ADR 0057 task 003: source_blocked must be cached as the node reason"
+        );
+    }
+
+    /// Proves ADR 0057 task 003: a feed with a `source_blocked` rejection from
+    /// the node gives no follow URLs. The `report_follow_urls` function returns
+    /// an empty list for any rejection, including `source_blocked`.
+    #[tokio::test]
+    async fn source_blocked_feed_gives_no_follow_urls() {
+        let body = br#"<?xml version="1.0"?>
+<rss xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>Feed</title>
+    <podcast:guid>test-feed-guid</podcast:guid>
+    <podcast:value type="lightning">
+      <valueRecipient split="100" />
+    </podcast:value>
+  </channel>
+</rss>"#;
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"source_blocked"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "source_blocked".to_string(),
+                warnings: Vec::new(),
+            }
+        );
+
+        let follow_urls =
+            crate::modes::batch::report_follow_urls(&report, crate::follow::FollowLevel::Input);
+        assert!(
+            follow_urls.is_empty(),
+            "ADR 0057 task 003: a rejected feed must give no follow URLs"
+        );
     }
 }
