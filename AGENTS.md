@@ -39,7 +39,7 @@ default redirect policy. The node deploys first, because it accepts the new
 field as optional.
 
 [stophammer ADR 0054](../docs/adr/0054-a-fetch-reaches-only-public-feed-hosts.md)
-tasks 001 and 002 are complete on 2026-09-25 and not deployed. `src/fetch_guard.rs` holds
+tasks 001 and 002 are complete and deployed on 2026-09-25. `src/fetch_guard.rs` holds
 `is_public_ip`, `check_target` and `PublicOnlyResolver`. Each feed fetch client
 resolves through `PublicOnlyResolver`, and `fetch_following_redirects` calls
 `check_target` before each hop. A rejected target is a final fetch error with
