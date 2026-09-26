@@ -39,12 +39,17 @@ default redirect policy. The node deploys first, because it accepts the new
 field as optional.
 
 [stophammer ADR 0054](../docs/adr/0054-a-fetch-reaches-only-public-feed-hosts.md)
-task 001 is complete on 2026-09-25 and not deployed. `src/fetch_guard.rs` holds
+tasks 001 and 002 are complete on 2026-09-25 and not deployed. `src/fetch_guard.rs` holds
 `is_public_ip`, `check_target` and `PublicOnlyResolver`. Each feed fetch client
 resolves through `PublicOnlyResolver`, and `fetch_following_redirects` calls
 `check_target` before each hop. A rejected target is a final fetch error with
 the reason `fetch_target_not_public`. `CrawlConfig::allow_private_targets` is
 for tests with a local stub server only, and no environment value sets it.
+A feed body is read in chunks to at most 16 MiB, or the fetch fails with
+`body_too_large`. `follow_urls` returns at most 200 URLs for one feed.
+`FollowQueueLimit` in `src/url_queue.rs` admits at most 50,000 follow URLs in
+one batch pass, and in one gossip replay, reconciliation batch or SSE
+session.
 
 The fetch cache keeps no row for a medium rejection or for an ingest answer
 of `413` (`CrawlOutcome::keeps_no_cache_row`). The skip list stops the next

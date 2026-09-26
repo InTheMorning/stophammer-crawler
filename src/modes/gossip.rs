@@ -15,6 +15,7 @@ use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
 };
+use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS};
 
 /// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
 ///
@@ -359,6 +360,9 @@ struct GossipCounters {
     /// `stophammer` repository), at any level. Never counts a URL from a
     /// notification.
     follow_fetches_launched: u64,
+    /// Follow URLs the follow queue dropped, past its limit (ADR 0054 §3,
+    /// `stophammer` repository).
+    follow_urls_dropped: u64,
 }
 
 /// Maximum bytes buffered in a single SSE line before it is discarded.
@@ -432,7 +436,7 @@ async fn process_notification_urls(
     sem: &Arc<Semaphore>,
     host_throttle: &Arc<HostThrottle>,
     follow_sem: &Arc<Semaphore>,
-    follow_launches: &Arc<std::sync::Mutex<u64>>,
+    follow_launches: &Arc<FollowQueueLimit>,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     cache: &FeedCache,
@@ -565,7 +569,9 @@ async fn process_notification_urls(
 /// This function never receives [`FollowLevel::Input`]: that level names
 /// the notification crawl itself, which is not a follow fetch.
 ///
-/// Counts each launch, at any level, in `follow_launches`.
+/// Admits each launch, at any level, into `follow_launches` (`stophammer`
+/// ADR 0054 §3). Past that queue's limit, a follow URL is dropped instead of
+/// spawned, and `follow_launches` counts the drop.
 ///
 /// This function returns a boxed future. It is not an `async fn`. The
 /// reason: [`run_follow_fetch`] calls this function, and this function
@@ -585,7 +591,7 @@ fn spawn_follow_fetches<'a>(
     dedup: &'a Arc<Mutex<Dedup>>,
     follow_sem: &'a Arc<Semaphore>,
     host_throttle: &'a Arc<HostThrottle>,
-    follow_launches: &'a Arc<std::sync::Mutex<u64>>,
+    follow_launches: &'a Arc<FollowQueueLimit>,
     progress: &'a Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &'a Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     cache: &'a FeedCache,
@@ -609,7 +615,12 @@ fn spawn_follow_fetches<'a>(
                 continue;
             }
 
-            *follow_launches.lock().unwrap() += 1;
+            // `stophammer` ADR 0054 §3: the follow queue of one pass holds
+            // at most `MAX_FOLLOW_QUEUE_URLS` URLs, in total. Past that, a
+            // new follow URL is dropped here, and never fetched.
+            if !follow_launches.try_admit() {
+                continue;
+            }
 
             match level {
                 FollowLevel::Publisher => {
@@ -724,7 +735,7 @@ async fn run_follow_fetch(
     dedup: Arc<Mutex<Dedup>>,
     follow_sem: Arc<Semaphore>,
     host_throttle: Arc<HostThrottle>,
-    follow_launches: Arc<std::sync::Mutex<u64>>,
+    follow_launches: Arc<FollowQueueLimit>,
     progress: Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
     cache: FeedCache,
@@ -970,7 +981,7 @@ async fn replay_from_archive(
     quiet: bool,
     audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> GossipCounters {
-    let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
+    let follow_launches = Arc::new(FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS));
     let conn = match Connection::open_with_flags(
         archive_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1137,11 +1148,15 @@ async fn replay_from_archive(
         }
     }
 
-    total_counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+    total_counters.follow_fetches_launched =
+        u64::try_from(follow_launches.admitted()).unwrap_or(u64::MAX);
+    total_counters.follow_urls_dropped =
+        u64::try_from(follow_launches.dropped()).unwrap_or(u64::MAX);
 
     eprintln!(
         "gossip: replay complete ({batch_number} batches): seen={} accepted={} filtered={} \
-         urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={}",
+         urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={} \
+         follow_dropped={}",
         total_counters.notifications_seen,
         total_counters.notifications_accepted,
         total_counters.notifications_filtered,
@@ -1150,6 +1165,7 @@ async fn replay_from_archive(
         total_counters.urls_dedup_skipped,
         total_counters.urls_feed_memory_skipped,
         total_counters.follow_fetches_launched,
+        total_counters.follow_urls_dropped,
     );
 
     total_counters
@@ -1167,7 +1183,7 @@ async fn stream_sse_events(
     sem: &Arc<Semaphore>,
     host_throttle: &Arc<HostThrottle>,
     follow_sem: &Arc<Semaphore>,
-    follow_launches: &Arc<std::sync::Mutex<u64>>,
+    follow_launches: &Arc<FollowQueueLimit>,
     counters: &mut GossipCounters,
     progress: &Arc<std::sync::Mutex<ProgressStore>>,
     skip_db: &Arc<std::sync::Mutex<crate::feed_skip::FeedSkipDb>>,
@@ -1310,7 +1326,7 @@ async fn reconcile_archive_batch(
 
     let count = messages.len() as u64;
     let mut counters = GossipCounters::default();
-    let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
+    let follow_launches = Arc::new(FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS));
     let mut last_cursor: Option<ArchiveCursor> = None;
 
     for msg in &messages {
@@ -1350,13 +1366,17 @@ async fn reconcile_archive_batch(
         progress.lock().unwrap().set_archive_cursor(cur);
     }
 
-    counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+    counters.follow_fetches_launched =
+        u64::try_from(follow_launches.admitted()).unwrap_or(u64::MAX);
+    counters.follow_urls_dropped = u64::try_from(follow_launches.dropped()).unwrap_or(u64::MAX);
 
     eprintln!(
-        "gossip: reconciliation: {count} rows, launched={}, skipped={}, follow_launched={}",
+        "gossip: reconciliation: {count} rows, launched={}, skipped={}, follow_launched={}, \
+         follow_dropped={}",
         counters.urls_launched,
         counters.urls_dedup_skipped + counters.urls_feed_memory_skipped,
         counters.follow_fetches_launched,
+        counters.follow_urls_dropped,
     );
 
     count
@@ -1646,7 +1666,7 @@ pub async fn run(
 
     loop {
         let mut session_counters = GossipCounters::default();
-        let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
+        let follow_launches = Arc::new(FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS));
 
         match stream_sse_events(
             &sse_url,
@@ -1677,11 +1697,14 @@ pub async fn run(
             }
         }
 
-        session_counters.follow_fetches_launched = *follow_launches.lock().unwrap();
+        session_counters.follow_fetches_launched =
+            u64::try_from(follow_launches.admitted()).unwrap_or(u64::MAX);
+        session_counters.follow_urls_dropped =
+            u64::try_from(follow_launches.dropped()).unwrap_or(u64::MAX);
 
         if session_counters.notifications_seen > 0 || session_counters.urls_launched > 0 {
             eprintln!(
-                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={}",
+                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={} follow_dropped={}",
                 session_counters.notifications_seen,
                 session_counters.notifications_accepted,
                 session_counters.notifications_filtered,
@@ -1689,7 +1712,8 @@ pub async fn run(
                 session_counters.urls_launched,
                 session_counters.urls_dedup_skipped,
                 session_counters.urls_feed_memory_skipped,
-                session_counters.follow_fetches_launched
+                session_counters.follow_fetches_launched,
+                session_counters.follow_urls_dropped
             );
         }
     }
@@ -2342,7 +2366,7 @@ mod tests {
             .await
             .expect("acquire the only follow permit");
         let dedup = Arc::new(Mutex::new(Dedup::new()));
-        let follow_launches = Arc::new(std::sync::Mutex::new(0u64));
+        let follow_launches = Arc::new(FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS));
 
         let handle = tokio::spawn(run_follow_fetch(
             "https://example.com/follow.xml".to_string(),
@@ -2381,6 +2405,88 @@ mod tests {
         );
 
         handle.abort();
+        drop(held_follow_permit);
+    }
+
+    /// Proves `stophammer` ADR 0054 §3: a follow queue at its limit drops
+    /// the next follow URL, and never spawns a fetch for it.
+    ///
+    /// The one `follow_sem` permit is held for the whole test, so a spawned
+    /// [`run_follow_fetch`] can only ever block on `follow_sem.acquire()`,
+    /// the same way [`a_follow_fetch_never_blocks_the_notification_semaphore`]
+    /// keeps its own spawned fetch from reaching the network. This test
+    /// never needs either follow URL to answer: [`spawn_follow_fetches`]
+    /// admits or drops a URL before it spawns anything.
+    #[tokio::test]
+    async fn a_follow_queue_at_its_limit_drops_the_next_follow_url() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            tempdir
+                .path()
+                .join("feed_skip.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            tempdir
+                .path()
+                .join("gossip_state.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(
+            tempdir
+                .path()
+                .join("feed_cache.db")
+                .to_str()
+                .expect("utf-8 path"),
+        )));
+        let client = Arc::new(create_async_client());
+        let config = Arc::new(CrawlConfig::dry_run(
+            "stophammer-crawler/test",
+            Duration::from_secs(1),
+        ));
+        let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(0)));
+        let follow_sem = Arc::new(Semaphore::new(1));
+        let held_follow_permit = Arc::clone(&follow_sem)
+            .acquire_owned()
+            .await
+            .expect("acquire the only follow permit");
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let follow_launches = Arc::new(FollowQueueLimit::new(1));
+
+        spawn_follow_fetches(
+            vec![
+                "https://one.example/feed.xml".to_string(),
+                "https://two.example/feed.xml".to_string(),
+            ],
+            FollowLevel::Publisher,
+            &client,
+            &config,
+            &dedup,
+            &follow_sem,
+            &host_throttle,
+            &follow_launches,
+            &progress,
+            &skip_db,
+            &cache,
+            false,
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            follow_launches.admitted(),
+            1,
+            "a follow queue limit of 1 must admit only the first URL"
+        );
+        assert_eq!(
+            follow_launches.dropped(),
+            1,
+            "a follow queue limit of 1 must drop the second URL"
+        );
+
         drop(held_follow_permit);
     }
 

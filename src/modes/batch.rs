@@ -7,7 +7,7 @@ use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed
 use crate::feed_cache::FeedCacheDb;
 use crate::follow::{FollowLevel, follow_urls_at_level};
 use crate::pool::run_pool;
-use crate::url_queue::{host_key, interleave_by_host};
+use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS, host_key, interleave_by_host};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const CRAWL_ATTEMPTS: u32 = 3;
@@ -365,6 +365,14 @@ fn exclude_seen_urls(collected: &[String], seen: &HashSet<String>) -> Vec<String
     follow
 }
 
+/// Filters `urls` through `queue`, in order, keeping only the URLs the queue
+/// still has room for (`stophammer` ADR 0054 §3). A URL the queue refuses is
+/// dropped here; `queue` itself counts the drop, for the pass to log at its
+/// end.
+fn admit_follow_urls(urls: Vec<String>, queue: &FollowQueueLimit) -> Vec<String> {
+    urls.into_iter().filter(|_| queue.try_admit()).collect()
+}
+
 /// Runs `wave1_urls` first. Then it crawls the publisher feeds that an
 /// accepted or unchanged wave-1 feed names (wave 2). Then it crawls the
 /// album feeds that an accepted or unchanged wave-2 publisher feed lists
@@ -379,6 +387,10 @@ fn exclude_seen_urls(collected: &[String], seen: &HashSet<String>) -> Vec<String
 /// value after this call is the total over the whole pass. This is the
 /// smaller change: `run_wave` already takes `failed_feeds` the same way.
 ///
+/// `follow_queue` caps the follow URLs wave 2 and wave 3 add, in total, for
+/// this one pass (`stophammer` ADR 0054 §3). A URL past the cap is dropped
+/// before it is ever fetched.
+///
 /// `step` fetches and ingests one URL and gives its crawl report. A test
 /// gives a stub `step` and needs no network.
 async fn run_waves<S, Fut>(
@@ -387,6 +399,7 @@ async fn run_waves<S, Fut>(
     host_delay_ms: u64,
     failed_feeds: &Arc<std::sync::Mutex<Vec<String>>>,
     fetch_counts: &Arc<std::sync::Mutex<FetchCounts>>,
+    follow_queue: &FollowQueueLimit,
     step: &Arc<S>,
 ) where
     S: Fn(String) -> Fut + Send + Sync + 'static,
@@ -405,6 +418,7 @@ async fn run_waves<S, Fut>(
     .await;
 
     let wave2_urls = exclude_seen_urls(&collected1, &wave1_seen);
+    let wave2_urls = admit_follow_urls(wave2_urls, follow_queue);
     let wave2_urls = interleave_by_host(wave2_urls, |url| host_key(url));
 
     if wave2_urls.is_empty() {
@@ -433,6 +447,7 @@ async fn run_waves<S, Fut>(
     .await;
 
     let wave3_urls = exclude_seen_urls(&collected2, &wave1_and_2_seen);
+    let wave3_urls = admit_follow_urls(wave3_urls, follow_queue);
     let wave3_urls = interleave_by_host(wave3_urls, |url| host_key(url));
 
     if wave3_urls.is_empty() {
@@ -516,6 +531,7 @@ pub async fn run_urls(
     let client = Arc::new(build_feed_fetch_client());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+    let follow_queue = FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS);
     let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(host_delay_ms)));
     let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&feed_cache)));
 
@@ -535,6 +551,7 @@ pub async fn run_urls(
         host_delay_ms,
         &failed_feeds,
         &fetch_counts,
+        &follow_queue,
         &step,
     )
     .await;
@@ -543,6 +560,13 @@ pub async fn run_urls(
     // every wave has run. Always printed, even when every count is zero.
     let counts = *fetch_counts.lock().expect("fetch counts mutex poisoned");
     eprintln!("{counts}");
+
+    // ADR 0054 §3 (`stophammer` repository): one line, printed once, at the
+    // end of the pass. Always printed, even when nothing was dropped.
+    eprintln!(
+        "crawl: follow queue: dropped {} URL(s), limit {MAX_FOLLOW_QUEUE_URLS}",
+        follow_queue.dropped()
+    );
 
     let mut failed_urls = failed_feeds
         .lock()
@@ -569,6 +593,7 @@ mod tests {
         HostThrottle, crawl_feed_with_retries, exclude_seen_urls, report_follow_urls, run_wave,
         run_waves,
     };
+    use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS};
 
     fn remote_item(position: i64, medium: &str, url: &str) -> IngestRemoteFeedRef {
         IngestRemoteFeedRef {
@@ -902,6 +927,7 @@ mod tests {
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+        let follow_queue = FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS);
 
         run_waves(
             vec!["https://music.example/feed.xml".to_string()],
@@ -909,6 +935,7 @@ mod tests {
             0,
             &failed_feeds,
             &fetch_counts,
+            &follow_queue,
             &step,
         )
         .await;
@@ -925,6 +952,76 @@ mod tests {
             ],
             "wave 3 must fetch each album wave 2's publisher feed lists, exactly once, \
              and no wave 4 must run"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0054 §3: a follow queue past its limit drops
+    /// the next URL, and never fetches it. A small limit stands in for the
+    /// production limit of 50,000, since the test does not need to reach
+    /// that count to prove the cap works.
+    #[tokio::test]
+    async fn a_small_follow_queue_limit_drops_the_url_past_it() {
+        // Wave 1's one input feed names three publisher links. With a
+        // follow queue limit of 2, wave 2 must run for only the first two.
+        let music_feed = feed(
+            "music",
+            vec![
+                remote_item(0, "publisher", "https://p1.example/feed.xml"),
+                remote_item(1, "publisher", "https://p2.example/feed.xml"),
+                remote_item(2, "publisher", "https://p3.example/feed.xml"),
+            ],
+        );
+
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_step = Arc::clone(&calls);
+        let step: Arc<_> = Arc::new(move |url: String| {
+            calls_for_step
+                .lock()
+                .expect("call list mutex poisoned")
+                .push(url.clone());
+            let report = match url.as_str() {
+                "https://music.example/feed.xml" => accepted_report(music_feed.clone()),
+                "https://p1.example/feed.xml" | "https://p2.example/feed.xml" => {
+                    accepted_report(feed("publisher", Vec::new()))
+                }
+                other => panic!(
+                    "unexpected fetch of {other}: the follow queue limit of 2 must drop \
+                     the third publisher link before it is ever fetched"
+                ),
+            };
+            async move { report }
+        });
+
+        let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+        let follow_queue = FollowQueueLimit::new(2);
+
+        run_waves(
+            vec!["https://music.example/feed.xml".to_string()],
+            2,
+            0,
+            &failed_feeds,
+            &fetch_counts,
+            &follow_queue,
+            &step,
+        )
+        .await;
+
+        let mut called = calls.lock().expect("call list mutex poisoned").clone();
+        called.sort();
+        assert_eq!(
+            called,
+            vec![
+                "https://music.example/feed.xml".to_string(),
+                "https://p1.example/feed.xml".to_string(),
+                "https://p2.example/feed.xml".to_string(),
+            ],
+            "a follow queue limit of 2 must fetch only the first two publisher links"
+        );
+        assert_eq!(
+            follow_queue.dropped(),
+            1,
+            "the pass must count the one follow URL the limit dropped"
         );
     }
 
@@ -964,6 +1061,7 @@ mod tests {
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+        let follow_queue = FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS);
 
         run_waves(
             vec!["https://music.example/feed.xml".to_string()],
@@ -971,6 +1069,7 @@ mod tests {
             0,
             &failed_feeds,
             &fetch_counts,
+            &follow_queue,
             &step,
         )
         .await;
@@ -1046,6 +1145,7 @@ mod tests {
 
         let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+        let follow_queue = FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS);
 
         run_waves(
             vec![
@@ -1056,6 +1156,7 @@ mod tests {
             0,
             &failed_feeds,
             &fetch_counts,
+            &follow_queue,
             &step,
         )
         .await;

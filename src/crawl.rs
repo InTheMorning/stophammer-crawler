@@ -245,6 +245,58 @@ const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 /// change.
 const MAX_REDIRECT_HOPS: usize = 10;
 
+/// The most bytes a decoded feed body may hold (`stophammer` ADR 0054 §2).
+pub const MAX_FEED_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// A body read that [`read_capped_body`] stopped (`stophammer` ADR 0054 §2).
+enum BodyReadError {
+    /// The body passed [`MAX_FEED_BODY_BYTES`]. Not retryable. A later
+    /// attempt would meet the same body.
+    TooLarge,
+    /// The read itself failed, the same way a plain `resp.bytes()` call
+    /// could fail before this change.
+    Fetch(reqwest::Error),
+}
+
+impl BodyReadError {
+    fn reason(&self) -> String {
+        match self {
+            Self::TooLarge => "body_too_large".to_string(),
+            Self::Fetch(e) => e.to_string(),
+        }
+    }
+
+    fn retryable(&self) -> bool {
+        !matches!(self, Self::TooLarge)
+    }
+}
+
+/// Reads `resp`'s body, and stops as soon as it would pass
+/// [`MAX_FEED_BODY_BYTES`] (`stophammer` ADR 0054 §2).
+///
+/// A `Content-Length` header over the limit fails before the first chunk.
+/// Past that check, this reads the body one chunk at a time, so a large
+/// body never sits in one single allocation the size of the whole transfer
+/// before the size check runs. The limit applies after decompression: a
+/// chunk from `resp.chunk()` is already decoded.
+async fn read_capped_body(mut resp: reqwest::Response) -> Result<Vec<u8>, BodyReadError> {
+    if let Some(declared_len) = resp.content_length() {
+        let max_len = u64::try_from(MAX_FEED_BODY_BYTES).unwrap_or(u64::MAX);
+        if declared_len > max_len {
+            return Err(BodyReadError::TooLarge);
+        }
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(BodyReadError::Fetch)? {
+        if body.len() + chunk.len() > MAX_FEED_BODY_BYTES {
+            return Err(BodyReadError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// One failed attempt of [`fetch_following_redirects`]. It holds a reason,
 /// and whether the crawler should retry the fetch later. A rejection of
 /// ADR 0054 §1 (`stophammer` repository) is never retryable. A later
@@ -906,13 +958,13 @@ async fn refetch_unconditional(
     let final_url = Some(resp.url().to_string());
     let headers = resp.headers().clone();
 
-    let body = match resp.bytes().await {
+    let body = match read_capped_body(resp).await {
         Ok(b) => b,
         Err(e) => {
             return build_crawl_report(
                 CrawlOutcome::FetchError {
-                    reason: e.to_string(),
-                    retryable: true,
+                    reason: e.reason(),
+                    retryable: e.retryable(),
                     retry_after_secs: None,
                 },
                 Some(status),
@@ -1108,13 +1160,13 @@ pub async fn crawl_feed_report(
     let final_url = Some(resp.url().to_string());
     let headers = resp.headers().clone();
 
-    let body = match resp.bytes().await {
+    let body = match read_capped_body(resp).await {
         Ok(b) => b,
         Err(e) => {
             return build_crawl_report(
                 CrawlOutcome::FetchError {
-                    reason: e.to_string(),
-                    retryable: true,
+                    reason: e.reason(),
+                    retryable: e.retryable(),
                     retry_after_secs: None,
                 },
                 Some(status),
@@ -1178,10 +1230,10 @@ pub async fn crawl_feed_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, RedirectHop, body_preview,
-        build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
-        is_retryable_http_status, is_retryable_ingest_status, is_uncached_node_answer,
-        normalize_rejection_reason, parse_feed_xml, plan_after_response,
+        CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, MAX_FEED_BODY_BYTES,
+        RedirectHop, body_preview, build_crawl_report, crawl_feed_report, format_http_fetch_error,
+        format_ingest_http_error, is_retryable_http_status, is_retryable_ingest_status,
+        is_uncached_node_answer, normalize_rejection_reason, parse_feed_xml, plan_after_response,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -2618,5 +2670,165 @@ mod tests {
             "a private target must be a non-retryable fetch_target_not_public error, got {:?}",
             report.outcome
         );
+    }
+
+    // ---- body limit (`stophammer` ADR 0054 §2) ----
+
+    /// A raw HTTP/1.1 response with no `Content-Length` header. The
+    /// connection close is what tells the client the body has ended.
+    fn stub_response_no_content_length(status_line: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!("{status_line}\r\nconnection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A raw HTTP/1.1 response whose `Content-Length` header names
+    /// `declared_len`, whatever the length of `body` really is. A test that
+    /// proves the crawler stops at the header, before it reads the real
+    /// body, needs this mismatch.
+    fn stub_response_declared_length(
+        status_line: &str,
+        declared_len: usize,
+        body: &[u8],
+    ) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut head = format!("{status_line}\r\n");
+        let _ = writeln!(head, "content-length: {declared_len}\r");
+        head.push_str("connection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Proves `stophammer` ADR 0054 §2: a body of `MAX_FEED_BODY_BYTES` and
+    /// one more byte, with no `Content-Length` header, is `body_too_large`,
+    /// and the crawler writes no cache row for it.
+    #[tokio::test]
+    async fn a_body_over_the_limit_with_no_content_length_is_body_too_large() {
+        let body = vec![b'a'; MAX_FEED_BODY_BYTES + 1];
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response_no_content_length("HTTP/1.1 200 OK", &body)).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        feed_handle.await.expect("feed stub task");
+
+        assert!(
+            matches!(
+                &report.outcome,
+                CrawlOutcome::FetchError {
+                    reason,
+                    retryable: false,
+                    ..
+                } if reason == "body_too_large"
+            ),
+            "a body over the limit with no Content-Length must be a non-retryable \
+             body_too_large error, got {:?}",
+            report.outcome
+        );
+        assert_eq!(
+            cache.lock().expect("cache lock").get(&feed_url),
+            None,
+            "an oversized body must write no cache row"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0054 §2: a `Content-Length` over the limit
+    /// fails before the first chunk. The stub declares 17 MiB and sends a
+    /// few bytes, well short of that; the crawl still finishes at once,
+    /// which it could not do if it were waiting to read a declared 17 MiB.
+    #[tokio::test]
+    async fn a_content_length_over_the_limit_fails_before_the_first_chunk() {
+        let declared_len = 17 * 1024 * 1024;
+        let (feed_addr, feed_handle) = spawn_stub(stub_response_declared_length(
+            "HTTP/1.1 200 OK",
+            declared_len,
+            b"short",
+        ))
+        .await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)),
+        )
+        .await
+        .expect(
+            "a Content-Length check must reject the body at once, not wait for the \
+             declared length to arrive",
+        );
+        feed_handle.await.expect("feed stub task");
+
+        assert!(
+            matches!(
+                &report.outcome,
+                CrawlOutcome::FetchError {
+                    reason,
+                    retryable: false,
+                    ..
+                } if reason == "body_too_large"
+            ),
+            "a Content-Length over the limit must be a non-retryable body_too_large \
+             error, got {:?}",
+            report.outcome
+        );
+        assert_eq!(
+            cache.lock().expect("cache lock").get(&feed_url),
+            None,
+            "an oversized body must write no cache row"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0054 §2: a body under the limit is accepted
+    /// exactly as it was before the limit existed.
+    #[tokio::test]
+    async fn a_body_of_1_mib_is_accepted_as_before() {
+        let padding = "a".repeat(1024 * 1024 - 120);
+        let body = format!(
+            "<rss><channel><title>Feed</title><description>{padding}</description></channel></rss>"
+        );
+        let body = body.into_bytes();
+        assert!(
+            body.len() <= 1024 * 1024,
+            "the test body must stay at or under 1 MiB"
+        );
+
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], &body)).await;
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            },
+            "a 1 MiB body must still be accepted, as it was before ADR 0054 §2"
+        );
+        let expected_hash = hex::encode(sha2::Sha256::digest(&body));
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 1 MiB body must still write a cache row");
+        assert_eq!(cached.content_sha256, expected_hash);
     }
 }

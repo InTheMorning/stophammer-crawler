@@ -66,6 +66,10 @@ pub fn follow_urls_at_level(
     }
 }
 
+/// The most follow URLs [`follow_urls`] gives back for one source feed
+/// (`stophammer` ADR 0054 §3).
+pub const MAX_FOLLOW_URLS_PER_FEED: usize = 200;
+
 /// Gives the follow URLs of `feed`.
 ///
 /// A feed whose `raw_medium` is `music`, ignoring ASCII case, gives the
@@ -83,8 +87,29 @@ pub fn follow_urls_at_level(
 /// last, when it is present, it is a followable URL, and it is not
 /// `fetched_url`, the URL the crawler fetched to get `feed`. This check runs
 /// whatever `feed`'s medium is.
+///
+/// The result holds at most [`MAX_FOLLOW_URLS_PER_FEED`] URLs, in the order
+/// this function finds them (`stophammer` ADR 0054 §3). When it drops URLs
+/// past that count, it logs `fetched_url` and the number dropped, once.
 #[must_use]
 pub fn follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
+    let mut urls = all_follow_urls(feed, fetched_url);
+
+    if urls.len() > MAX_FOLLOW_URLS_PER_FEED {
+        let dropped = urls.len() - MAX_FOLLOW_URLS_PER_FEED;
+        urls.truncate(MAX_FOLLOW_URLS_PER_FEED);
+        eprintln!(
+            "follow: dropped {dropped} follow URL(s) of {fetched_url}, ADR 0054 §3 caps one \
+             feed at {MAX_FOLLOW_URLS_PER_FEED}"
+        );
+    }
+
+    urls
+}
+
+/// Gives every follow URL of `feed`, with no cap. [`follow_urls`] is the
+/// public entry point; it caps and logs what this function finds.
+fn all_follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
@@ -469,6 +494,35 @@ mod tests {
             follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
             Vec::<String>::new(),
             "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed"
+        );
+    }
+
+    #[test]
+    fn a_feed_with_201_music_links_gives_200() {
+        let remote_items: Vec<IngestRemoteFeedRef> = (0..201i64)
+            .map(|position| {
+                let url = format!("https://album-{position}.example/feed.xml");
+                remote_item(position, Some("music"), Some(url.as_str()))
+            })
+            .collect();
+        let data = feed(Some("publisher"), remote_items);
+
+        let urls = follow_urls(&data, FETCHED_URL);
+
+        assert_eq!(
+            urls.len(),
+            200,
+            "a publisher feed that lists 201 music feeds must give at most 200 (ADR 0054 §3)"
+        );
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://album-0.example/feed.xml"),
+            "the cap must keep the URLs in the order follow_urls finds them, not drop from the front"
+        );
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some("https://album-199.example/feed.xml"),
+            "the cap must drop only past the 200th URL"
         );
     }
 
