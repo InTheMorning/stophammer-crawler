@@ -5,6 +5,7 @@ mod feed_skip;
 mod fetch_guard;
 mod follow;
 mod modes;
+mod ping_window;
 mod pool;
 mod url_queue;
 

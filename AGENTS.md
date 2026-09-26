@@ -86,6 +86,14 @@ during a corrective pass.
 - **Five modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip` and
   `refresh`. `crawl` is an alias of `feed`. There is no `podping` mode. The
   `gossip` mode consumes the stream that carries podping notifications.
+- **A podping is never dropped.** [stophammer ADR
+  0062](../docs/adr/0062-a-podping-is-never-dropped.md) owns the rule, and
+  `src/ping_window.rs` holds it. A podping inside the window of its URL is
+  merged into one more crawl when the window closes.
+
+  The window is 30 seconds. It doubles to at most 1 hour after a crawl that
+  changes nothing. The skip list runs before the window. A follow URL keeps its own cooldown of
+  5 minutes in `src/dedup.rs`.
 - **`feed`, `refresh` and `gossip` follow a publisher link or a list feed.**
   ADR 0049 section 2 owns the publisher rule. ADR 0060 sections 5 and 6 own
   the list rule.

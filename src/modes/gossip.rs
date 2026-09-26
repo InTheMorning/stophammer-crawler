@@ -7,7 +7,7 @@ use rusqlite::{Connection, params};
 use std::sync::mpsc;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::crawl::{CrawlConfig, CrawlReport, FeedCache, crawl_feed_report};
+use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
 use crate::dedup::Dedup;
 use crate::feed_cache::FeedCacheDb;
 use crate::follow::FollowLevel;
@@ -15,6 +15,7 @@ use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
 };
+use crate::ping_window::PingDecision;
 use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS};
 
 /// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
@@ -427,6 +428,10 @@ impl SseParser {
     clippy::too_many_arguments,
     reason = "gossip notification processing requires many shared resources"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the crawl task holds its URL through the window of ADR 0062, and a helper would take the same 16 shared resources"
+)]
 async fn process_notification_urls(
     notification: &GossipNotification,
     counters: &mut GossipCounters,
@@ -451,13 +456,12 @@ async fn process_notification_urls(
     }
     counters.notifications_accepted += 1;
 
+    // ADR 0062 §4 (`stophammer` repository): a live notification is not
+    // delayed by the window of its URL.
+    let live = matches!(notification.reason.as_deref(), Some("live" | "liveEnd"));
+
     for url in notification.all_urls() {
         counters.urls_seen += 1;
-        let should_crawl = dedup.lock().await.should_process(url);
-        if !should_crawl {
-            counters.urls_dedup_skipped += 1;
-            continue;
-        }
 
         if skip_known_non_music {
             // Check shared cross-mode skip DB first
@@ -483,6 +487,20 @@ async fn process_notification_urls(
             }
         }
 
+        // ADR 0062 §1 (`stophammer` repository): the skip checks run first,
+        // so a skipped URL does not change its window. A podping inside the
+        // window of its URL is merged into the crawl of the owner, and never
+        // dropped.
+        let decision = dedup
+            .lock()
+            .await
+            .pings
+            .on_ping(url, live, std::time::Instant::now());
+        if decision == PingDecision::Merged {
+            counters.urls_dedup_skipped += 1;
+            continue;
+        }
+
         counters.urls_launched += 1;
 
         let url = url.to_string();
@@ -498,63 +516,93 @@ async fn process_notification_urls(
         let cache = Arc::clone(cache);
         let audit_tx = audit_tx.cloned();
 
+        // ADR 0062 (`stophammer` repository): this task owns the URL until
+        // its window closes. It crawls once more when a podping set the
+        // pending mark, and at once for a live podping.
         tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            let start = Instant::now();
-            let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
-            let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let mut keep_window = false;
+            loop {
+                let window_start = std::time::Instant::now();
+                let permit = sem.acquire().await.expect("semaphore closed");
+                let start = Instant::now();
+                let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
+                drop(permit);
+                let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+                let changed = matches!(report.outcome, CrawlOutcome::Accepted { .. });
 
-            // ADR 0049 §2 (`stophammer` repository): read the follow URLs
-            // as soon as the report arrives, so `report` (which carries
-            // `raw_xml` and the full parsed feed) can drop at the end of
-            // this task instead of living through the follow fetches. The
-            // notification crawl is `FollowLevel::Input`.
-            let follow = report_follow_urls(&report, FollowLevel::Input);
+                // ADR 0049 §2 (`stophammer` repository): read the follow URLs
+                // as soon as the report arrives, so `report` (which carries
+                // `raw_xml` and the full parsed feed) can drop at the end of
+                // this task instead of living through the follow fetches. The
+                // notification crawl is `FollowLevel::Input`.
+                let follow = report_follow_urls(&report, FollowLevel::Input);
 
-            if !(quiet && report.outcome.is_medium_rejection()) {
-                eprintln!("  {}: {url}", report.outcome);
-            }
+                if !(quiet && report.outcome.is_medium_rejection()) {
+                    eprintln!("  {}: {url}", report.outcome);
+                }
 
-            if let Some(ref tx) = audit_tx {
-                let fetched_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
+                if let Some(ref tx) = audit_tx {
+                    let fetched_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let fetched_at_i64 =
+                        i64::try_from(fetched_at).expect("unix timestamp fits i64");
+                    if let Some(audit_row) = build_audit_row_from_url(&url, &report, fetched_at_i64)
+                    {
+                        enqueue_import_audit(tx, audit_row);
+                    }
+                }
+
+                skip_db
+                    .lock()
                     .unwrap()
-                    .as_secs();
-                let fetched_at_i64 = i64::try_from(fetched_at).expect("unix timestamp fits i64");
-                if let Some(audit_row) = build_audit_row_from_url(&url, &report, fetched_at_i64) {
-                    enqueue_import_audit(tx, audit_row);
+                    .record_outcome(&url, &report, "gossip");
+                progress
+                    .lock()
+                    .unwrap()
+                    .upsert_feed_memory(&url, &report, duration_ms);
+
+                // A fetch of one of these URLs is a level-1 follow fetch
+                // (task 010b): `FollowLevel::Publisher`. It gives its own
+                // links only when it parses as a publisher feed.
+                spawn_follow_fetches(
+                    follow,
+                    FollowLevel::Publisher,
+                    &client,
+                    &config,
+                    &dedup,
+                    &follow_sem,
+                    &host_throttle,
+                    &follow_launches,
+                    &progress,
+                    &skip_db,
+                    &cache,
+                    skip_known_non_music,
+                    skip_ttl_days,
+                    quiet,
+                )
+                .await;
+
+                let (until, live_signal) =
+                    dedup
+                        .lock()
+                        .await
+                        .pings
+                        .finish_crawl(&url, changed, window_start, keep_window);
+                tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {
+                        if !dedup.lock().await.pings.end_window(&url) {
+                            break;
+                        }
+                        keep_window = false;
+                    }
+                    () = live_signal.notified() => {
+                        dedup.lock().await.pings.clear_pending(&url);
+                        keep_window = true;
+                    }
                 }
             }
-
-            skip_db
-                .lock()
-                .unwrap()
-                .record_outcome(&url, &report, "gossip");
-            progress
-                .lock()
-                .unwrap()
-                .upsert_feed_memory(&url, &report, duration_ms);
-
-            // A fetch of one of these URLs is a level-1 follow fetch
-            // (task 010b): `FollowLevel::Publisher`. It gives its own
-            // links only when it parses as a publisher feed.
-            spawn_follow_fetches(
-                follow,
-                FollowLevel::Publisher,
-                &client,
-                &config,
-                &dedup,
-                &follow_sem,
-                &host_throttle,
-                &follow_launches,
-                &progress,
-                &skip_db,
-                &cache,
-                skip_known_non_music,
-                skip_ttl_days,
-                quiet,
-            )
-            .await;
         });
     }
 }
@@ -1155,7 +1203,7 @@ async fn replay_from_archive(
 
     eprintln!(
         "gossip: replay complete ({batch_number} batches): seen={} accepted={} filtered={} \
-         urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={} \
+         urls_seen={} launched={} merged={} memory_skipped={} follow_launched={} \
          follow_dropped={}",
         total_counters.notifications_seen,
         total_counters.notifications_accepted,
@@ -1704,7 +1752,7 @@ pub async fn run(
 
         if session_counters.notifications_seen > 0 || session_counters.urls_launched > 0 {
             eprintln!(
-                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} dedup_skipped={} memory_skipped={} follow_launched={} follow_dropped={}",
+                "gossip: session stats: seen={} accepted={} filtered={} urls_seen={} launched={} merged={} memory_skipped={} follow_launched={} follow_dropped={}",
                 session_counters.notifications_seen,
                 session_counters.notifications_accepted,
                 session_counters.notifications_filtered,
@@ -2525,6 +2573,99 @@ mod tests {
         assert!(
             !should_launch,
             "a follow URL the dedup store already saw must not be launched"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0062 guard 5: a podping for a URL that the
+    /// skip list refuses gives no crawl, and opens no window, so a later
+    /// podping is not merged into a window that never had a crawl.
+    #[tokio::test]
+    async fn a_skipped_podping_gives_no_crawl_and_opens_no_window() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = |name: &str| {
+            tempdir
+                .path()
+                .join(name)
+                .to_str()
+                .expect("utf-8 path")
+                .to_string()
+        };
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            &path("feed_skip.db"),
+        )));
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(&path(
+            "gossip_state.db",
+        ))));
+        let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(&path(
+            "feed_cache.db",
+        ))));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let client = Arc::new(create_async_client());
+        let config = Arc::new(CrawlConfig::dry_run(
+            "stophammer-crawler/test",
+            Duration::from_secs(1),
+        ));
+        let sem = Arc::new(Semaphore::new(1));
+        let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(1500)));
+        let follow_sem = Arc::new(Semaphore::new(1));
+        let follow_launches = Arc::new(FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS));
+        let url = "https://example.com/known-podcast.xml";
+
+        let prior_report = make_report("accepted", None, Some(200), Some("podcast"), None);
+        skip_db
+            .lock()
+            .unwrap()
+            .record_outcome(url, &prior_report, "gossip");
+
+        let notification = GossipNotification {
+            version: "1.0".to_string(),
+            sender: "test".to_string(),
+            medium: None,
+            reason: Some("update".to_string()),
+            iris: Some(vec![url.to_string()]),
+            signature: None,
+            sig_status: None,
+            timestamp: None,
+        };
+        let mut counters = GossipCounters::default();
+        for _ in 0..2 {
+            process_notification_urls(
+                &notification,
+                &mut counters,
+                &dedup,
+                &client,
+                &config,
+                &sem,
+                &host_throttle,
+                &follow_sem,
+                &follow_launches,
+                &progress,
+                &skip_db,
+                &cache,
+                true,
+                None,
+                true,
+                None,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            counters.urls_launched, 0,
+            "ADR 0062: a skipped URL is not crawled"
+        );
+        assert_eq!(
+            counters.urls_dedup_skipped, 0,
+            "ADR 0062: a skipped podping is not merged into a window"
+        );
+        assert_eq!(
+            dedup
+                .lock()
+                .await
+                .pings
+                .on_ping(url, false, std::time::Instant::now()),
+            PingDecision::CrawlNow,
+            "ADR 0062 guard 5: the skipped podpings opened no window"
         );
     }
 
