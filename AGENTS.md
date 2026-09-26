@@ -30,13 +30,12 @@ publisher found through an album. `gossip` follows in two levels, in
 Deployed on 2026-09-24.
 
 [stophammer ADR 0052](../docs/adr/0052-a-source-moves-its-own-feed.md) task
-005 is complete on 2026-09-25 and not deployed. Each feed fetch client uses
+005 is complete and deployed on 2026-09-25. Each feed fetch client uses
 `redirect::Policy::none()`, and `fetch_following_redirects` in `src/crawl.rs`
 follows at most 10 hops. The ingest request carries `redirects`, one entry for
 each hop with its status. `follow_urls` also returns a declared
 `itunes:new-feed-url`. The gossip SSE stream keeps its own client with the
-default redirect policy. The node deploys first, because it accepts the new
-field as optional.
+default redirect policy.
 
 [stophammer ADR 0054](../docs/adr/0054-a-fetch-reaches-only-public-feed-hosts.md)
 tasks 001 and 002 are complete and deployed on 2026-09-25. `src/fetch_guard.rs` holds
@@ -53,7 +52,7 @@ one batch pass, and in one gossip replay, reconciliation batch or SSE
 session.
 
 [stophammer ADR 0060](../docs/adr/0060-a-list-feed-keeps-its-items.md) task 003
-is complete and not deployed. A `musicL` feed gives the `remote_feed_url` of
+is complete and deployed on 2026-09-26. A `musicL` feed gives the `remote_feed_url` of
 each channel remote item with the `medium` `music` or with no `medium` (ADR
 0060 §5). A feed reached through a list is fetched at
 `FollowLevel::Publisher`. A music feed gives no follow URL at that level, so
@@ -89,7 +88,7 @@ during a corrective pass.
 - **A podping is never dropped.** [stophammer ADR
   0062](../docs/adr/0062-a-podping-is-never-dropped.md) owns the rule, and
   `src/ping_window.rs` holds it. A podping inside the window of its URL is
-  merged into one more crawl when the window closes.
+  merged into one more crawl when the window closes. Deployed on 2026-09-26.
 
   The window is 30 seconds. It doubles to at most 1 hour after a crawl that
   changes nothing. The skip list runs before the window. A follow URL keeps its own cooldown of
