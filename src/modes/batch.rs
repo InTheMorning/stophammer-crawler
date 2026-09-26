@@ -602,6 +602,8 @@ mod tests {
             remote_feed_guid: format!("guid-{position}"),
             remote_feed_url: Some(url.to_string()),
             rel: None,
+            item_guid: None,
+            item_title: None,
         }
     }
 

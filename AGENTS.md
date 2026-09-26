@@ -46,10 +46,18 @@ resolves through `PublicOnlyResolver`, and `fetch_following_redirects` calls
 the reason `fetch_target_not_public`. `CrawlConfig::allow_private_targets` is
 for tests with a local stub server only, and no environment value sets it.
 A feed body is read in chunks to at most 16 MiB, or the fetch fails with
-`body_too_large`. `follow_urls` returns at most 200 URLs for one feed.
+`body_too_large`. `follow_urls` returns at most 200 URLs for one feed, or at
+most 1,000 URLs for a `musicL` list feed (ADR 0060 §6).
 `FollowQueueLimit` in `src/url_queue.rs` admits at most 50,000 follow URLs in
 one batch pass, and in one gossip replay, reconciliation batch or SSE
 session.
+
+[stophammer ADR 0060](../docs/adr/0060-a-list-feed-keeps-its-items.md) task 003
+is complete and not deployed. A `musicL` feed gives the `remote_feed_url` of
+each channel remote item with the `medium` `music` or with no `medium` (ADR
+0060 §5). A feed reached through a list is fetched at
+`FollowLevel::Publisher`. A music feed gives no follow URL at that level, so
+the walk stops after one level.
 
 The fetch cache keeps no row for a medium rejection or for an ingest answer
 of `413` (`CrawlOutcome::keeps_no_cache_row`). The skip list stops the next
@@ -70,8 +78,9 @@ during a corrective pass.
 - **Five modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip` and
   `refresh`. `crawl` is an alias of `feed`. There is no `podping` mode. The
   `gossip` mode consumes the stream that carries podping notifications.
-- **`feed`, `refresh` and `gossip` follow a publisher link.** ADR 0049 section
-  2 owns the rule.
+- **`feed`, `refresh` and `gossip` follow a publisher link or a list feed.**
+  ADR 0049 section 2 owns the publisher rule. ADR 0060 sections 5 and 6 own
+  the list rule.
 - **The node owns the index.** Local SQLite holds progress and memory of
   attempts only.
 - Lints are `[lints.clippy] pedantic = "deny"` and nothing more.

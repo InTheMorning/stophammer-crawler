@@ -70,13 +70,20 @@ pub fn follow_urls_at_level(
 /// (`stophammer` ADR 0054 §3).
 pub const MAX_FOLLOW_URLS_PER_FEED: usize = 200;
 
+/// The most follow URLs [`follow_urls`] gives back for a `musicL` feed
+/// (`stophammer` ADR 0060 §6).
+pub const MAX_FOLLOW_URLS_PER_LIST_FEED: usize = 1_000;
+
 /// Gives the follow URLs of `feed`.
 ///
 /// A feed whose `raw_medium` is `music`, ignoring ASCII case, gives the
 /// `remote_feed_url` of each channel-level remote item whose `medium` is
 /// `publisher`. A feed whose `raw_medium` is `publisher` gives the
 /// `remote_feed_url` of each channel-level remote item whose `medium` is
-/// `music`. Any other medium, including none, gives none of these links.
+/// `music`. A feed whose `raw_medium` is `musicL` gives the `remote_feed_url`
+/// of each channel-level remote item whose `medium` is `music` or has no
+/// `medium`. Any other medium, including none, gives none of these links.
+/// (`stophammer` ADR 0060 §5 for list feeds.)
 ///
 /// An item's own `medium` comparison also ignores ASCII case, so
 /// `medium="Music"` counts. An item with no URL, or a URL whose scheme is
@@ -88,19 +95,37 @@ pub const MAX_FOLLOW_URLS_PER_FEED: usize = 200;
 /// `fetched_url`, the URL the crawler fetched to get `feed`. This check runs
 /// whatever `feed`'s medium is.
 ///
-/// The result holds at most [`MAX_FOLLOW_URLS_PER_FEED`] URLs, in the order
-/// this function finds them (`stophammer` ADR 0054 §3). When it drops URLs
-/// past that count, it logs `fetched_url` and the number dropped, once.
+/// The result holds at most [`MAX_FOLLOW_URLS_PER_FEED`] URLs for a non-list
+/// feed, or at most [`MAX_FOLLOW_URLS_PER_LIST_FEED`] URLs for a `musicL`
+/// feed, in the order this function finds them. When it drops URLs past that
+/// count, it logs `fetched_url` and the number dropped, once.
+/// (`stophammer` ADR 0054 §3, ADR 0060 §6.)
 #[must_use]
 pub fn follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     let mut urls = all_follow_urls(feed, fetched_url);
 
-    if urls.len() > MAX_FOLLOW_URLS_PER_FEED {
-        let dropped = urls.len() - MAX_FOLLOW_URLS_PER_FEED;
-        urls.truncate(MAX_FOLLOW_URLS_PER_FEED);
+    let is_list_feed = feed
+        .raw_medium
+        .as_deref()
+        .is_some_and(|medium| medium.eq_ignore_ascii_case("musicL"));
+
+    let max_urls = if is_list_feed {
+        MAX_FOLLOW_URLS_PER_LIST_FEED
+    } else {
+        MAX_FOLLOW_URLS_PER_FEED
+    };
+    let owner = if is_list_feed {
+        "ADR 0060 §6"
+    } else {
+        "ADR 0054 §3"
+    };
+
+    if urls.len() > max_urls {
+        let dropped = urls.len() - max_urls;
+        urls.truncate(max_urls);
         eprintln!(
-            "follow: dropped {dropped} follow URL(s) of {fetched_url}, ADR 0054 §3 caps one \
-             feed at {MAX_FOLLOW_URLS_PER_FEED}"
+            "follow: dropped {dropped} follow URL(s) of {fetched_url}, {owner} caps this \
+             feed at {max_urls}"
         );
     }
 
@@ -113,21 +138,27 @@ fn all_follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
-    let target_medium = match feed.raw_medium.as_deref() {
-        Some(medium) if medium.eq_ignore_ascii_case("music") => Some("publisher"),
-        Some(medium) if medium.eq_ignore_ascii_case("publisher") => Some("music"),
-        _ => None,
+    // Which item mediums a feed of this medium follows. A `musicL` feed
+    // also follows an item with no `medium` (ADR 0060 §5).
+    let (target_medium, list_feed) = match feed.raw_medium.as_deref() {
+        Some(medium) if medium.eq_ignore_ascii_case("music") => (Some("publisher"), false),
+        Some(medium) if medium.eq_ignore_ascii_case("publisher") => (Some("music"), false),
+        Some(medium) if medium.eq_ignore_ascii_case("musicL") => (Some("music"), true),
+        _ => (None, false),
     };
 
     if let Some(target_medium) = target_medium {
+        let mut items_with_no_url = 0_usize;
         for item in &feed.remote_items {
-            let Some(medium) = item.medium.as_deref() else {
-                continue;
+            let accepted = match item.medium.as_deref() {
+                Some(medium) => medium.eq_ignore_ascii_case(target_medium),
+                None => list_feed,
             };
-            if !medium.eq_ignore_ascii_case(target_medium) {
+            if !accepted {
                 continue;
             }
             let Some(url) = item.remote_feed_url.as_deref() else {
+                items_with_no_url += 1;
                 continue;
             };
             if !is_followable_url(url) {
@@ -136,6 +167,13 @@ fn all_follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
             if seen.insert(url.to_string()) {
                 urls.push(url.to_string());
             }
+        }
+
+        if list_feed && items_with_no_url > 0 {
+            eprintln!(
+                "follow: {items_with_no_url} music item(s) of {fetched_url} give no \
+                 feedUrl, so the crawler cannot fetch them (ADR 0060 §5)"
+            );
         }
     }
 
@@ -174,6 +212,8 @@ mod tests {
             remote_feed_guid: format!("guid-{position}"),
             remote_feed_url: url.map(ToString::to_string),
             rel: None,
+            item_guid: None,
+            item_title: None,
         }
     }
 
@@ -307,7 +347,39 @@ mod tests {
     }
 
     #[test]
-    fn a_medium_l_feed_gives_nothing() {
+    fn a_musicl_feed_with_one_music_item_with_feedurl_gives_that_url() {
+        let data = feed(
+            Some("musicL"),
+            vec![remote_item(
+                0,
+                Some("music"),
+                Some("https://music.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec!["https://music.example/feed.xml".to_string()],
+            "a musicL feed must give the URL of each music item (ADR 0060 §5)"
+        );
+    }
+
+    #[test]
+    fn a_musicl_feed_with_an_item_with_no_medium_gives_its_url() {
+        let data = feed(
+            Some("musicL"),
+            vec![remote_item(0, None, Some("https://music.example/feed.xml"))],
+        );
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec!["https://music.example/feed.xml".to_string()],
+            "a musicL feed must give the URL of each item with no medium (ADR 0060 §5)"
+        );
+    }
+
+    #[test]
+    fn a_musicl_feed_with_a_publisher_item_gives_nothing_for_it() {
         let data = feed(
             Some("musicL"),
             vec![remote_item(
@@ -320,7 +392,7 @@ mod tests {
         assert_eq!(
             follow_urls(&data, FETCHED_URL),
             Vec::<String>::new(),
-            "a musicL feed is a different medium and must give nothing"
+            "a musicL feed must not give URLs from publisher items (ADR 0060 §5)"
         );
     }
 
@@ -480,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn a_publisher_level_music_feed_gives_nothing() {
+    fn a_publisher_level_music_feed_that_names_a_publisher_gives_nothing() {
         let data = feed(
             Some("music"),
             vec![remote_item(
@@ -493,7 +565,27 @@ mod tests {
         assert_eq!(
             follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
             Vec::<String>::new(),
-            "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed"
+            "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed (ADR 0060 §5)"
+        );
+    }
+
+    #[test]
+    fn a_music_feed_with_300_publisher_links_gives_200() {
+        let items = (0..300)
+            .map(|i| {
+                remote_item(
+                    i,
+                    Some("publisher"),
+                    Some(&format!("https://pub{i}.example/feed.xml")),
+                )
+            })
+            .collect();
+        let data = feed(Some("music"), items);
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL).len(),
+            200,
+            "ADR 0060 §6: a feed that is not a list keeps the limit of 200 (ADR 0054 §3)"
         );
     }
 
@@ -523,6 +615,55 @@ mod tests {
             urls.last().map(String::as_str),
             Some("https://album-199.example/feed.xml"),
             "the cap must drop only past the 200th URL"
+        );
+    }
+
+    #[test]
+    fn a_musicl_feed_with_1200_different_urls_gives_1000() {
+        let remote_items: Vec<IngestRemoteFeedRef> = (0..1200i64)
+            .map(|position| {
+                let url = format!("https://track-{position}.example/feed.xml");
+                remote_item(position, Some("music"), Some(url.as_str()))
+            })
+            .collect();
+        let data = feed(Some("musicL"), remote_items);
+
+        let urls = follow_urls(&data, FETCHED_URL);
+
+        assert_eq!(
+            urls.len(),
+            1000,
+            "a musicL feed that lists 1200 tracks must give at most 1000 (ADR 0060 §6)"
+        );
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://track-0.example/feed.xml"),
+            "the cap must keep the URLs in the order follow_urls finds them"
+        );
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some("https://track-999.example/feed.xml"),
+            "the cap must drop only past the 1000th URL"
+        );
+    }
+
+    #[test]
+    fn a_musicl_feed_with_30_items_for_one_url_gives_one_url() {
+        let remote_items: Vec<IngestRemoteFeedRef> = (0..30i64)
+            .map(|position| {
+                remote_item(
+                    position,
+                    Some("music"),
+                    Some("https://album.example/feed.xml"),
+                )
+            })
+            .collect();
+        let data = feed(Some("musicL"), remote_items);
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec!["https://album.example/feed.xml".to_string()],
+            "a musicL feed with 30 items for the same URL must give that URL only once (ADR 0060 §5)"
         );
     }
 
