@@ -142,6 +142,19 @@ impl CrawlOutcome {
         matches!(self, Self::Rejected { reason, .. } if reason.starts_with("[medium_music]"))
     }
 
+    /// Returns `true` when the cache must keep no row for this outcome.
+    ///
+    /// A medium rejection: the shared skip list stops the next fetch, so the
+    /// body is never used again. An ingest answer of `413`: the node refuses
+    /// a request body over its limit, and it refuses the same body each time,
+    /// so a kept body only fails again. Both are mostly large podcast feeds,
+    /// and one such body can hold tens of MiB.
+    #[must_use]
+    pub fn keeps_no_cache_row(&self) -> bool {
+        self.is_medium_rejection()
+            || matches!(self, Self::IngestError { reason, .. } if reason.starts_with("ingest http 413"))
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -711,6 +724,12 @@ fn write_cache_row(
     outcome: &CrawlOutcome,
     at: i64,
 ) {
+    // A medium rejection or an ingest answer of 413 keeps no row. See
+    // `CrawlOutcome::keeps_no_cache_row`.
+    if outcome.keeps_no_cache_row() {
+        remove_cache_row(cache, url);
+        return;
+    }
     match cache.lock() {
         Ok(guard) => guard.put(url, entry),
         Err(e) => {
@@ -727,6 +746,19 @@ fn write_cache_row(
         Err(e) => {
             eprintln!(
                 "crawl: WARNING: feed cache lock poisoned; skipped recording node answer for {url}: {e}"
+            );
+        }
+    }
+}
+
+/// Delete the cached row for `url`. A poisoned lock skips the delete. It does
+/// not panic the crawl.
+fn remove_cache_row(cache: &FeedCache, url: &str) {
+    match cache.lock() {
+        Ok(guard) => guard.remove(url),
+        Err(e) => {
+            eprintln!(
+                "crawl: WARNING: feed cache lock poisoned; skipped removing cache row for {url}: {e}"
             );
         }
     }
@@ -899,6 +931,7 @@ async fn ingest_kept_body(
         // this kept body again.
         let at = unix_now();
         match cache.lock() {
+            Ok(guard) if report.outcome.keeps_no_cache_row() => guard.remove(url),
             Ok(guard) if is_uncached_node_answer(&report.outcome) => guard.clear_node_answer(url),
             Ok(guard) => {
                 guard.record_node_answer(url, report.outcome.label(), report.outcome.reason(), at);
@@ -1431,6 +1464,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keeps_no_cache_row_is_true_for_a_medium_rejection_and_a_413_only() {
+        let medium = CrawlOutcome::Rejected {
+            reason: "[medium_music] absent".to_string(),
+            warnings: Vec::new(),
+        };
+        let too_large = CrawlOutcome::IngestError {
+            reason: "ingest http 413 Payload Too Large Payload Too Large response=".to_string(),
+            retryable: false,
+            retry_after_secs: None,
+        };
+        let server_error = CrawlOutcome::IngestError {
+            reason: "ingest http 500 Internal Server Error response=".to_string(),
+            retryable: true,
+            retry_after_secs: None,
+        };
+        let payment = CrawlOutcome::Rejected {
+            reason: "[v4v_payment] no payment route".to_string(),
+            warnings: Vec::new(),
+        };
+        assert!(
+            medium.keeps_no_cache_row(),
+            "a medium rejection keeps no row"
+        );
+        assert!(too_large.keeps_no_cache_row(), "a 413 keeps no row");
+        assert!(!server_error.keeps_no_cache_row(), "a 500 keeps its row");
+        assert!(
+            !payment.keeps_no_cache_row(),
+            "an ordinary rejection keeps its row"
+        );
+    }
+
     // ---- `is_uncached_node_answer` (`stophammer` ADR 0051 §5, ADR 0053 §1) ----
 
     #[test]
@@ -1857,6 +1922,54 @@ mod tests {
         let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"[v4v_payment] no payment route"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.await.expect("ingest stub task");
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Rejected {
+                reason: "[v4v_payment] no payment route".to_string(),
+                warnings: Vec::new(),
+            }
+        );
+
+        let cached = cache
+            .lock()
+            .expect("cache lock")
+            .get(&feed_url)
+            .expect("a 200 fetch must still write a cache row");
+        assert_eq!(
+            cached.node_answer.as_deref(),
+            Some("rejected"),
+            "an ordinary rejection is not a node conflict, so it is still cached"
+        );
+    }
+
+    /// A medium rejection keeps no cache row. The shared skip list stops the
+    /// next fetch of the feed, so the body is never used again.
+    #[tokio::test]
+    async fn stub_200_with_a_medium_rejection_keeps_no_cache_row() {
+        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
             br#"{"accepted":false,"reason":"[medium_music] absent"}"#,
         ))
         .await;
@@ -1879,15 +1992,9 @@ mod tests {
             }
         );
 
-        let cached = cache
-            .lock()
-            .expect("cache lock")
-            .get(&feed_url)
-            .expect("a 200 fetch must still write a cache row");
-        assert_eq!(
-            cached.node_answer.as_deref(),
-            Some("rejected"),
-            "an ordinary rejection is not a node conflict, so it is still cached"
+        assert!(
+            cache.lock().expect("cache lock").get(&feed_url).is_none(),
+            "a medium rejection must keep no cache row: the skip list stops the next fetch"
         );
     }
 

@@ -246,6 +246,20 @@ impl FeedCacheDb {
         }
     }
 
+    /// Delete the row for `url`. Do nothing when no row exists.
+    ///
+    /// The crawler calls this when the node rejects a feed for its medium.
+    /// The shared skip list keeps that feed out of later fetches, so its body
+    /// is never used again, and a podcast body can hold tens of MiB.
+    pub fn remove(&self, url: &str) {
+        if let Err(e) = self
+            .conn
+            .execute("DELETE FROM feed_cache WHERE url = ?1", params![url])
+        {
+            eprintln!("feed_cache: WARNING: failed to remove cache row for {url}: {e}");
+        }
+    }
+
     /// Clear the node's answer for `url`, so a later `304` submits the kept
     /// body again (`stophammer` ADR 0051 §5). Do nothing when no row exists.
     pub fn clear_node_answer(&self, url: &str) {
@@ -363,6 +377,18 @@ mod tests {
         assert_eq!(cached.node_answer.as_deref(), Some("rejected"));
         assert_eq!(cached.node_reason.as_deref(), Some("[medium_music] absent"));
         assert_eq!(cached.answered_at, Some(at));
+    }
+
+    #[test]
+    fn remove_deletes_the_row_and_a_missing_url_does_nothing() {
+        let db = FeedCacheDb::open(&temp_db());
+        db.put("https://example.com/a.xml", &sample_entry("<rss/>"));
+        db.remove("https://example.com/a.xml");
+        assert!(
+            db.get("https://example.com/a.xml").is_none(),
+            "remove must delete the row"
+        );
+        db.remove("https://example.com/missing.xml");
     }
 
     #[test]

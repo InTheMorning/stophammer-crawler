@@ -38,6 +38,12 @@ each hop with its status. `follow_urls` also returns a declared
 default redirect policy. The node deploys first, because it accepts the new
 field as optional.
 
+The fetch cache keeps no row for a medium rejection or for an ingest answer
+of `413` (`CrawlOutcome::keeps_no_cache_row`). The skip list stops the next
+fetch of a non-music feed, and the node refuses a request body over 2 MiB each
+time. On 2026-09-25, 221 rows with the answer `ingest_error` held 216 MiB of
+the 252 MiB cache.
+
 `FORCE_REINGEST` and `--force` stay global to a run. `src/crawl.rs:350` adds
 `force_reingest` to each `/ingest/feed` payload, whatever the mode. Thus a
 forced pass must use `refresh`, which reads only feeds the index holds. A
