@@ -35,6 +35,10 @@ const IMPORT_BATCH_HEARTBEAT_SAMPLE_SIZE: usize = 5;
 const WAVLAKE_IMPORT_MIN_DELAY_MS: u64 = 2_000;
 const WAVLAKE_IMPORT_FALLBACK_429_BACKOFF_SECS: u64 = 300;
 const SNAPSHOT_CONNECT_TIMEOUT_SECS: u64 = 30;
+/// Free space that a snapshot refresh needs beyond the size of the current
+/// snapshot and its growth allowance. The new snapshot is written beside the
+/// old one, so a refresh needs about the snapshot size a second time.
+const SNAPSHOT_FREE_SPACE_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 const MUSIC_FIRST_LOWER_BOUND_ID: i64 = 4_630_863;
 const WAVLAKE_HOSTS: [&str; 2] = ["wavlake.com", "www.wavlake.com"];
 
@@ -104,6 +108,9 @@ struct StartCursorDecision {
 enum SnapshotRefreshOutcome {
     Downloaded,
     Unchanged,
+    /// The disk has too little free space for a second copy of the snapshot.
+    /// The import keeps the existing snapshot.
+    SkippedLowSpace,
 }
 
 impl KnownSkipKind {
@@ -1445,6 +1452,51 @@ fn format_if_modified_since_value(modified_at: SystemTime) -> String {
     modified_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
+/// Bytes that a refresh needs free, beside a current snapshot of
+/// `current_snapshot_bytes`: the same size again, 10 % growth, and a margin.
+fn snapshot_refresh_required_bytes(current_snapshot_bytes: u64) -> u64 {
+    current_snapshot_bytes
+        .saturating_add(current_snapshot_bytes / 10)
+        .saturating_add(SNAPSHOT_FREE_SPACE_MARGIN_BYTES)
+}
+
+/// Free bytes that an unprivileged process can use on the file system of
+/// `dir`.
+fn available_bytes(dir: &Path) -> io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_dir` is a valid NUL-terminated path, and `stat` points to
+    // writable memory of the size and alignment of `libc::statvfs`.
+    let rc = unsafe { libc::statvfs(c_dir.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `statvfs` returned 0, so it initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// Returns the missing bytes when the directory of `db_path` cannot hold a
+/// second copy of the current snapshot, or `None` when the refresh can run.
+/// With no current snapshot there is nothing to measure, so the refresh runs.
+fn snapshot_space_shortfall(db_path: &Path) -> io::Result<Option<u64>> {
+    let Ok(metadata) = fs::metadata(db_path) else {
+        return Ok(None);
+    };
+    let dir = match db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let required = snapshot_refresh_required_bytes(metadata.len());
+    let available = available_bytes(dir)?;
+    Ok(required
+        .checked_sub(available)
+        .filter(|missing| *missing > 0))
+}
+
 fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()> {
     ensure_parent_dir(db_path)?;
 
@@ -1452,37 +1504,14 @@ fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()
     let backup_path = db_path.with_extension("backup");
     let _ = fs::remove_file(&tmp_path);
     let _ = fs::remove_file(&backup_path);
-    let mut wrote_db = false;
-
-    {
-        let decoder = GzDecoder::new(reader);
-        let mut archive = Archive::new(decoder);
-
-        for entry_result in archive.entries()? {
-            let mut entry = entry_result?;
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-
-            let entry_path = entry.path()?;
-            let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-
-            if !Path::new(file_name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
-            {
-                continue;
-            }
-
-            let mut tmp_file = fs::File::create(&tmp_path)?;
-            io::copy(&mut entry, &mut tmp_file)?;
-            tmp_file.flush()?;
-            wrote_db = true;
-            break;
+    // A failed write must not leave a partial snapshot on the disk.
+    let wrote_db = match write_snapshot_db(reader, &tmp_path) {
+        Ok(wrote_db) => wrote_db,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
         }
-    }
+    };
 
     if !wrote_db {
         let _ = fs::remove_file(&tmp_path);
@@ -1504,6 +1533,39 @@ fn extract_snapshot_archive<R: Read>(reader: R, db_path: &Path) -> io::Result<()
         fs::rename(&tmp_path, db_path)?;
     }
     Ok(())
+}
+
+/// Writes the first `.db` entry of the gzip tar archive in `reader` to
+/// `tmp_path`. Returns `false` when the archive holds no `.db` entry.
+fn write_snapshot_db<R: Read>(reader: R, tmp_path: &Path) -> io::Result<bool> {
+    let decoder = GzDecoder::new(reader);
+    let mut archive = Archive::new(decoder);
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let entry_path = entry.path()?;
+        let Some(file_name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if !Path::new(file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        {
+            continue;
+        }
+
+        let mut tmp_file = fs::File::create(tmp_path)?;
+        io::copy(&mut entry, &mut tmp_file)?;
+        tmp_file.flush()?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 fn download_snapshot_archive(
@@ -1542,6 +1604,16 @@ fn download_snapshot_archive(
     }
 
     let response = response.error_for_status().map_err(io::Error::other)?;
+
+    if let Some(missing) = snapshot_space_shortfall(db_path)? {
+        eprintln!(
+            "import: WARNING: skipping PodcastIndex snapshot refresh; {} MiB more free space is \
+             needed beside {} for a second copy; keeping the existing snapshot",
+            missing / (1024 * 1024),
+            db_path.display()
+        );
+        return Ok(SnapshotRefreshOutcome::SkippedLowSpace);
+    }
 
     extract_snapshot_archive(response, db_path)?;
     eprintln!(
@@ -1935,12 +2007,14 @@ mod tests {
     use super::{
         CandidateRow, ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter,
         ImportMemoryRow, ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity,
-        ProgressStore, WAVLAKE_HOSTS, batch_max_id, build_import_audit_row,
-        build_import_timeout_report, current_lock_identity, effective_audit_append,
-        enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
-        format_if_modified_since_value, is_skip_known_non_music, known_skip_kind,
-        legacy_lock_matches_process, load_known_import_memory, open_state_connection, query_batch,
-        read_lock_identity, resolve_start_cursor, upsert_import_memory, wavlake_throttle_delay,
+        ProgressStore, SNAPSHOT_FREE_SPACE_MARGIN_BYTES, WAVLAKE_HOSTS, batch_max_id,
+        build_import_audit_row, build_import_timeout_report, current_lock_identity,
+        effective_audit_append, enqueue_import_audit, enqueue_import_memory,
+        extract_snapshot_archive, format_if_modified_since_value, is_skip_known_non_music,
+        known_skip_kind, legacy_lock_matches_process, load_known_import_memory,
+        open_state_connection, query_batch, read_lock_identity, resolve_start_cursor,
+        snapshot_refresh_required_bytes, snapshot_space_shortfall, upsert_import_memory,
+        wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
@@ -2079,6 +2153,85 @@ mod tests {
         assert_eq!(fs::read(&db_path).expect("read db"), b"new sqlite bytes");
         assert!(!db_path.with_extension("download").exists());
         assert!(!db_path.with_extension("backup").exists());
+    }
+
+    #[test]
+    fn extract_snapshot_archive_removes_partial_download_on_a_failed_write() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        fs::write(&db_path, b"old sqlite bytes").expect("seed old db");
+        let payload = vec![7_u8; 256 * 1024];
+        let mut archive = make_snapshot_archive(&[("podcastindex_feeds.db", payload.as_slice())]);
+        archive.truncate(archive.len() / 2);
+
+        extract_snapshot_archive(Cursor::new(archive), &db_path)
+            .expect_err("a truncated archive must fail");
+
+        assert!(
+            !db_path.with_extension("download").exists(),
+            "a failed write must not leave the partial .download file"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read db"),
+            b"old sqlite bytes",
+            "a failed write must keep the existing snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_required_bytes_adds_growth_and_margin() {
+        assert_eq!(
+            snapshot_refresh_required_bytes(1_000),
+            1_000 + 100 + SNAPSHOT_FREE_SPACE_MARGIN_BYTES,
+            "a refresh needs the snapshot size, 10 % growth and the margin"
+        );
+        assert_eq!(
+            snapshot_refresh_required_bytes(u64::MAX),
+            u64::MAX,
+            "the sum saturates instead of overflowing"
+        );
+    }
+
+    #[test]
+    fn snapshot_space_shortfall_is_none_without_a_current_snapshot() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+
+        assert_eq!(
+            snapshot_space_shortfall(&db_path).expect("check space"),
+            None,
+            "a first download has no size to measure, so it runs"
+        );
+    }
+
+    #[test]
+    fn snapshot_space_shortfall_is_none_for_a_small_snapshot() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        fs::write(&db_path, b"small").expect("seed db");
+
+        assert_eq!(
+            snapshot_space_shortfall(&db_path).expect("check space"),
+            None,
+            "a small snapshot fits on the test file system"
+        );
+    }
+
+    #[test]
+    fn snapshot_space_shortfall_reports_a_snapshot_larger_than_the_disk() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+        // A sparse file reports a length of 1 PiB and uses almost no blocks.
+        fs::File::create(&db_path)
+            .and_then(|file| file.set_len(1 << 50))
+            .expect("create sparse snapshot");
+
+        let missing = snapshot_space_shortfall(&db_path).expect("check space");
+
+        assert!(
+            missing.is_some_and(|bytes| bytes > 0),
+            "a 1 PiB snapshot cannot have a second copy on the test file system"
+        );
     }
 
     #[test]
