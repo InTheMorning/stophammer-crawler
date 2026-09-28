@@ -527,7 +527,11 @@ pub async fn run_urls(
         host_delay_ms
     );
 
-    let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
+    let config = Arc::new(
+        CrawlConfig::from_env_with_force(force)
+            .with_revalidate(revalidate)
+            .with_report_gone(true),
+    );
     let client = Arc::new(build_feed_fetch_client());
     let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
     let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));

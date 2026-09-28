@@ -1511,7 +1511,11 @@ pub async fn run(
 ) {
     let sse_url = sse_url.unwrap_or_else(|| GOSSIP_LISTENER_SSE_URL.to_string());
 
-    let config = Arc::new(CrawlConfig::from_env_with_force(force).with_revalidate(revalidate));
+    let config = Arc::new(
+        CrawlConfig::from_env_with_force(force)
+            .with_revalidate(revalidate)
+            .with_report_gone(true),
+    );
     let client = Arc::new(create_async_client());
     let sem = Arc::new(Semaphore::new(concurrency));
     // ADR 0049 §2 (`stophammer` repository): one host throttle, shared by

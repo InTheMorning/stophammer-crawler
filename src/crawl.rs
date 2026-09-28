@@ -21,6 +21,12 @@ const HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
 pub type FeedCache = Arc<Mutex<FeedCacheDb>>;
 
 /// Configuration shared by all crawl modes.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent, unrelated switch on one part of the fetch or ingest \
+              pipeline (force reingest, revalidation, private-target tests, gone reporting); no \
+              two ever change together, so an enum would not share a variant"
+)]
 pub struct CrawlConfig {
     pub crawl_token: String,
     pub ingest_url: String,
@@ -40,6 +46,12 @@ pub struct CrawlConfig {
     /// for an IP literal. Without this switch, the loop would reject the
     /// stub's own loopback address.
     pub allow_private_targets: bool,
+    /// When true, a `404` or `410` from the requested URL, with no redirect
+    /// before it, posts one gone report to the node (ADR 0067 §1,
+    /// `stophammer` repository). The `feed`, `refresh` and `gossip` modes
+    /// set this. `import` and `ndjson` leave it `false`, because they fetch
+    /// feeds the index does not hold.
+    pub report_gone: bool,
     /// Dedicated HTTP client for ingest POSTs, built with connection pooling
     /// disabled so stale keep-alive sockets never cause spurious failures.
     ingest_client: reqwest::Client,
@@ -58,6 +70,7 @@ impl CrawlConfig {
             force_reingest,
             revalidate: true,
             allow_private_targets: false,
+            report_gone: false,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -74,6 +87,7 @@ impl CrawlConfig {
             force_reingest: false,
             revalidate: true,
             allow_private_targets: false,
+            report_gone: false,
             ingest_client: Self::build_ingest_client(ingest_timeout),
         }
     }
@@ -83,6 +97,14 @@ impl CrawlConfig {
     #[must_use]
     pub fn with_revalidate(mut self, revalidate: bool) -> Self {
         self.revalidate = revalidate;
+        self
+    }
+
+    /// Change whether a gone answer posts a report to the node (ADR 0067
+    /// §1, `stophammer` repository).
+    #[must_use]
+    pub fn with_report_gone(mut self, report_gone: bool) -> Self {
+        self.report_gone = report_gone;
         self
     }
 
@@ -637,6 +659,83 @@ async fn post_ingest_payload(
             CrawlOutcome::NoChange
         } else {
             CrawlOutcome::Rejected { reason, warnings }
+        }
+    }
+}
+
+/// Build the ingest JSON for a gone report (ADR 0067 §1, `stophammer`
+/// repository).
+///
+/// The requested URL fills both `canonical_url` and `source_url`. There is
+/// no parsed body, so `feed_data` stays `null` and `content_hash` stays
+/// empty. `force_reingest` stays `false`, whatever the run's own force
+/// flag, because a gone report never resubmits a body. `redirects` stays
+/// empty, because a gone report only follows a fetch that took no redirect
+/// hop.
+fn build_gone_report_payload(url: &str, http_status: u16, crawl_token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "canonical_url": url,
+        "source_url": url,
+        "crawl_token": crawl_token,
+        "http_status": http_status,
+        "content_hash": "",
+        "feed_data": null,
+        "force_reingest": false,
+        "redirects": [],
+    })
+}
+
+/// Post one gone report to the node for a `404` or `410` from the requested
+/// URL, with no redirect before it (ADR 0067 §1, `stophammer` repository).
+///
+/// Uses the same client, token, timeout and ingest URL as
+/// [`post_ingest_payload`]. Never changes the caller's `FetchError`
+/// outcome: a failed post, a non-JSON answer, or an ingest-side HTTP error
+/// only logs a warning. A parsed answer is logged with its reason, for
+/// example `source_gone_observed` or `source_gone`. The crate logs with
+/// `eprintln!`, as each mode does.
+async fn post_gone_report(url: &str, http_status: u16, config: &CrawlConfig) {
+    let payload = build_gone_report_payload(url, http_status, &config.crawl_token);
+
+    let resp = match config
+        .ingest_client
+        .post(&config.ingest_url)
+        .json(&payload)
+        .timeout(config.ingest_timeout)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("  gone_report: WARNING: post failed for {url} (http {http_status}): {e}");
+            return;
+        }
+    };
+
+    let ingest_status = resp.status();
+    let resp_body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("  gone_report: WARNING: could not read the node answer for {url}: {e}");
+            return;
+        }
+    };
+
+    if !ingest_status.is_success() {
+        eprintln!(
+            "  gone_report: WARNING: the node answered {ingest_status} for {url}: {}",
+            body_preview(resp_body.as_bytes())
+        );
+        return;
+    }
+
+    match serde_json::from_str::<IngestResponse>(&resp_body) {
+        Ok(parsed) => {
+            let reason = parsed.reason.as_deref().unwrap_or("");
+            eprintln!("  gone_report: http {http_status} {url} -> {reason}");
+        }
+        Err(e) => {
+            eprintln!("  gone_report: WARNING: non-JSON node answer for {url}: {e}");
         }
     }
 }
@@ -1211,19 +1310,24 @@ pub async fn crawl_feed_report(
                 .expect("plan_after_response gives SkipIngest only with a cached row");
             skip_ingest_with_kept_body(row, fallback_guid)
         }
-        FetchAction::FetchError | FetchAction::RefetchUnconditional => build_crawl_report(
-            CrawlOutcome::FetchError {
-                reason: format_http_fetch_error(status, &headers, &body),
-                retryable: is_retryable_http_status(status),
-                retry_after_secs: parse_retry_after_secs(&headers),
-            },
-            Some(status),
-            None,
-            final_url,
-            None,
-            None,
-            redirects,
-        ),
+        FetchAction::FetchError | FetchAction::RefetchUnconditional => {
+            if config.report_gone && matches!(status, 404 | 410) && redirects.is_empty() {
+                post_gone_report(url, status, config).await;
+            }
+            build_crawl_report(
+                CrawlOutcome::FetchError {
+                    reason: format_http_fetch_error(status, &headers, &body),
+                    retryable: is_retryable_http_status(status),
+                    retry_after_secs: parse_retry_after_secs(&headers),
+                },
+                Some(status),
+                None,
+                final_url,
+                None,
+                None,
+                redirects,
+            )
+        }
     }
 }
 
@@ -2631,6 +2735,207 @@ mod tests {
             serde_json::json!([]),
             "the ingest payload must send an empty redirects list when there was no redirect"
         );
+    }
+
+    // ---- stub-server tests for the ADR 0067 gone report ----
+
+    /// `stophammer` ADR 0067 §1: a `404` from the requested URL, with no
+    /// redirect before it, and `report_gone` true, posts one gone report to
+    /// the node. The report names the requested URL twice, carries the
+    /// status, and has no parsed body.
+    #[tokio::test]
+    async fn a_404_with_report_gone_posts_one_gone_report_to_the_node() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 404 Not Found", &[], b"Not found")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let (node_addr, node_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"source_gone_observed"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
+        config.report_gone = true;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+        let node_request = node_handle.await.expect("node stub task");
+
+        assert_eq!(
+            node_request.method, "POST",
+            "a gone report must be a POST to the node"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&node_request.body).expect("gone report payload must be JSON");
+        assert_eq!(payload["canonical_url"], feed_url);
+        assert_eq!(payload["source_url"], feed_url);
+        assert_eq!(payload["http_status"], 404);
+        assert_eq!(payload["feed_data"], serde_json::Value::Null);
+        assert_eq!(payload["content_hash"], "");
+        assert_eq!(payload["force_reingest"], false);
+        assert_eq!(payload["redirects"], serde_json::json!([]));
+
+        assert!(
+            matches!(&report.outcome, CrawlOutcome::FetchError { .. }),
+            "a gone answer must still be reported as a fetch error, got {:?}",
+            report.outcome
+        );
+        assert_eq!(report.fetch_http_status, Some(404));
+    }
+
+    /// `stophammer` ADR 0067 §1: a `410` counts as a gone answer too, the
+    /// same as a `404`.
+    #[tokio::test]
+    async fn a_410_with_report_gone_posts_one_gone_report_to_the_node() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 410 Gone", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let (node_addr, node_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false,"reason":"source_gone_observed"}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
+        config.report_gone = true;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+        let node_request = node_handle.await.expect("node stub task");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&node_request.body).expect("gone report payload must be JSON");
+        assert_eq!(payload["canonical_url"], feed_url);
+        assert_eq!(payload["source_url"], feed_url);
+        assert_eq!(payload["http_status"], 410);
+        assert_eq!(payload["feed_data"], serde_json::Value::Null);
+
+        assert!(
+            matches!(&report.outcome, CrawlOutcome::FetchError { .. }),
+            "a gone answer must still be reported as a fetch error, got {:?}",
+            report.outcome
+        );
+        assert_eq!(report.fetch_http_status, Some(410));
+    }
+
+    /// `stophammer` ADR 0067 §1: a `404` that came after a redirect is not a
+    /// gone answer. The node stub never receives a connection.
+    #[tokio::test]
+    async fn a_404_after_a_redirect_makes_no_gone_report() {
+        let (addr_b, handle_b) =
+            spawn_stub(stub_response("HTTP/1.1 404 Not Found", &[], b"")).await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (node_addr, node_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false}"#,
+        ))
+        .await;
+
+        let client = no_redirect_client();
+        let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
+        config.report_gone = true;
+
+        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), node_handle)
+                .await
+                .is_err(),
+            "a 404 that came after a redirect must post no gone report"
+        );
+        assert_eq!(report.fetch_http_status, Some(404));
+        assert!(matches!(&report.outcome, CrawlOutcome::FetchError { .. }));
+    }
+
+    /// `stophammer` ADR 0067 §1: only `404` and `410` are gone answers. A
+    /// `500` posts no report, even with `report_gone` true.
+    #[tokio::test]
+    async fn a_500_with_report_gone_makes_no_gone_report() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 500 Internal Server Error",
+            &[],
+            b"",
+        ))
+        .await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let (node_addr, node_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
+        config.report_gone = true;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), node_handle)
+                .await
+                .is_err(),
+            "a 500 must post no gone report"
+        );
+        assert_eq!(report.fetch_http_status, Some(500));
+        assert!(matches!(&report.outcome, CrawlOutcome::FetchError { .. }));
+    }
+
+    /// `stophammer` ADR 0067 §1: with `report_gone` false, a `404` posts no
+    /// report. This is the default, so `import` and `ndjson` send none.
+    #[tokio::test]
+    async fn a_404_with_report_gone_false_makes_no_gone_report() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 404 Not Found", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let (node_addr, node_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":false}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        // `test_config` leaves `report_gone` at its default, `false`.
+        let config = test_config(format!("http://{node_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+
+        feed_handle.await.expect("feed stub task");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), node_handle)
+                .await
+                .is_err(),
+            "report_gone=false must post no gone report"
+        );
+        assert_eq!(report.fetch_http_status, Some(404));
+        assert!(matches!(&report.outcome, CrawlOutcome::FetchError { .. }));
     }
 
     /// `stophammer` ADR 0054 §1: the loop rejects a private target before
