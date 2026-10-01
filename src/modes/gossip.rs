@@ -523,45 +523,56 @@ async fn process_notification_urls(
             let mut keep_window = false;
             loop {
                 let window_start = std::time::Instant::now();
-                let permit = sem.acquire().await.expect("semaphore closed");
-                let start = Instant::now();
-                let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
-                drop(permit);
-                let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
-                let changed = matches!(report.outcome, CrawlOutcome::Accepted { .. });
+                // `report` carries `raw_xml` and the full parsed feed. It must
+                // drop before the window sleep below: a replay of the archive
+                // starts thousands of these tasks in minutes, and each held its
+                // feed body through a wall-clock window until the host ran out
+                // of memory (stophammer ADR 0062). This block gives back only
+                // what the rest of the task needs, so `report` drops at its end.
+                let (changed, follow) = {
+                    let permit = sem.acquire().await.expect("semaphore closed");
+                    let start = Instant::now();
+                    let report =
+                        crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
+                    drop(permit);
+                    let duration_ms =
+                        i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+                    let changed = matches!(report.outcome, CrawlOutcome::Accepted { .. });
 
-                // ADR 0049 §2 (`stophammer` repository): read the follow URLs
-                // as soon as the report arrives, so `report` (which carries
-                // `raw_xml` and the full parsed feed) can drop at the end of
-                // this task instead of living through the follow fetches. The
-                // notification crawl is `FollowLevel::Input`.
-                let follow = report_follow_urls(&report, FollowLevel::Input);
+                    // ADR 0049 §2 (`stophammer` repository): read the follow URLs
+                    // as soon as the report arrives. The notification crawl is
+                    // `FollowLevel::Input`.
+                    let follow = report_follow_urls(&report, FollowLevel::Input);
 
-                if !(quiet && report.outcome.is_medium_rejection()) {
-                    eprintln!("  {}: {url}", report.outcome);
-                }
-
-                if let Some(ref tx) = audit_tx {
-                    let fetched_at = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let fetched_at_i64 =
-                        i64::try_from(fetched_at).expect("unix timestamp fits i64");
-                    if let Some(audit_row) = build_audit_row_from_url(&url, &report, fetched_at_i64)
-                    {
-                        enqueue_import_audit(tx, audit_row);
+                    if !(quiet && report.outcome.is_medium_rejection()) {
+                        eprintln!("  {}: {url}", report.outcome);
                     }
-                }
 
-                skip_db
-                    .lock()
-                    .unwrap()
-                    .record_outcome(&url, &report, "gossip");
-                progress
-                    .lock()
-                    .unwrap()
-                    .upsert_feed_memory(&url, &report, duration_ms);
+                    if let Some(ref tx) = audit_tx {
+                        let fetched_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        let fetched_at_i64 =
+                            i64::try_from(fetched_at).expect("unix timestamp fits i64");
+                        if let Some(audit_row) =
+                            build_audit_row_from_url(&url, &report, fetched_at_i64)
+                        {
+                            enqueue_import_audit(tx, audit_row);
+                        }
+                    }
+
+                    skip_db
+                        .lock()
+                        .unwrap()
+                        .record_outcome(&url, &report, "gossip");
+                    progress
+                        .lock()
+                        .unwrap()
+                        .upsert_feed_memory(&url, &report, duration_ms);
+
+                    (changed, follow)
+                };
 
                 // A fetch of one of these URLs is a level-1 follow fetch
                 // (task 010b): `FollowLevel::Publisher`. It gives its own
