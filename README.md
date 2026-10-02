@@ -505,6 +505,15 @@ stophammer-crawler --force ndjson --input /data/repair.ndjson \
 The script opens both databases read-only. stophammer
 `docs/tasks/adr-0051-task-006-replay-fetch-cache.md` gives the procedure.
 
+Two options export a different set of rows. Each needs `--force` in the
+replay:
+
+- `--self-links` exports the rows at a declared self link that is not the
+  stored feed URL. The replay moves each such record (stophammer ADR 0052 §2).
+- `--copies` exports the rows at the URL of a feed copy. The node classifies
+  each body as a mirror, changes no record, and stores the copy summary again,
+  with its item titles and image (stophammer ADR 0058 §1c).
+
 ## Environment variables
 
 - **`CRAWL_TOKEN`** (required) --

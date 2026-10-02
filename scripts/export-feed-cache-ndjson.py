@@ -20,6 +20,13 @@ moves each record with no request to a feed host, and it follows no link. The
 `--self-links` rows need `--force`, because the node answers `no_change` for an
 unchanged body, and that answer does not move a record.
 
+With `--copies`, the script exports a row only when its URL is the URL of a
+`feed_copies` row (ADR 0058). The node classifies a submission from that URL
+as a mirror. It changes no record, and it stores the summary of the copy again.
+This fills the item titles and the image of ADR 0058 section 1c with no
+request to a feed host. The `--copies` rows need `--force`, as the
+`--self-links` rows do.
+
 Both databases are opened read-only. The script writes only the output file.
 
 Usage:
@@ -27,7 +34,7 @@ Usage:
       --cache /data/feed_cache.db \\
       --node-db /data/stophammer.db \\
       --output /data/repair.ndjson \\
-      [--since UNIX_SECONDS] [--self-links]
+      [--since UNIX_SECONDS] [--self-links | --copies]
 
 Then:
   stophammer-crawler --force ndjson --input /data/repair.ndjson \\
@@ -70,6 +77,12 @@ def load_self_link_feeds(node_db):
     return {url: (guid, title) for url, guid, title in rows}
 
 
+def load_copy_feeds(node_db):
+    """Map each feed_copies URL to (feed_guid, title). ADR 0058 section 1c."""
+    rows = node_db.execute("SELECT url, feed_guid, title FROM feed_copies")
+    return {url: (guid, title) for url, guid, title in rows}
+
+
 def cache_rows(cache_db, since):
     """Yield (url, final_url, content_sha256, body_gzip, fetched_at), by URL."""
     query = (
@@ -79,7 +92,7 @@ def cache_rows(cache_db, since):
     yield from cache_db.execute(query, (since,))
 
 
-def export(cache_path, node_db_path, output_path, since, self_links=False):
+def export(cache_path, node_db_path, output_path, since, self_links=False, copies=False):
     """Write one NDJSON row for each cache row at a source URL. Return counts."""
     counts = {
         "cache_rows": 0,
@@ -90,7 +103,12 @@ def export(cache_path, node_db_path, output_path, since, self_links=False):
     }
     node_db = open_read_only(node_db_path)
     cache_db = open_read_only(cache_path)
-    sources = load_self_link_feeds(node_db) if self_links else load_source_feeds(node_db)
+    if copies:
+        sources = load_copy_feeds(node_db)
+    elif self_links:
+        sources = load_self_link_feeds(node_db)
+    else:
+        sources = load_source_feeds(node_db)
     node_db.close()
 
     with open(output_path, "w", encoding="utf-8") as out:
@@ -144,14 +162,22 @@ def main():
         default=0,
         help="export only rows fetched at or after this Unix time (default: all)",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--self-links",
         action="store_true",
         help="export the rows at a declared self link that is not the feed_url (ADR 0052)",
     )
+    selection.add_argument(
+        "--copies",
+        action="store_true",
+        help="export the rows at the URL of a feed copy (ADR 0058 section 1c)",
+    )
     args = parser.parse_args()
 
-    counts = export(args.cache, args.node_db, args.output, args.since, args.self_links)
+    counts = export(
+        args.cache, args.node_db, args.output, args.since, args.self_links, args.copies
+    )
     for key, value in counts.items():
         print(f"{key}: {value}", file=sys.stderr)
     if counts["exported"] == 0:
