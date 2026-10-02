@@ -577,39 +577,56 @@ fn build_crawl_report(
     }
 }
 
-/// Attempts of one POST to the node while the node answers `429`.
-const NODE_RATE_LIMIT_ATTEMPTS: u32 = 6;
+/// Attempts of one POST to the node while the node answers `429`, or while
+/// it does not accept a connection. Eight attempts wait about two minutes in
+/// all, which covers a restart of the node.
+const NODE_RATE_LIMIT_ATTEMPTS: u32 = 8;
 
 /// The longest wait before a POST is sent again after a `429`.
 const NODE_RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
 
-/// Gives the wait before attempt `attempt + 1` after a `429` from the node.
-/// A `Retry-After` header sets it. With no header, the wait is 1, 2, 4, 8
-/// and 16 seconds.
+/// Gives the wait before attempt `attempt + 1` after a `429` from the node,
+/// or after a refused connection. A `Retry-After` header sets it. With no
+/// header, the wait is 1, 2, 4, 8, 16, 32 and 60 seconds.
 fn node_rate_limit_wait(retry_after_secs: Option<u64>, attempt: u32) -> Duration {
     let secs = retry_after_secs.unwrap_or(1_u64 << attempt.saturating_sub(1).min(16));
     Duration::from_secs(secs.min(NODE_RATE_LIMIT_MAX_WAIT_SECS))
 }
 
-/// POSTs `payload` to the ingest URL of the node. A `429` from the node
-/// sends the same POST again, at most [`NODE_RATE_LIMIT_ATTEMPTS`] times in
-/// all. The rate limit of the node is per address, and each crawler of a
-/// host shares one address, so a fast pass gets `429` and must wait. A
-/// `429` that was not sent again records the feed as an ingest error, and
-/// the feed is then missed until its next crawl. Gives the last answer.
+/// POSTs `payload` to the ingest URL of the node. A `429` from the node, or
+/// a connection that the node does not accept, sends the same POST again, at
+/// most [`NODE_RATE_LIMIT_ATTEMPTS`] times in all. The rate limit of the node
+/// is per address, and each crawler of a host shares one address, so a fast
+/// pass gets `429` and must wait. A restart of the node refuses each
+/// connection for some seconds. A POST that was not sent again records the
+/// feed as an ingest error, and the feed is then missed until its next crawl
+/// (`stophammer` ADR 0062 §8). Gives the last answer.
 async fn send_to_node(
     payload: &serde_json::Value,
     config: &CrawlConfig,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut attempt = 1;
     loop {
-        let resp = config
+        let resp = match config
             .ingest_client
             .post(&config.ingest_url)
             .json(payload)
             .timeout(config.ingest_timeout)
             .send()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_connect() && attempt < NODE_RATE_LIMIT_ATTEMPTS => {
+                let wait = node_rate_limit_wait(None, attempt);
+                eprintln!(
+                    "  ingest: the node refused the connection, attempt {attempt}/{NODE_RATE_LIMIT_ATTEMPTS}, waiting {wait:?}: {e}"
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
             || attempt >= NODE_RATE_LIMIT_ATTEMPTS
         {
@@ -2456,6 +2473,11 @@ mod tests {
     fn node_rate_limit_wait_doubles_and_obeys_retry_after() {
         assert_eq!(node_rate_limit_wait(None, 1), Duration::from_secs(1));
         assert_eq!(node_rate_limit_wait(None, 5), Duration::from_secs(16));
+        assert_eq!(
+            node_rate_limit_wait(None, 7),
+            Duration::from_secs(NODE_RATE_LIMIT_MAX_WAIT_SECS),
+            "the seventh wait is capped at 60 seconds"
+        );
         assert_eq!(node_rate_limit_wait(Some(3), 1), Duration::from_secs(3));
         assert_eq!(
             node_rate_limit_wait(Some(3_600), 1),
@@ -2498,6 +2520,54 @@ mod tests {
         assert!(
             matches!(outcome, CrawlOutcome::Accepted { .. }),
             "expected the third POST to be accepted, got {outcome}"
+        );
+    }
+
+    /// ADR 0062 §8: a node that restarts refuses each connection for some
+    /// seconds. The crawler sends the same POST again, and the feed is not
+    /// missed.
+    #[tokio::test]
+    async fn a_refused_connection_to_the_node_sends_the_ingest_again() {
+        // Take a free port, then close it, so the first POST is refused.
+        let probe = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let addr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+
+        let accepted = stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        );
+        let node = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let listener = TcpListener::bind(addr).await.expect("bind node listener");
+            let (mut stream, _) = listener.accept().await.expect("accept node connection");
+            let _ = read_stub_request(&mut stream).await;
+            stream
+                .write_all(&accepted)
+                .await
+                .expect("write node response");
+            let _ = stream.shutdown().await;
+        });
+        let config = test_config(format!("http://{addr}/ingest/feed"));
+
+        let outcome = post_ingest_payload(
+            "https://example.com/feed.xml",
+            "https://example.com/feed.xml",
+            200,
+            "hash",
+            None,
+            &config,
+            &[],
+        )
+        .await;
+
+        node.await.expect("node stub task");
+        assert!(
+            matches!(outcome, CrawlOutcome::Accepted { .. }),
+            "expected the POST after the restart to be accepted, got {outcome}"
         );
     }
 

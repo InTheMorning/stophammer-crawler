@@ -1355,6 +1355,13 @@ async fn reconcile_archive_batch(
             return 0;
         };
 
+        // ADR 0062 §8: a cursor that falls behind must show in the log.
+        if let Some(newest) = get_archive_high_water_mark(&conn)
+            && let Some(warning) = cursor_lag_warning(cursor.created_at, newest.created_at)
+        {
+            eprintln!("{warning}");
+        }
+
         let mut stmt = match conn.prepare(
             "SELECT hash, payload, created_at FROM messages
              WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
@@ -1500,6 +1507,37 @@ async fn archive_reconciliation_loop(
             );
         }
     }
+}
+
+/// The most that the archive cursor may lag the newest archive row before
+/// the reconciliation logs a warning (ADR 0062 §8, `stophammer` repository).
+const CURSOR_LAG_WARNING_SECS: i64 = 15 * 60;
+
+/// The line that the crawler logs when the reconciliation loop ends. The
+/// loop never returns, so an end is a panic or a cancellation.
+fn reconciliation_end_message(result: &Result<(), tokio::task::JoinError>) -> String {
+    match result {
+        Ok(()) => "gossip: ERROR: the archive reconciliation loop returned; \
+                   stopping so the cursor does not freeze"
+            .to_string(),
+        Err(e) => format!(
+            "gossip: ERROR: the archive reconciliation loop ended ({e}); \
+             stopping so the cursor does not freeze"
+        ),
+    }
+}
+
+/// Gives a warning when the archive cursor lags the newest archive row by
+/// more than [`CURSOR_LAG_WARNING_SECS`]. Both values are `created_at`
+/// seconds of archive rows.
+fn cursor_lag_warning(cursor_created_at: i64, newest_created_at: i64) -> Option<String> {
+    let lag = newest_created_at.saturating_sub(cursor_created_at);
+    (lag > CURSOR_LAG_WARNING_SECS).then(|| {
+        format!(
+            "gossip: WARNING: the archive cursor lags the newest podping by {lag}s \
+             (more than {CURSOR_LAG_WARNING_SECS}s)"
+        )
+    })
 }
 
 #[allow(
@@ -1701,7 +1739,7 @@ pub async fn run(
         let recon_skip_db = Arc::clone(&skip_db);
         let recon_cache = Arc::clone(&cache);
         let recon_audit_tx = audit_tx.clone();
-        tokio::spawn(async move {
+        let reconciliation = tokio::spawn(async move {
             archive_reconciliation_loop(
                 recon_archive,
                 recon_dedup,
@@ -1719,6 +1757,14 @@ pub async fn run(
                 recon_audit_tx,
             )
             .await;
+        });
+        // ADR 0062 §8 (`stophammer` repository): only this loop moves the
+        // archive cursor. When it ends, the crawler stops, and the restart
+        // policy starts it again from the cursor.
+        tokio::spawn(async move {
+            let result = reconciliation.await;
+            eprintln!("{}", reconciliation_end_message(&result));
+            std::process::exit(1);
         });
     }
 
@@ -1851,6 +1897,35 @@ mod tests {
             })
             .expect("feed memory table should exist");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn cursor_lag_warning_fires_only_past_fifteen_minutes() {
+        assert_eq!(
+            cursor_lag_warning(1_000, 1_000 + 900),
+            None,
+            "15 minutes is still on time"
+        );
+        let warning = cursor_lag_warning(1_000, 1_000 + 901).expect("a warning past 15 minutes");
+        assert!(
+            warning.contains("901s"),
+            "the warning gives the lag: {warning}"
+        );
+        assert_eq!(
+            cursor_lag_warning(2_000, 1_000),
+            None,
+            "a cursor at the newest row is on time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicked_reconciliation_loop_gives_an_error_line() {
+        let handle = tokio::spawn(async { panic!("poisoned lock") });
+        let message = reconciliation_end_message(&handle.await);
+        assert!(
+            message.starts_with("gossip: ERROR: the archive reconciliation loop ended"),
+            "unexpected message: {message}"
+        );
     }
 
     #[test]
