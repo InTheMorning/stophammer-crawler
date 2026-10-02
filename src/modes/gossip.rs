@@ -928,10 +928,14 @@ fn validate_archive_schema(conn: &Connection) -> Result<(), String> {
         }
     }
 
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .map_err(|e| format!("failed to count archive messages: {e}"))?;
-    if count == 0 {
+    // One row is sufficient. A count reads each row of a large archive at
+    // each start.
+    let has_rows: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM messages LIMIT 1)", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| format!("failed to read archive messages: {e}"))?;
+    if !has_rows {
         return Err("archive.db 'messages' table is empty".to_string());
     }
 
