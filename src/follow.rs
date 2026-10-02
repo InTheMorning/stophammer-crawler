@@ -214,6 +214,7 @@ mod tests {
             rel: None,
             item_guid: None,
             item_title: None,
+            publisher_reference: false,
         }
     }
 
