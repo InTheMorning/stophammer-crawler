@@ -1318,6 +1318,75 @@ async fn stream_sse_events(
     Ok(())
 }
 
+/// Reads the archive rows after the cursor of `progress`, at most 1,000.
+/// Gives no row when the archive or the cursor cannot be read. Each failure
+/// is logged. The connection closes before the caller awaits anything.
+fn read_rows_after_cursor(
+    archive_path: &str,
+    progress: &Arc<std::sync::Mutex<ProgressStore>>,
+) -> Vec<ArchiveMessage> {
+    let conn = match Connection::open_with_flags(
+        archive_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gossip: reconciliation: failed to open archive: {e}");
+            return Vec::new();
+        }
+    };
+
+    let Some(cursor) = progress.lock().unwrap().get_archive_cursor() else {
+        return Vec::new();
+    };
+
+    // ADR 0062 §8: a cursor that falls behind must show in the log.
+    if let Some(newest) = get_archive_high_water_mark(&conn)
+        && let Some(warning) = cursor_lag_warning(cursor.created_at, newest.created_at)
+    {
+        eprintln!("{warning}");
+    }
+
+    let mut stmt = match conn.prepare(
+        "SELECT hash, payload, created_at FROM messages
+             WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
+             ORDER BY created_at ASC, hash ASC
+             LIMIT 1000",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("gossip: reconciliation: failed to prepare query: {e}");
+            return Vec::new();
+        }
+    };
+
+    // ADR 0062 §8 (`stophammer` repository): the listener stores the
+    // payload as a BLOB. Read it as bytes, as `replay_from_archive`
+    // does. A row that still fails is logged, never dropped in silence.
+    match stmt.query_map(params![cursor.created_at, cursor.hash], |row| {
+        Ok(ArchiveMessage {
+            hash: row.get(0)?,
+            payload: row.get::<_, Vec<u8>>(1)?,
+            created_at: row.get(2)?,
+        })
+    }) {
+        Ok(rows) => rows
+            .filter_map(|row| {
+                row.map_err(|e| {
+                    eprintln!(
+                        "gossip: reconciliation: WARNING: failed to read an archive row: {e}"
+                    );
+                })
+                .ok()
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("gossip: reconciliation: failed to query archive: {e}");
+            Vec::new()
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "archive reconciliation requires many shared resources"
@@ -1339,56 +1408,7 @@ async fn reconcile_archive_batch(
     audit_tx: Option<&mpsc::Sender<ImportAuditCommand>>,
 ) -> u64 {
     // Collect all messages synchronously, then drop the connection before any .await
-    let messages: Vec<ArchiveMessage> = {
-        let conn = match Connection::open_with_flags(
-            archive_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("gossip: reconciliation: failed to open archive: {e}");
-                return 0;
-            }
-        };
-
-        let Some(cursor) = progress.lock().unwrap().get_archive_cursor() else {
-            return 0;
-        };
-
-        // ADR 0062 §8: a cursor that falls behind must show in the log.
-        if let Some(newest) = get_archive_high_water_mark(&conn)
-            && let Some(warning) = cursor_lag_warning(cursor.created_at, newest.created_at)
-        {
-            eprintln!("{warning}");
-        }
-
-        let mut stmt = match conn.prepare(
-            "SELECT hash, payload, created_at FROM messages
-             WHERE created_at > ?1 OR (created_at = ?1 AND hash > ?2)
-             ORDER BY created_at ASC, hash ASC
-             LIMIT 1000",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("gossip: reconciliation: failed to prepare query: {e}");
-                return 0;
-            }
-        };
-
-        match stmt.query_map(params![cursor.created_at, cursor.hash], |row| {
-            Ok(ArchiveMessage {
-                hash: row.get(0)?,
-                payload: row.get::<_, String>(1)?.into_bytes(),
-                created_at: row.get(2)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(Result::ok).collect(),
-            Err(e) => {
-                eprintln!("gossip: reconciliation: failed to query archive: {e}");
-                return 0;
-            }
-        }
-    };
+    let messages = read_rows_after_cursor(archive_path, progress);
 
     if messages.is_empty() {
         return 0;
@@ -2162,6 +2182,92 @@ mod tests {
         assert_eq!(counters.notifications_seen, 1);
         assert_eq!(counters.notifications_accepted, 1);
         assert_eq!(counters.urls_seen, 0);
+    }
+
+    /// ADR 0062 §8 (`stophammer` repository): the listener stores each
+    /// payload as a BLOB. The reconciliation read the payload as text, so
+    /// each row failed and was dropped with no log line, and the cursor never
+    /// moved. It must read a BLOB row and move the cursor past it.
+    #[tokio::test]
+    async fn reconciliation_reads_blob_payload_rows_and_moves_the_cursor() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let archive_path = tempdir.path().join("archive.db");
+        let archive_conn = Connection::open(&archive_path).expect("open archive");
+        archive_conn
+            .execute_batch(
+                "CREATE TABLE messages (
+                    hash TEXT PRIMARY KEY,
+                    payload BLOB,
+                    created_at INTEGER
+                )",
+            )
+            .expect("create messages table");
+        let payload = r#"{"version":"1.1","sender":"abc","iris":[],"timestamp":100}"#;
+        for (hash, created_at) in [("hash_a", 1000i64), ("hash_b", 1001i64)] {
+            archive_conn
+                .execute(
+                    "INSERT INTO messages (hash, payload, created_at) VALUES (?1, ?2, ?3)",
+                    params![hash, payload.as_bytes(), created_at],
+                )
+                .expect("insert message");
+        }
+        drop(archive_conn);
+
+        let progress_path = tempdir.path().join("gossip_state.db");
+        let progress = Arc::new(std::sync::Mutex::new(ProgressStore::open(
+            progress_path.to_str().expect("utf-8 path"),
+        )));
+        progress.lock().unwrap().set_archive_cursor(&ArchiveCursor {
+            created_at: 1000,
+            hash: "hash_a".to_string(),
+        });
+        let skip_db_path = tempdir.path().join("feed_skip.db");
+        let skip_db = Arc::new(std::sync::Mutex::new(crate::feed_skip::FeedSkipDb::open(
+            skip_db_path.to_str().expect("utf-8 path"),
+        )));
+        let cache_path = tempdir.path().join("feed_cache.db");
+        let cache: FeedCache = Arc::new(std::sync::Mutex::new(FeedCacheDb::open(
+            cache_path.to_str().expect("utf-8 path"),
+        )));
+        let dedup = Arc::new(Mutex::new(Dedup::new()));
+        let client = Arc::new(create_async_client());
+        let config = Arc::new(CrawlConfig::dry_run(
+            "stophammer-crawler/test",
+            Duration::from_secs(1),
+        ));
+        let sem = Arc::new(Semaphore::new(1));
+        let host_throttle = Arc::new(HostThrottle::new(Duration::from_millis(1500)));
+        let follow_sem = Arc::new(Semaphore::new(1));
+
+        let rows = reconcile_archive_batch(
+            archive_path.to_str().expect("utf-8 path"),
+            &dedup,
+            &client,
+            &config,
+            &sem,
+            &host_throttle,
+            &follow_sem,
+            &progress,
+            &skip_db,
+            &cache,
+            false,
+            None,
+            true,
+            None,
+        )
+        .await;
+
+        assert_eq!(rows, 1, "the BLOB row after the cursor must be read");
+        let cursor = progress
+            .lock()
+            .unwrap()
+            .get_archive_cursor()
+            .expect("a cursor");
+        assert_eq!(
+            (cursor.created_at, cursor.hash.as_str()),
+            (1001, "hash_b"),
+            "the cursor must move past the BLOB row"
+        );
     }
 
     #[test]
