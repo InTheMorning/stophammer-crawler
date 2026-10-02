@@ -870,8 +870,6 @@ enum FetchAction {
     IngestKept,
     /// A `304` the node has already seen and answered. No POST.
     SkipIngest,
-    /// A `304` with no kept body to trust. Fetch once more, unconditionally.
-    RefetchUnconditional,
     /// Any other status. As today: a retryable or a final fetch error.
     FetchError,
 }
@@ -886,8 +884,11 @@ fn plan_after_response(status: u16, cached: Option<&CachedFeed>, force: bool) ->
         return FetchAction::FetchError;
     }
 
+    // A `304` is an answer to a conditional request only. `cached` is the
+    // row whose validators this request sent. With no such row, the `304`
+    // is a server fault (ADR 0050 §3, amended on 2026-10-02).
     let Some(cached) = cached else {
-        return FetchAction::RefetchUnconditional;
+        return FetchAction::FetchError;
     };
 
     if force {
@@ -1049,93 +1050,6 @@ async fn ingest_fresh_and_cache(
     }
 
     report
-}
-
-/// Fetch a URL with no conditional header, after a `304` this crawl cannot
-/// trust (ADR 0050 §3, `stophammer` repository). Sends exactly one more
-/// GET, then continues as for `200`. Never loops.
-///
-/// Follows its own redirect chain (`stophammer` ADR 0052 §2), and gives its
-/// hops to the report, as any other feed fetch does.
-async fn refetch_unconditional(
-    client: &reqwest::Client,
-    url: &str,
-    fallback_guid: Option<&str>,
-    config: &CrawlConfig,
-    cache: Option<&FeedCache>,
-) -> CrawlReport {
-    let build_request = |hop_url: &str| build_hop_request(client, hop_url, config, None);
-
-    let (resp, redirects) =
-        match fetch_following_redirects(url, config.allow_private_targets, build_request).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                return build_crawl_report(
-                    CrawlOutcome::FetchError {
-                        reason: err.reason,
-                        retryable: err.retryable,
-                        retry_after_secs: None,
-                    },
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                );
-            }
-        };
-
-    let status = resp.status().as_u16();
-    let final_url = Some(resp.url().to_string());
-    let headers = resp.headers().clone();
-
-    let body = match read_capped_body(resp).await {
-        Ok(b) => b,
-        Err(e) => {
-            return build_crawl_report(
-                CrawlOutcome::FetchError {
-                    reason: e.reason(),
-                    retryable: e.retryable(),
-                    retry_after_secs: None,
-                },
-                Some(status),
-                None,
-                final_url,
-                None,
-                None,
-                redirects,
-            );
-        }
-    };
-
-    if status != 200 {
-        return build_crawl_report(
-            CrawlOutcome::FetchError {
-                reason: format_http_fetch_error(status, &headers, &body),
-                retryable: is_retryable_http_status(status),
-                retry_after_secs: parse_retry_after_secs(&headers),
-            },
-            Some(status),
-            None,
-            final_url,
-            None,
-            None,
-            redirects,
-        );
-    }
-
-    ingest_fresh_and_cache(
-        url,
-        final_url,
-        &headers,
-        &body,
-        fallback_guid,
-        config,
-        cache,
-        &redirects,
-    )
-    .await
 }
 
 /// Submit the kept body for a `304` that must still reach the node (ADR
@@ -1311,7 +1225,7 @@ pub async fn crawl_feed_report(
         }
     };
 
-    match plan_after_response(status, cached.as_ref(), config.force_reingest) {
+    match plan_after_response(status, conditional_row, config.force_reingest) {
         FetchAction::IngestFresh => {
             ingest_fresh_and_cache(
                 url,
@@ -1325,12 +1239,6 @@ pub async fn crawl_feed_report(
             )
             .await
         }
-        // A `304` to a request with no conditional header is a server
-        // fault. Report it as before ADR 0050. Only a conditional request
-        // earns the one unconditional refetch.
-        FetchAction::RefetchUnconditional if send_conditional => {
-            refetch_unconditional(client, url, fallback_guid, config, cache).await
-        }
         FetchAction::IngestKept => {
             let row = cached
                 .as_ref()
@@ -1343,7 +1251,7 @@ pub async fn crawl_feed_report(
                 .expect("plan_after_response gives SkipIngest only with a cached row");
             skip_ingest_with_kept_body(row, fallback_guid)
         }
-        FetchAction::FetchError | FetchAction::RefetchUnconditional => {
+        FetchAction::FetchError => {
             if config.report_gone && matches!(status, 404 | 410) && redirects.is_empty() {
                 post_gone_report(url, status, config).await;
             }
@@ -1686,15 +1594,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_after_response_304_with_no_kept_body_refetches_unconditionally() {
+    fn plan_after_response_304_to_an_unconditional_request_is_a_fetch_error() {
         assert_eq!(
             plan_after_response(304, None, false),
-            FetchAction::RefetchUnconditional
+            FetchAction::FetchError,
+            "ADR 0050 §3: a 304 with no conditional row is a server fault"
         );
         assert_eq!(
             plan_after_response(304, None, true),
-            FetchAction::RefetchUnconditional,
-            "a force pass with no kept body still cannot trust the 304"
+            FetchAction::FetchError,
+            "a force pass cannot trust a 304 to an unconditional request"
         );
     }
 
@@ -2516,10 +2425,33 @@ mod tests {
         );
     }
 
+    /// ADR 0050 §3: a `304` to a request with no conditional header is a
+    /// server fault. A `--no-revalidate` pass must not trust it against the
+    /// kept row.
+    #[tokio::test]
+    async fn stub_304_in_a_no_revalidate_pass_is_a_fetch_error() {
+        let (feed_addr, _feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, None);
+
+        let client = reqwest::Client::new();
+        let mut config = test_config(String::new());
+        config.revalidate = false;
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        assert!(
+            matches!(report.outcome, CrawlOutcome::FetchError { .. }),
+            "expected a fetch error, got {}",
+            report.outcome
+        );
+    }
+
     // ---- redirect hops (`stophammer` ADR 0052 §2) ----
 
-    /// Builds an ingest stub that accepts one POST, for a test that fetches
-    /// a redirect chain and does not check the ingest body.
     #[test]
     fn node_rate_limit_wait_doubles_and_obeys_retry_after() {
         assert_eq!(node_rate_limit_wait(None, 1), Duration::from_secs(1));
@@ -2604,6 +2536,8 @@ mod tests {
         );
     }
 
+    /// Builds an ingest stub that accepts one POST, for a test that fetches
+    /// a redirect chain and does not check the ingest body.
     async fn spawn_accepting_ingest_stub() -> (String, tokio::task::JoinHandle<StubRequest>) {
         spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
