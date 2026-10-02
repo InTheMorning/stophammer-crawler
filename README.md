@@ -449,9 +449,17 @@ proven irrelevant by a prior crawl are skipped on future notifications:
 - HTTP 200 with a non-music, non-publisher `raw_medium`, or
 - a `[medium_music]` rejection (including absent `podcast:medium`)
 
-Fetch errors (404, 429, timeouts), parse errors, and prior successful feeds are
+The shared skip database also skips a feed for 7 days after a parse error, or
+after a node `413` for a feed with no `podcast:medium` (`stophammer` ADR 0030).
+After 7 days, one fetch tries the feed again.
+
+Fetch errors (404, 429, timeouts), a node `429` and prior successful feeds are
 never skipped. `--skip-ttl-days <n>` expires skip decisions after N days so
 feeds are periodically re-evaluated.
+
+When the node answers `429` to an ingest POST, the crawler sends the same POST
+again, at most 6 times in all. It waits for the `Retry-After` of the node, or
+1, 2, 4, 8 and 16 seconds. So a fast pass slows down and does not drop a feed.
 
 #### Gossip options
 

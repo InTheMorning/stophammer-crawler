@@ -577,6 +577,53 @@ fn build_crawl_report(
     }
 }
 
+/// Attempts of one POST to the node while the node answers `429`.
+const NODE_RATE_LIMIT_ATTEMPTS: u32 = 6;
+
+/// The longest wait before a POST is sent again after a `429`.
+const NODE_RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
+
+/// Gives the wait before attempt `attempt + 1` after a `429` from the node.
+/// A `Retry-After` header sets it. With no header, the wait is 1, 2, 4, 8
+/// and 16 seconds.
+fn node_rate_limit_wait(retry_after_secs: Option<u64>, attempt: u32) -> Duration {
+    let secs = retry_after_secs.unwrap_or(1_u64 << attempt.saturating_sub(1).min(16));
+    Duration::from_secs(secs.min(NODE_RATE_LIMIT_MAX_WAIT_SECS))
+}
+
+/// POSTs `payload` to the ingest URL of the node. A `429` from the node
+/// sends the same POST again, at most [`NODE_RATE_LIMIT_ATTEMPTS`] times in
+/// all. The rate limit of the node is per address, and each crawler of a
+/// host shares one address, so a fast pass gets `429` and must wait. A
+/// `429` that was not sent again records the feed as an ingest error, and
+/// the feed is then missed until its next crawl. Gives the last answer.
+async fn send_to_node(
+    payload: &serde_json::Value,
+    config: &CrawlConfig,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 1;
+    loop {
+        let resp = config
+            .ingest_client
+            .post(&config.ingest_url)
+            .json(payload)
+            .timeout(config.ingest_timeout)
+            .send()
+            .await?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+            || attempt >= NODE_RATE_LIMIT_ATTEMPTS
+        {
+            return Ok(resp);
+        }
+        let wait = node_rate_limit_wait(parse_retry_after_secs(resp.headers()), attempt);
+        eprintln!(
+            "  ingest: the node answered 429, attempt {attempt}/{NODE_RATE_LIMIT_ATTEMPTS}, waiting {wait:?}"
+        );
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
 async fn post_ingest_payload(
     canonical_url: &str,
     source_url: &str,
@@ -599,14 +646,7 @@ async fn post_ingest_payload(
         payload["force_reingest"] = serde_json::json!(true);
     }
 
-    let ingest_resp = match config
-        .ingest_client
-        .post(&config.ingest_url)
-        .json(&payload)
-        .timeout(config.ingest_timeout)
-        .send()
-        .await
-    {
+    let ingest_resp = match send_to_node(&payload, config).await {
         Ok(r) => r,
         Err(e) => {
             return CrawlOutcome::IngestError {
@@ -697,14 +737,7 @@ fn build_gone_report_payload(url: &str, http_status: u16, crawl_token: &str) -> 
 async fn post_gone_report(url: &str, http_status: u16, config: &CrawlConfig) {
     let payload = build_gone_report_payload(url, http_status, &config.crawl_token);
 
-    let resp = match config
-        .ingest_client
-        .post(&config.ingest_url)
-        .json(&payload)
-        .timeout(config.ingest_timeout)
-        .send()
-        .await
-    {
+    let resp = match send_to_node(&payload, config).await {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("  gone_report: WARNING: post failed for {url} (http {http_status}): {e}");
@@ -1335,9 +1368,11 @@ pub async fn crawl_feed_report(
 mod tests {
     use super::{
         CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, MAX_FEED_BODY_BYTES,
-        RedirectHop, body_preview, build_crawl_report, crawl_feed_report, format_http_fetch_error,
-        format_ingest_http_error, is_retryable_http_status, is_retryable_ingest_status,
-        is_uncached_node_answer, normalize_rejection_reason, parse_feed_xml, plan_after_response,
+        NODE_RATE_LIMIT_ATTEMPTS, NODE_RATE_LIMIT_MAX_WAIT_SECS, RedirectHop, body_preview,
+        build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
+        is_retryable_http_status, is_retryable_ingest_status, is_uncached_node_answer,
+        node_rate_limit_wait, normalize_rejection_reason, parse_feed_xml, plan_after_response,
+        post_ingest_payload,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -2485,6 +2520,90 @@ mod tests {
 
     /// Builds an ingest stub that accepts one POST, for a test that fetches
     /// a redirect chain and does not check the ingest body.
+    #[test]
+    fn node_rate_limit_wait_doubles_and_obeys_retry_after() {
+        assert_eq!(node_rate_limit_wait(None, 1), Duration::from_secs(1));
+        assert_eq!(node_rate_limit_wait(None, 5), Duration::from_secs(16));
+        assert_eq!(node_rate_limit_wait(Some(3), 1), Duration::from_secs(3));
+        assert_eq!(
+            node_rate_limit_wait(Some(3_600), 1),
+            Duration::from_secs(NODE_RATE_LIMIT_MAX_WAIT_SECS),
+            "a long Retry-After is capped"
+        );
+    }
+
+    /// A `429` from the node sends the same POST again, so a rate limit
+    /// slows a pass and never drops a feed.
+    #[tokio::test]
+    async fn a_node_429_sends_the_ingest_again() {
+        let limited = stub_response(
+            "HTTP/1.1 429 Too Many Requests",
+            &[("retry-after", "0"), ("content-type", "application/json")],
+            br#"{"error":"rate limit exceeded"}"#,
+        );
+        let accepted = stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        );
+        let (ingest_addr, ingest_handle) =
+            spawn_multi_stub(vec![limited.clone(), limited, accepted]).await;
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let outcome = post_ingest_payload(
+            "https://example.com/feed.xml",
+            "https://example.com/feed.xml",
+            200,
+            "hash",
+            None,
+            &config,
+            &[],
+        )
+        .await;
+
+        let requests = ingest_handle.await.expect("ingest stub task");
+        assert_eq!(requests.len(), 3, "expected two 429 answers and one accept");
+        assert!(
+            matches!(outcome, CrawlOutcome::Accepted { .. }),
+            "expected the third POST to be accepted, got {outcome}"
+        );
+    }
+
+    /// After the last attempt, a `429` stays a retryable ingest error.
+    #[tokio::test]
+    async fn a_node_429_on_each_attempt_is_a_retryable_ingest_error() {
+        let limited = stub_response(
+            "HTTP/1.1 429 Too Many Requests",
+            &[("retry-after", "0"), ("content-type", "application/json")],
+            br#"{"error":"rate limit exceeded"}"#,
+        );
+        let responses = vec![limited; NODE_RATE_LIMIT_ATTEMPTS as usize];
+        let (ingest_addr, ingest_handle) = spawn_multi_stub(responses).await;
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let outcome = post_ingest_payload(
+            "https://example.com/feed.xml",
+            "https://example.com/feed.xml",
+            200,
+            "hash",
+            None,
+            &config,
+            &[],
+        )
+        .await;
+
+        let requests = ingest_handle.await.expect("ingest stub task");
+        assert_eq!(
+            requests.len(),
+            NODE_RATE_LIMIT_ATTEMPTS as usize,
+            "expected each attempt to reach the node"
+        );
+        assert!(
+            outcome.is_retryable(),
+            "expected a retryable ingest error, got {outcome}"
+        );
+    }
+
     async fn spawn_accepting_ingest_stub() -> (String, tokio::task::JoinHandle<StubRequest>) {
         spawn_stub(stub_response(
             "HTTP/1.1 200 OK",

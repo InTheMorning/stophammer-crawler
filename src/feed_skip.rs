@@ -22,6 +22,27 @@ pub struct FeedSkipDb {
 
 type SkipLookupRow = (Option<i64>, String, Option<String>, Option<String>, i64);
 
+/// Days that a failure which repeats stops the fetch of its URL (ADR 0030
+/// §A failure that repeats waits, `stophammer` repository). After this age,
+/// one fetch tries the URL again.
+pub const REPEATED_FAILURE_SKIP_DAYS: i64 = 7;
+
+/// Gives the skip reason when `outcome` and `reason` are a failure that the
+/// same body gives again at each fetch: a parse error, or a node `413` for a
+/// body with no `podcast:medium`. The caller has already checked that the
+/// fetch gave `200`.
+fn repeated_failure(outcome: &str, reason: Option<&str>, medium: Option<&str>) -> Option<String> {
+    match outcome {
+        "parse_error" => Some(format!("prior parse error: {}", reason.unwrap_or_default())),
+        "ingest_error"
+            if medium.is_none() && reason.is_some_and(|r| r.starts_with("ingest http 413")) =>
+        {
+            Some("prior node 413 for a feed with no medium".to_string())
+        }
+        _ => None,
+    }
+}
+
 impl FeedSkipDb {
     /// Open (or create) the shared skip database at `path`.
     /// Uses WAL journal mode and a 5-second busy timeout for safe concurrent
@@ -62,7 +83,9 @@ impl FeedSkipDb {
         Self { conn }
     }
 
-    /// Check if a feed URL is known to be irrelevant (non-music, non-publisher).
+    /// Check if a feed URL is known to be irrelevant (non-music, non-publisher),
+    /// or gave a failure that repeats less than
+    /// [`REPEATED_FAILURE_SKIP_DAYS`] ago.
     /// Returns `Some(reason)` if the feed should be skipped, `None` to proceed.
     /// When `ttl_days` is set, entries older than that are ignored (re-evaluated).
     pub fn should_skip(&self, feed_url: &str, ttl_days: Option<u64>) -> Option<String> {
@@ -108,6 +131,14 @@ impl FeedSkipDb {
             && r.starts_with("[medium_music]")
         {
             return Some(format!("prior medium-gate rejection: {r}"));
+        }
+
+        // A failure that repeats waits for REPEATED_FAILURE_SKIP_DAYS
+        if http_status == Some(200)
+            && unix_now().saturating_sub(last_seen_at) <= REPEATED_FAILURE_SKIP_DAYS * 86_400
+            && let Some(skip) = repeated_failure(&outcome, reason.as_deref(), medium.as_deref())
+        {
+            return Some(skip);
         }
 
         None
@@ -401,5 +432,95 @@ mod tests {
             db.record_outcome(&url, &report, "test");
             assert_eq!(db.should_skip(&url, None), None, "should not skip {medium}");
         }
+    }
+
+    fn backdate(db: &FeedSkipDb, url: &str, days: i64) {
+        db.conn
+            .execute(
+                "UPDATE feed_outcomes SET last_seen_at = ?1 WHERE feed_url = ?2",
+                params![unix_now() - days * 86_400, url],
+            )
+            .unwrap();
+    }
+
+    fn node_413() -> CrawlOutcome {
+        CrawlOutcome::IngestError {
+            reason: "ingest http 413 Payload Too Large: length limit exceeded".into(),
+            retryable: false,
+            retry_after_secs: None,
+        }
+    }
+
+    #[test]
+    fn parse_error_skips_for_seven_days() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/feed.xml";
+        let report = report_with(
+            CrawlOutcome::ParseError("undefined entity".into()),
+            Some(200),
+            None,
+            None,
+        );
+        db.record_outcome(url, &report, "gossip");
+
+        let reason = db.should_skip(url, None).expect("a new parse error skips");
+        assert!(reason.contains("prior parse error"), "reason was {reason}");
+
+        backdate(&db, url, 6);
+        assert!(db.should_skip(url, None).is_some(), "6 days still skips");
+
+        backdate(&db, url, 8);
+        assert_eq!(db.should_skip(url, None), None, "8 days fetches again");
+    }
+
+    #[test]
+    fn node_413_with_no_medium_skips_for_seven_days() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/big.xml";
+        db.record_outcome(
+            url,
+            &report_with(node_413(), Some(200), None, None),
+            "gossip",
+        );
+
+        let reason = db.should_skip(url, None).expect("a new 413 skips");
+        assert!(reason.contains("413"), "reason was {reason}");
+
+        backdate(&db, url, 8);
+        assert_eq!(db.should_skip(url, None), None, "8 days fetches again");
+    }
+
+    #[test]
+    fn node_413_with_a_medium_does_not_skip() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/big-music.xml";
+        db.record_outcome(
+            url,
+            &report_with(node_413(), Some(200), Some("music"), None),
+            "gossip",
+        );
+        assert_eq!(
+            db.should_skip(url, None),
+            None,
+            "a music feed is never skipped"
+        );
+    }
+
+    #[test]
+    fn other_ingest_errors_do_not_skip() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/feed.xml";
+        let report = report_with(
+            CrawlOutcome::IngestError {
+                reason: "ingest http 429 Too Many Requests".into(),
+                retryable: true,
+                retry_after_secs: None,
+            },
+            Some(200),
+            None,
+            None,
+        );
+        db.record_outcome(url, &report, "import");
+        assert_eq!(db.should_skip(url, None), None, "a 429 is never skipped");
     }
 }
