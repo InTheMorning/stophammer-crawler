@@ -1,6 +1,6 @@
 [package]
 name = "stophammer-crawler"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Unified RSS feed crawler with crawl, import, ndjson, and gossip modes"
