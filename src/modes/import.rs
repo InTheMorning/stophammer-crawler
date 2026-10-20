@@ -23,7 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
 use crate::feed_cache::FeedCacheDb;
-use crate::feed_skip::is_unparsed_channel_without_medium;
+use crate::feed_skip::{is_index_medium, is_unparsed_channel_without_medium};
 use crate::modes::batch::build_feed_fetch_client;
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
@@ -784,10 +784,10 @@ fn audit_dedupe_key(row: &ImportAuditRow) -> Option<ImportAuditDedupeKey> {
     })
 }
 
+// `stophammer` ADR 0060 §5: the audit keeps the medium set of the node
+// medium gate.
 fn is_audit_accepted_medium(raw_medium: &str) -> bool {
-    raw_medium.eq_ignore_ascii_case("music")
-        || raw_medium.eq_ignore_ascii_case("publisher")
-        || raw_medium.eq_ignore_ascii_case("musicL")
+    is_index_medium(raw_medium)
 }
 
 fn should_record_audit_row(report: &CrawlReport) -> bool {
@@ -1319,8 +1319,10 @@ fn load_known_import_memory(
     rows.filter_map(Result::ok).collect()
 }
 
+// `stophammer` ADR 0060 §5: a medium outside the node medium gate is a
+// known non-music medium.
 fn is_skip_known_non_music(raw_medium: &str) -> bool {
-    !raw_medium.eq_ignore_ascii_case("music") && !raw_medium.eq_ignore_ascii_case("publisher")
+    !is_index_medium(raw_medium)
 }
 
 fn is_known_medium_gate_rejection(known: &KnownImportMemory) -> bool {
@@ -2467,6 +2469,22 @@ mod tests {
     }
 
     #[test]
+    fn known_skip_kind_does_not_skip_musicl() {
+        // `stophammer` ADR 0060 §5: `musicL` is a medium of the index.
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let known_musicl =
+            sample_memory_row(30, Some(200), "accepted", None, false, Some("musicL"));
+
+        upsert_import_memory(&conn, &known_musicl).expect("upsert musicL row");
+
+        let lookup = load_known_import_memory(&conn, &[30]);
+
+        assert!(known_skip_kind(lookup.get(&30), true, false).is_none());
+    }
+
+    #[test]
     fn medium_gate_rejections_with_absent_medium_are_skipped() {
         let tempdir = tempdir().expect("tempdir");
         let state_path = tempdir.path().join("import_state.db");
@@ -2517,6 +2535,13 @@ mod tests {
         assert!(!is_skip_known_non_music("music"));
         assert!(!is_skip_known_non_music("publisher"));
         assert!(is_skip_known_non_music("podcast"));
+    }
+
+    #[test]
+    fn skip_helper_treats_musicl_as_accepted() {
+        // `stophammer` ADR 0060 §5: `musicL` is a medium of the index.
+        assert!(!is_skip_known_non_music("musicL"));
+        assert!(!is_skip_known_non_music("musicl"));
     }
 
     #[tokio::test]

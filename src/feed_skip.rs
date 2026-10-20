@@ -48,6 +48,16 @@ fn repeated_failure(outcome: &str, reason: Option<&str>, medium: Option<&str>) -
 pub(crate) const UNPARSED_NO_MEDIUM_SKIP_REASON: &str =
     "no podcast:medium in a body that does not parse";
 
+/// Gives `true` for a medium of the index: `music`, `publisher` or `musicL`,
+/// with no regard to letter case. This is the set of the node medium gate
+/// (`stophammer` ADR 0060 §5), so a skip store must not treat a `musicL`
+/// feed as a known non-music medium.
+pub(crate) fn is_index_medium(raw_medium: &str) -> bool {
+    raw_medium.eq_ignore_ascii_case("music")
+        || raw_medium.eq_ignore_ascii_case("publisher")
+        || raw_medium.eq_ignore_ascii_case("musicL")
+}
+
 /// Gives `true` when a recorded outcome is a parse error for a channel with
 /// no `<title>` or no `podcast:guid`, and with no `podcast:medium`
 /// (`stophammer` ADR 0074 §3b). The medium gate of the node refuses a feed
@@ -139,11 +149,10 @@ impl FeedSkipDb {
             }
         }
 
-        // HTTP 200 with a known non-music, non-publisher medium
+        // HTTP 200 with a medium outside the index (`stophammer` ADR 0060 §5)
         if http_status == Some(200)
             && let Some(ref m) = medium
-            && !m.eq_ignore_ascii_case("music")
-            && !m.eq_ignore_ascii_case("publisher")
+            && !is_index_medium(m)
         {
             return Some(format!("known non-music medium: {m}"));
         }
@@ -370,6 +379,20 @@ mod tests {
     }
 
     #[test]
+    fn does_not_skip_musicl() {
+        // `stophammer` ADR 0060 §5: `musicL` is a medium of the index.
+        let db = FeedSkipDb::open(&temp_db());
+        let report = report_with(
+            CrawlOutcome::Accepted { warnings: vec![] },
+            Some(200),
+            Some("musicL"),
+            Some("guid-1"),
+        );
+        db.record_outcome("https://example.com/feed.xml", &report, "test");
+        assert_eq!(db.should_skip("https://example.com/feed.xml", None), None);
+    }
+
+    #[test]
     fn does_not_record_fetch_errors() {
         let db = FeedSkipDb::open(&temp_db());
         let report = report_with(
@@ -448,6 +471,20 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         assert_eq!(mode, "import"); // last writer wins
+    }
+
+    #[test]
+    fn is_index_medium_gives_the_node_medium_gate() {
+        // `stophammer` ADR 0060 §5.
+        for medium in ["music", "MUSIC", "publisher", "musicL", "musicl"] {
+            assert!(is_index_medium(medium), "{medium} is a medium of the index");
+        }
+        for medium in ["podcast", "video", ""] {
+            assert!(
+                !is_index_medium(medium),
+                "{medium} is not a medium of the index"
+            );
+        }
     }
 
     #[test]
@@ -631,6 +668,32 @@ mod tests {
             db.should_skip(url, None),
             None,
             "a music feed that adds its GUID is fetched again after 7 days"
+        );
+    }
+
+    /// ADR 0074 §3b, the `musicL` case (ADR 0060 §5): no GUID, medium
+    /// `musicL`. `musicL` is a medium of the index, so the parse error keeps
+    /// the 7-day rule, not the no-time-limit rule of a body with no medium.
+    #[test]
+    fn feed_skip_no_guid_with_musicl_medium_keeps_the_seven_day_rule() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/musicl.xml";
+        db.record_outcome(
+            url,
+            &unparsed_report("missing podcast:guid", Some("musicL")),
+            "test",
+        );
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some("prior parse error: missing podcast:guid"),
+            "a musicL body with no GUID skips as a parse error, seen now"
+        );
+
+        backdate(&db, url, 8);
+        assert_eq!(
+            db.should_skip(url, None),
+            None,
+            "a musicL feed that adds its GUID is fetched again after 7 days"
         );
     }
 

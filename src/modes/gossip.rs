@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
 use crate::dedup::Dedup;
 use crate::feed_cache::FeedCacheDb;
+use crate::feed_skip::is_index_medium;
 use crate::follow::FollowLevel;
 use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
@@ -334,11 +335,11 @@ impl ProgressStore {
             }
         }
 
-        // Skip if HTTP 200 and medium is not music/publisher
+        // Skip if HTTP 200 and the medium is outside the index
+        // (`stophammer` ADR 0060 §5).
         if http_status == Some(200)
             && let Some(ref m) = medium
-            && m != "music"
-            && m != "publisher"
+            && !is_index_medium(m)
         {
             return Some(format!("known non-music medium: {m}"));
         }
@@ -3083,6 +3084,39 @@ mod tests {
         assert!(
             store
                 .should_skip_feed("https://example.com/pub.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_skip_musicl_feed() {
+        // `stophammer` ADR 0060 §5: `musicL` is a medium of the index.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("musicL"), Some("guid-3"));
+        store.upsert_feed_memory("https://example.com/list.xml", &report, 100);
+
+        assert!(
+            store
+                .should_skip_feed("https://example.com/list.xml", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_not_skip_music_feed_with_any_letter_case() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report("accepted", None, Some(200), Some("MUSIC"), Some("guid-4"));
+        store.upsert_feed_memory("https://example.com/upper.xml", &report, 100);
+
+        assert!(
+            store
+                .should_skip_feed("https://example.com/upper.xml", None)
                 .is_none()
         );
     }
