@@ -6,12 +6,13 @@ Fetches RSS feeds, hashes content, parses with the `stophammer-parser` Rust
 library dependency, and submits results to a stophammer node's
 `/ingest/feed` endpoint.
 
-Four subcommands cover every discovery path:
+Five subcommands cover every discovery path:
 
 - **feed** — one-shot URL list (file, args, env, or stdin)
 - **import** — batch scan a PodcastIndex SQLite snapshot with resume cursor
 - **ndjson** — replay cached feed NDJSON into stophammer without re-fetching
 - **gossip** — long-running gossip-listener SSE consumer with optional archive replay
+- **refresh** — corrective pass over the feeds that the node already holds (stophammer ADR 0047)
 
 ## Requirements
 
@@ -502,8 +503,8 @@ stophammer-crawler --force ndjson --input /data/repair.ndjson \
     --state /data/repair_state.db --reset
 ```
 
-The script opens both databases read-only. stophammer
-`docs/tasks/adr-0051-task-006-replay-fetch-cache.md` gives the procedure.
+The script opens both databases read-only. stophammer ADR 0051 owns the
+rule that the replay applies.
 
 Two options export a different set of rows. Each needs `--force` in the
 replay:
