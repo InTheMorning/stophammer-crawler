@@ -178,7 +178,7 @@ async fn crawl_feed_with_retries(
 
     loop {
         let lease = host_throttle.acquire(url).await;
-        let report = crawl_feed_report(client, url, None, config, cache).await;
+        let report = crawl_feed_report(client, url, config, cache).await;
         let delay = report
             .outcome
             .retry_delay(attempt)
@@ -1407,7 +1407,9 @@ mod tests {
     /// proves the cache reaches the step `run_urls` builds.
     #[tokio::test]
     async fn crawl_feed_with_retries_passes_the_cache_through_to_crawl_feed_report() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        // `stophammer` ADR 0074 §3a: a body with no `podcast:guid` sends no
+        // ingest, so this body states a GUID.
+        let body = br#"<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Feed</title><podcast:guid>fresh-feed-guid</podcast:guid></channel></rss>"#;
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],

@@ -23,6 +23,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
 use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
 use crate::feed_cache::FeedCacheDb;
+use crate::feed_skip::is_unparsed_channel_without_medium;
 use crate::modes::batch::build_feed_fetch_client;
 use crate::pool::run_pool;
 use crate::url_queue::{host_key, interleave_by_host};
@@ -959,6 +960,33 @@ fn build_import_timeout_report(timeout_secs: u64) -> CrawlReport {
     }
 }
 
+/// Crawl one snapshot row, with the hard deadline of an import task.
+///
+/// `stophammer` ADR 0074 §3: the `PodcastIndex` GUID of the row selects and
+/// records the row only. The crawl does not send it as feed data, so a body
+/// with no `podcast:guid` is a parse error and sends no ingest.
+async fn crawl_candidate(
+    client: &reqwest::Client,
+    row: &CandidateRow,
+    config: &CrawlConfig,
+    cache: Option<&FeedCache>,
+) -> CrawlReport {
+    if let Ok(report) = tokio::time::timeout(
+        Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
+        crawl_feed_report(client, &row.url, config, cache),
+    )
+    .await
+    {
+        report
+    } else {
+        eprintln!(
+            "  import: ERROR hard timeout after {}s for id={} {}",
+            IMPORT_TASK_HARD_TIMEOUT_SECS, row.id, row.url,
+        );
+        build_import_timeout_report(IMPORT_TASK_HARD_TIMEOUT_SECS)
+    }
+}
+
 async fn run_import_batch_heartbeat(
     batch_start_cursor: i64,
     batch_max_id: i64,
@@ -1305,6 +1333,17 @@ fn is_known_medium_gate_rejection(known: &KnownImportMemory) -> bool {
         .is_some_and(|reason| reason.starts_with("[medium_music]"))
 }
 
+/// `stophammer` ADR 0074 §3b: a memory row of a channel with no `<title>` or
+/// no `podcast:guid`, and with no `podcast:medium`. The shared skip list
+/// uses the same rule.
+fn is_known_unparsed_channel_without_medium(known: &KnownImportMemory) -> bool {
+    is_unparsed_channel_without_medium(
+        &known.fetch_outcome,
+        known.outcome_reason.as_deref(),
+        known.raw_medium.as_deref(),
+    )
+}
+
 fn is_known_successful_ingest(known: &KnownImportMemory) -> bool {
     known.fetch_http_status == Some(200)
         && matches!(
@@ -1329,7 +1368,8 @@ fn known_skip_kind(
                 .raw_medium
                 .as_deref()
                 .is_some_and(is_skip_known_non_music)
-                || is_known_medium_gate_rejection(memory))
+                || is_known_medium_gate_rejection(memory)
+                || is_known_unparsed_channel_without_medium(memory))
         {
             return Some(KnownSkipKind::Irrelevant);
         }
@@ -1913,21 +1953,7 @@ pub async fn run(
                         if let Some(throttle) = &wavlake_throttle {
                             throttle.wait_for_turn(&row).await;
                         }
-                        let fallback = row.podcast_guid.as_deref();
-                        let report = if let Ok(report) = tokio::time::timeout(
-                            Duration::from_secs(IMPORT_TASK_HARD_TIMEOUT_SECS),
-                            crawl_feed_report(&client, &row.url, fallback, &config, cache.as_ref()),
-                        )
-                        .await
-                        {
-                            report
-                        } else {
-                            eprintln!(
-                                "  import: ERROR hard timeout after {}s for id={} {}",
-                                IMPORT_TASK_HARD_TIMEOUT_SECS, row.id, row.url,
-                            );
-                            build_import_timeout_report(IMPORT_TASK_HARD_TIMEOUT_SECS)
-                        };
+                        let report = crawl_candidate(&client, &row, &config, cache.as_ref()).await;
                         if let Some(throttle) = &wavlake_throttle {
                             throttle.record_attempt(&row, &report).await;
                         }
@@ -2013,13 +2039,13 @@ mod tests {
         CandidateRow, ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter,
         ImportMemoryRow, ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity,
         ProgressStore, SNAPSHOT_FREE_SPACE_MARGIN_BYTES, SnapshotRefreshOutcome, WAVLAKE_HOSTS,
-        batch_max_id, build_import_audit_row, build_import_timeout_report, current_lock_identity,
-        download_snapshot_archive, effective_audit_append, enqueue_import_audit,
-        enqueue_import_memory, extract_snapshot_archive, format_if_modified_since_value,
-        is_skip_known_non_music, known_skip_kind, legacy_lock_matches_process,
-        load_known_import_memory, open_state_connection, query_batch, read_lock_identity,
-        resolve_start_cursor, snapshot_refresh_required_bytes, snapshot_space_shortfall,
-        upsert_import_memory, wavlake_throttle_delay,
+        batch_max_id, build_import_audit_row, build_import_timeout_report, crawl_candidate,
+        current_lock_identity, download_snapshot_archive, effective_audit_append,
+        enqueue_import_audit, enqueue_import_memory, extract_snapshot_archive,
+        format_if_modified_since_value, is_skip_known_non_music, known_skip_kind,
+        legacy_lock_matches_process, load_known_import_memory, open_state_connection, query_batch,
+        read_lock_identity, resolve_start_cursor, snapshot_refresh_required_bytes,
+        snapshot_space_shortfall, upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
@@ -3062,6 +3088,139 @@ mod tests {
             wavlake_throttle_delay(&report, 2),
             Duration::from_millis(super::WAVLAKE_IMPORT_MIN_DELAY_MS)
                 .saturating_add(Duration::from_secs(2))
+        );
+    }
+    /// The report of a body that does not parse (`stophammer` ADR 0074
+    /// §3a): a parse error after a `200`, with the `raw_medium` of the
+    /// failure.
+    fn unparsed_report(reason: &str, medium: Option<&str>) -> CrawlReport {
+        CrawlReport {
+            outcome: CrawlOutcome::ParseError(reason.to_string()),
+            fetch_http_status: Some(200),
+            raw_medium: medium.map(ToOwned::to_owned),
+            parsed_feed_guid: None,
+            final_url: None,
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+            redirects: Vec::new(),
+            wasted_200: false,
+        }
+    }
+
+    /// Records `report` for snapshot row `id` at `attempted_at`, then gives
+    /// the skip kind of the memory row with `skip_known_non_music` set.
+    fn known_skip_after(id: i64, report: &CrawlReport, attempted_at: i64) -> Option<KnownSkipKind> {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let candidate = candidate_row(id, &format!("https://example.com/{id}.xml"));
+        let row = ImportMemoryRow::from_crawl_report(&candidate, report, attempted_at, 10);
+        upsert_import_memory(&conn, &row).expect("upsert memory row");
+        let lookup = load_known_import_memory(&conn, &[id]);
+        known_skip_kind(lookup.get(&id), true, false)
+    }
+
+    fn unix_now() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+        )
+        .expect("time fits i64")
+    }
+
+    /// ADR 0074 §3b in the import memory: the five rows of the table.
+    #[test]
+    fn known_skip_follows_the_adr_0074_table() {
+        let now = unix_now();
+        let eight_days_ago = now - 8 * 86_400;
+
+        assert_eq!(
+            known_skip_after(
+                70,
+                &unparsed_report("missing podcast:guid", Some("podcast")),
+                now
+            ),
+            Some(KnownSkipKind::Irrelevant),
+            "no GUID, medium podcast"
+        );
+        assert_eq!(
+            known_skip_after(71, &unparsed_report("missing podcast:guid", None), now),
+            Some(KnownSkipKind::Irrelevant),
+            "no GUID, no medium"
+        );
+        assert_eq!(
+            known_skip_after(72, &unparsed_report("missing <title> element", None), now),
+            Some(KnownSkipKind::Irrelevant),
+            "no title, no medium"
+        );
+        assert_eq!(
+            known_skip_after(
+                73,
+                &unparsed_report("missing podcast:guid", Some("music")),
+                now
+            ),
+            None,
+            "no GUID, medium music, seen now"
+        );
+        assert_eq!(
+            known_skip_after(
+                74,
+                &unparsed_report("missing podcast:guid", Some("music")),
+                eight_days_ago
+            ),
+            None,
+            "no GUID, medium music, seen 8 days ago"
+        );
+    }
+
+    /// ADR 0074 §3b: the skip of a known accepted feed does not change.
+    #[test]
+    fn known_skip_of_an_accepted_row_is_still_success() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_path = tempdir.path().join("import_state.db");
+        let conn = open_state_connection(state_path.to_str().expect("utf-8 path"));
+        let accepted = sample_memory_row(75, Some(200), "accepted", None, false, Some("music"));
+        upsert_import_memory(&conn, &accepted).expect("upsert accepted row");
+        let lookup = load_known_import_memory(&conn, &[75]);
+        assert_eq!(
+            known_skip_kind(lookup.get(&75), false, true),
+            Some(KnownSkipKind::Success)
+        );
+    }
+
+    /// ADR 0074 §3: the `PodcastIndex` GUID of a snapshot row is not feed
+    /// data. A body with no `podcast:guid` sends no ingest.
+    #[tokio::test]
+    async fn an_import_row_with_a_podcastindex_guid_and_no_body_guid_sends_no_ingest() {
+        use crate::crawl::tests::{
+            spawn_counting_ingest_stub, spawn_stub, stub_response, test_config,
+        };
+
+        let body = br#"<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Feed</title><podcast:medium>music</podcast:medium></channel></rss>"#;
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let (ingest_addr, ingest_count, ingest_handle) = spawn_counting_ingest_stub().await;
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let row = candidate_row(76, &format!("http://{feed_addr}/feed.xml"));
+        assert!(row.podcast_guid.is_some(), "the row must carry a GUID");
+
+        let report = crawl_candidate(&reqwest::Client::new(), &row, &config, None).await;
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        assert!(
+            matches!(report.outcome, CrawlOutcome::ParseError(_)),
+            "expected a parse error, got {}",
+            report.outcome
+        );
+        assert_eq!(report.parsed_feed_guid, None);
+        assert_eq!(
+            ingest_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the import must not send the PodcastIndex GUID as feed data"
         );
     }
 }

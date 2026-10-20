@@ -539,8 +539,7 @@ async fn process_notification_urls(
                 let (changed, follow) = {
                     let permit = sem.acquire().await.expect("semaphore closed");
                     let start = Instant::now();
-                    let report =
-                        crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
+                    let report = crawl_feed_report(&client, &url, &config, Some(&cache)).await;
                     drop(permit);
                     let duration_ms =
                         i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -820,7 +819,7 @@ async fn run_follow_fetch(
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
+    let report = crawl_feed_report(&client, &url, &config, Some(&cache)).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -883,7 +882,7 @@ async fn run_leaf_follow_fetch(
     let _permit = follow_sem.acquire().await.expect("semaphore closed");
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
-    let report = crawl_feed_report(&client, &url, None, &config, Some(&cache)).await;
+    let report = crawl_feed_report(&client, &url, &config, Some(&cache)).await;
     host_throttle.release(&lease, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 

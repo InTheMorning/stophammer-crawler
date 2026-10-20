@@ -43,6 +43,29 @@ fn repeated_failure(outcome: &str, reason: Option<&str>, medium: Option<&str>) -
     }
 }
 
+/// The skip reason of a body with a channel and no `podcast:medium` that
+/// does not parse (`stophammer` ADR 0074 §3b).
+pub(crate) const UNPARSED_NO_MEDIUM_SKIP_REASON: &str =
+    "no podcast:medium in a body that does not parse";
+
+/// Gives `true` when a recorded outcome is a parse error for a channel with
+/// no `<title>` or no `podcast:guid`, and with no `podcast:medium`
+/// (`stophammer` ADR 0074 §3b). The medium gate of the node refuses a feed
+/// with no medium, so the crawler skips such a body with no time limit. The
+/// shared skip list and the import memory both use this rule. The caller
+/// checks that the fetch gave `200`.
+pub(crate) fn is_unparsed_channel_without_medium(
+    outcome: &str,
+    reason: Option<&str>,
+    raw_medium: Option<&str>,
+) -> bool {
+    outcome == "parse_error"
+        && raw_medium.is_none()
+        && reason.is_some_and(|r| {
+            r.starts_with("missing podcast:guid") || r.starts_with("missing <title> element")
+        })
+}
+
 impl FeedSkipDb {
     /// Open (or create) the shared skip database at `path`.
     /// Uses WAL journal mode and a 5-second busy timeout for safe concurrent
@@ -131,6 +154,14 @@ impl FeedSkipDb {
             && r.starts_with("[medium_music]")
         {
             return Some(format!("prior medium-gate rejection: {r}"));
+        }
+
+        // ADR 0074 §3b: a channel with no title or no GUID, and with no
+        // medium, skips with no time limit.
+        if http_status == Some(200)
+            && is_unparsed_channel_without_medium(&outcome, reason.as_deref(), medium.as_deref())
+        {
+            return Some(UNPARSED_NO_MEDIUM_SKIP_REASON.to_string());
         }
 
         // A failure that repeats waits for REPEATED_FAILURE_SKIP_DAYS
@@ -505,6 +536,141 @@ mod tests {
             None,
             "a music feed is never skipped"
         );
+    }
+
+    /// The report of a body that does not parse (ADR 0074 §3a): a parse
+    /// error after a `200`, with the `raw_medium` of the failure.
+    fn unparsed_report(reason: &str, medium: Option<&str>) -> CrawlReport {
+        report_with(
+            CrawlOutcome::ParseError(reason.into()),
+            Some(200),
+            medium,
+            None,
+        )
+    }
+
+    /// ADR 0074 §3b, row 1: no GUID, medium `podcast`.
+    #[test]
+    fn feed_skip_no_guid_with_podcast_medium_skips_as_non_music() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/podcast.xml";
+        db.record_outcome(
+            url,
+            &unparsed_report("missing podcast:guid", Some("podcast")),
+            "test",
+        );
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some("known non-music medium: podcast"),
+            "a podcast body with no GUID must skip as a non-music medium"
+        );
+    }
+
+    /// ADR 0074 §3b, row 2: no GUID, no medium.
+    #[test]
+    fn feed_skip_no_guid_with_no_medium_skips_with_no_time_limit() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/no-medium.xml";
+        db.record_outcome(url, &unparsed_report("missing podcast:guid", None), "test");
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some(UNPARSED_NO_MEDIUM_SKIP_REASON),
+        );
+        backdate(&db, url, 30);
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some(UNPARSED_NO_MEDIUM_SKIP_REASON),
+            "the skip of a body with no medium has no time limit"
+        );
+    }
+
+    /// ADR 0074 §3b, row 3: no title, no medium.
+    #[test]
+    fn feed_skip_no_title_with_no_medium_skips_with_no_time_limit() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/no-title.xml";
+        db.record_outcome(
+            url,
+            &unparsed_report("missing <title> element", None),
+            "test",
+        );
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some(UNPARSED_NO_MEDIUM_SKIP_REASON),
+        );
+    }
+
+    /// ADR 0074 §3b, row 4: no GUID, medium `music`, seen now.
+    #[test]
+    fn feed_skip_no_guid_with_music_medium_seen_now_skips_as_a_parse_error() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/music.xml";
+        db.record_outcome(
+            url,
+            &unparsed_report("missing podcast:guid", Some("music")),
+            "test",
+        );
+        assert_eq!(
+            db.should_skip(url, None).as_deref(),
+            Some("prior parse error: missing podcast:guid"),
+        );
+    }
+
+    /// ADR 0074 §3b, row 5: no GUID, medium `music`, seen 8 days ago.
+    #[test]
+    fn feed_skip_no_guid_with_music_medium_seen_8_days_ago_does_not_skip() {
+        let db = FeedSkipDb::open(&temp_db());
+        let url = "https://example.com/music.xml";
+        db.record_outcome(
+            url,
+            &unparsed_report("missing podcast:guid", Some("music")),
+            "test",
+        );
+        backdate(&db, url, 8);
+        assert_eq!(
+            db.should_skip(url, None),
+            None,
+            "a music feed that adds its GUID is fetched again after 7 days"
+        );
+    }
+
+    #[test]
+    fn unparsed_channel_rule_needs_a_parse_error_with_no_medium() {
+        assert!(is_unparsed_channel_without_medium(
+            "parse_error",
+            Some("missing podcast:guid"),
+            None
+        ));
+        assert!(is_unparsed_channel_without_medium(
+            "parse_error",
+            Some("missing <title> element"),
+            None
+        ));
+        assert!(
+            !is_unparsed_channel_without_medium(
+                "parse_error",
+                Some("missing podcast:guid"),
+                Some("music")
+            ),
+            "a body with a medium is not this rule"
+        );
+        assert!(
+            !is_unparsed_channel_without_medium("parse_error", Some("malformed XML: x"), None),
+            "malformed XML keeps the 7-day rule"
+        );
+        assert!(
+            !is_unparsed_channel_without_medium(
+                "parse_error",
+                Some("missing <channel> element"),
+                None
+            ),
+            "a body with no channel keeps the 7-day rule"
+        );
+        assert!(!is_unparsed_channel_without_medium(
+            "rejected",
+            Some("missing podcast:guid"),
+            None
+        ));
     }
 
     #[test]

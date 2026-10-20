@@ -150,17 +150,12 @@ fn read_batch(path: &str, start_row: usize, batch_size: usize) -> Vec<Candidate>
     batch
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "cached ingest replay carries source row details plus retry bookkeeping together"
-)]
 async fn ingest_with_retries(
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
     raw_xml: &str,
     content_hash: Option<&str>,
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     row_num: usize,
 ) -> CrawlOutcome {
@@ -175,7 +170,6 @@ async fn ingest_with_retries(
             http_status,
             raw_xml,
             content_hash,
-            fallback_guid,
             config,
             &[],
         )
@@ -195,6 +189,26 @@ async fn ingest_with_retries(
 
         return outcome;
     }
+}
+
+/// Replay the cached body of one export row to the node.
+///
+/// `stophammer` ADR 0074 §3: the `feed_guid` of the export row is not feed
+/// data. A body with no `podcast:guid` is a parse error and sends no ingest.
+async fn replay_candidate(row: &Candidate, raw_xml: &str, config: &CrawlConfig) -> CrawlOutcome {
+    let source_url = row.source_db.feed_url.as_str();
+    let canonical_url = row.fetch.final_url.as_deref().unwrap_or(source_url);
+    let http_status = row.fetch.http_status.unwrap_or(200);
+    ingest_with_retries(
+        source_url,
+        canonical_url,
+        http_status,
+        raw_xml,
+        row.fetch.content_sha256.as_deref(),
+        config,
+        row.row_num,
+    )
+    .await
 }
 
 #[expect(
@@ -308,21 +322,7 @@ pub async fn run(
                             return;
                         };
 
-                        let source_url = row.source_db.feed_url.as_str();
-                        let canonical_url = row.fetch.final_url.as_deref().unwrap_or(source_url);
-                        let http_status = row.fetch.http_status.unwrap_or(200);
-                        let fallback_guid = Some(row.source_db.feed_guid.as_str());
-                        let outcome = ingest_with_retries(
-                            source_url,
-                            canonical_url,
-                            http_status,
-                            raw_xml,
-                            row.fetch.content_sha256.as_deref(),
-                            fallback_guid,
-                            &config,
-                            row.row_num,
-                        )
-                        .await;
+                        let outcome = replay_candidate(&row, raw_xml, &config).await;
 
                         match &outcome {
                             CrawlOutcome::Accepted { .. } => {
@@ -522,5 +522,43 @@ mod tests {
 
         store.reset();
         assert_eq!(store.get_last_row(), 0, "reset returns to 0");
+    }
+    /// `stophammer` ADR 0074 §3: the `feed_guid` of an export row is not
+    /// feed data. A body with no `podcast:guid` sends no ingest.
+    #[tokio::test]
+    async fn an_export_row_with_a_feed_guid_and_no_body_guid_sends_no_ingest() {
+        use crate::crawl::tests::{spawn_counting_ingest_stub, test_config};
+
+        let (ingest_addr, ingest_count, ingest_handle) = spawn_counting_ingest_stub().await;
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let raw_xml = r#"<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Test</title><podcast:medium>music</podcast:medium></channel></rss>"#;
+        let row = Candidate {
+            row_num: 1,
+            source_db: SourceDb {
+                feed_guid: "export-feed-guid".to_string(),
+                feed_url: "https://example.com/feed.xml".to_string(),
+                title: "Test".to_string(),
+            },
+            fetch: Fetch {
+                final_url: None,
+                http_status: Some(200),
+                content_sha256: None,
+                error: None,
+            },
+            raw_xml: Some(raw_xml.to_string()),
+        };
+
+        let outcome = replay_candidate(&row, raw_xml, &config).await;
+        ingest_handle.abort();
+
+        assert!(
+            matches!(outcome, CrawlOutcome::ParseError(_)),
+            "expected a parse error, got {outcome}"
+        );
+        assert_eq!(
+            ingest_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the replay must not send the export GUID as feed data"
+        );
     }
 }

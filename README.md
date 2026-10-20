@@ -553,7 +553,7 @@ stophammer-crawler
     feed_skip.rs      Shared skip-memory database for proven irrelevant feeds
     modes/
       batch.rs        Load URLs from file/env/stdin, run pool
-      import.rs       PodcastIndex DB batches, resume cursor, fallback GUID
+      import.rs       PodcastIndex DB batches, resume cursor, import memory
       ndjson.rs       Replay cached feed NDJSON without re-fetching
       gossip.rs       SSE listener and optional archive replay for gossip-listener
 ```
@@ -563,8 +563,10 @@ subprocess spawning. Every mode feeds URLs into the same `crawl_feed()` function
 
 1. **Fetch** the RSS feed via `reqwest`
 2. **Hash** the raw response body with SHA-256
-3. **Parse** the XML with `stophammer-parser::profile::stophammer()` (or
-   `stophammer_with_fallback()` for import mode with PodcastIndex GUIDs)
+3. **Parse** the XML with `stophammer-parser::profile::stophammer()`. No mode
+   gives a fallback GUID. A body with no `<channel>`, no `<title>` or no
+   `podcast:guid` is a parse error, and the crawler sends no ingest for it
+   (`stophammer` ADR 0074 §3)
 4. **POST** the result as JSON to the stophammer `/ingest/feed` endpoint
 
 Concurrency is bounded by a tokio semaphore — crawl and import modes drain a

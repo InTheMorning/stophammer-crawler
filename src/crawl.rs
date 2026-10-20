@@ -455,27 +455,51 @@ struct IngestResponse {
     warnings: Option<Vec<String>>,
 }
 
-fn parse_feed_xml(
-    xml: &str,
-    fallback_guid: Option<&str>,
-) -> Result<Option<IngestFeedData>, String> {
-    let parser = match fallback_guid {
-        Some(guid) => profile::stophammer_with_fallback(guid.to_string()),
-        None => profile::stophammer(),
-    };
+/// A feed body that the parser does not accept (`stophammer` ADR 0074 §3a).
+///
+/// `reason` is the `Display` text of the parser error. It names the missing
+/// element, or the XML fault. `raw_medium` is the `podcast:medium` of the
+/// channel, when the parser found a channel with a medium.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParseFailure {
+    reason: String,
+    raw_medium: Option<String>,
+}
 
-    match parser.parse(xml) {
-        Ok(data) => Ok(Some(data)),
-        Err(e) => {
-            if e.is_xml() {
-                Err(e.to_string())
-            } else {
-                // Missing fields (no title, no guid) → still POST with `feed_data: null`
-                // so the server can record the crawl attempt.
-                Ok(None)
-            }
-        }
-    }
+/// Parse a feed body with the stophammer profile (`stophammer` ADR 0074 §3).
+///
+/// The crawler gives no fallback GUID. A body with no `<channel>`, no
+/// `<title>` or no `podcast:guid` is a failure, as malformed XML is. The
+/// caller sends no ingest for a failure.
+fn parse_feed_xml(xml: &str) -> Result<IngestFeedData, ParseFailure> {
+    profile::stophammer().parse(xml).map_err(|e| ParseFailure {
+        reason: e.to_string(),
+        raw_medium: e.raw_medium().map(ToOwned::to_owned),
+    })
+}
+
+/// Build the report of a body that does not parse (`stophammer` ADR 0074
+/// §3a). The report carries the `raw_medium` of the failure, so each skip
+/// store records it.
+fn parse_failure_report(
+    failure: ParseFailure,
+    fetch_http_status: u16,
+    final_url: String,
+    content_sha256: String,
+    raw_xml: String,
+    redirects: Vec<RedirectHop>,
+) -> CrawlReport {
+    let mut report = build_crawl_report(
+        CrawlOutcome::ParseError(failure.reason),
+        Some(fetch_http_status),
+        None,
+        Some(final_url),
+        Some(content_sha256),
+        Some(raw_xml),
+        redirects,
+    );
+    report.raw_medium = failure.raw_medium;
+    report
 }
 
 fn is_retryable_http_status(status: u16) -> bool {
@@ -655,7 +679,7 @@ async fn post_ingest_payload(
     source_url: &str,
     http_status: u16,
     content_hash: &str,
-    feed_data: Option<IngestFeedData>,
+    feed_data: &IngestFeedData,
     config: &CrawlConfig,
     redirects: &[RedirectHop],
 ) -> CrawlOutcome {
@@ -800,17 +824,12 @@ async fn post_gone_report(url: &str, http_status: u16, config: &CrawlConfig) {
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
-)]
 pub async fn ingest_cached_feed_report(
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
     raw_xml: &str,
     content_hash: Option<&str>,
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     redirects: &[RedirectHop],
 ) -> CrawlReport {
@@ -819,16 +838,15 @@ pub async fn ingest_cached_feed_report(
         ToOwned::to_owned,
     );
 
-    let feed_data = match parse_feed_xml(raw_xml, fallback_guid) {
+    let feed_data = match parse_feed_xml(raw_xml) {
         Ok(data) => data,
-        Err(e) => {
-            return build_crawl_report(
-                CrawlOutcome::ParseError(e),
-                Some(http_status),
-                None,
-                Some(canonical_url.to_string()),
-                Some(content_hash),
-                Some(raw_xml.to_string()),
+        Err(failure) => {
+            return parse_failure_report(
+                failure,
+                http_status,
+                canonical_url.to_string(),
+                content_hash,
+                raw_xml.to_string(),
                 redirects.to_vec(),
             );
         }
@@ -839,7 +857,7 @@ pub async fn ingest_cached_feed_report(
         source_url,
         http_status,
         &content_hash,
-        feed_data.clone(),
+        &feed_data,
         config,
         redirects,
     )
@@ -848,7 +866,7 @@ pub async fn ingest_cached_feed_report(
     build_crawl_report(
         outcome,
         Some(http_status),
-        feed_data.as_ref(),
+        Some(&feed_data),
         Some(canonical_url.to_string()),
         Some(content_hash),
         Some(raw_xml.to_string()),
@@ -857,17 +875,12 @@ pub async fn ingest_cached_feed_report(
 }
 
 /// Parse cached XML and POST it to `/ingest/feed`. Never panics.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
-)]
 pub async fn ingest_cached_feed(
     source_url: &str,
     canonical_url: &str,
     http_status: u16,
     raw_xml: &str,
     content_hash: Option<&str>,
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     redirects: &[RedirectHop],
 ) -> CrawlOutcome {
@@ -877,7 +890,6 @@ pub async fn ingest_cached_feed(
         http_status,
         raw_xml,
         content_hash,
-        fallback_guid,
         config,
         redirects,
     )
@@ -1030,16 +1042,11 @@ fn remove_cache_row(cache: &FeedCache, url: &str) {
 
 /// Parse, POST, and cache a freshly fetched `200` body (ADR 0050 §3,
 /// `stophammer` repository).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is one wire field or one config value the caller already holds; grouping them would add a type with no other use"
-)]
 async fn ingest_fresh_and_cache(
     url: &str,
     final_url: Option<String>,
     headers: &HeaderMap,
     body: &[u8],
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
     redirects: &[RedirectHop],
@@ -1054,7 +1061,6 @@ async fn ingest_fresh_and_cache(
         200,
         &xml,
         Some(&hash),
-        fallback_guid,
         config,
         redirects,
     )
@@ -1084,7 +1090,6 @@ async fn ingest_fresh_and_cache(
 async fn ingest_kept_body(
     url: &str,
     cached: &CachedFeed,
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
     redirects: &[RedirectHop],
@@ -1095,7 +1100,6 @@ async fn ingest_kept_body(
         200,
         &cached.body,
         Some(&cached.content_sha256),
-        fallback_guid,
         config,
         redirects,
     )
@@ -1128,17 +1132,16 @@ async fn ingest_kept_body(
 /// Build a `NoChange` report from the kept body, with no ingest POST (ADR
 /// 0050 §3, `stophammer` repository). The node has already answered for
 /// this content.
-fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) -> CrawlReport {
-    let feed_data = match parse_feed_xml(&cached.body, fallback_guid) {
+fn skip_ingest_with_kept_body(cached: &CachedFeed) -> CrawlReport {
+    let feed_data = match parse_feed_xml(&cached.body) {
         Ok(data) => data,
-        Err(e) => {
-            return build_crawl_report(
-                CrawlOutcome::ParseError(e),
-                Some(304),
-                None,
-                Some(cached.final_url.clone()),
-                Some(cached.content_sha256.clone()),
-                Some(cached.body.clone()),
+        Err(failure) => {
+            return parse_failure_report(
+                failure,
+                304,
+                cached.final_url.clone(),
+                cached.content_sha256.clone(),
+                cached.body.clone(),
                 Vec::new(),
             );
         }
@@ -1147,7 +1150,7 @@ fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) 
     build_crawl_report(
         CrawlOutcome::NoChange,
         Some(304),
-        feed_data.as_ref(),
+        Some(&feed_data),
         Some(cached.final_url.clone()),
         Some(cached.content_sha256.clone()),
         Some(cached.body.clone()),
@@ -1237,7 +1240,6 @@ fn build_hop_request(
 pub async fn crawl_feed_report(
     client: &reqwest::Client,
     url: &str,
-    fallback_guid: Option<&str>,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
 ) -> CrawlReport {
@@ -1302,17 +1304,9 @@ pub async fn crawl_feed_report(
 
     match plan_after_response(status, conditional_row, config.force_reingest) {
         FetchAction::IngestFresh => {
-            let mut report = ingest_fresh_and_cache(
-                url,
-                final_url,
-                &headers,
-                &body,
-                fallback_guid,
-                config,
-                cache,
-                &redirects,
-            )
-            .await;
+            let mut report =
+                ingest_fresh_and_cache(url, final_url, &headers, &body, config, cache, &redirects)
+                    .await;
             // ADR 0072 §6 (`stophammer` repository): a `200` to a
             // conditional request, with a body that hashes the same as the
             // cached row, wasted its transfer. `conditional_row` is the row
@@ -1327,13 +1321,13 @@ pub async fn crawl_feed_report(
             let row = cached
                 .as_ref()
                 .expect("plan_after_response gives IngestKept only with a cached row");
-            ingest_kept_body(url, row, fallback_guid, config, cache, &redirects).await
+            ingest_kept_body(url, row, config, cache, &redirects).await
         }
         FetchAction::SkipIngest => {
             let row = cached
                 .as_ref()
                 .expect("plan_after_response gives SkipIngest only with a cached row");
-            skip_ingest_with_kept_body(row, fallback_guid)
+            skip_ingest_with_kept_body(row)
         }
         FetchAction::FetchError => {
             if config.report_gone && matches!(status, 404 | 410) && redirects.is_empty() {
@@ -1357,7 +1351,7 @@ pub async fn crawl_feed_report(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, MAX_FEED_BODY_BYTES,
         NODE_RATE_LIMIT_ATTEMPTS, NODE_RATE_LIMIT_MAX_WAIT_SECS, RedirectHop, body_preview,
@@ -1422,9 +1416,7 @@ mod tests {
           </channel>
         </rss>"#;
 
-        let parsed = parse_feed_xml(xml, None)
-            .expect("publisher feed should parse")
-            .expect("publisher feed data should be present");
+        let parsed = parse_feed_xml(xml).expect("publisher feed should parse");
 
         assert_eq!(parsed.raw_medium.as_deref(), Some("publisher"));
         assert_eq!(
@@ -1791,7 +1783,7 @@ mod tests {
     // test sends a request to an external host.
 
     /// One HTTP/1.1 request, captured from a stub connection.
-    struct StubRequest {
+    pub(crate) struct StubRequest {
         method: String,
         body: Vec<u8>,
         headers: HashMap<String, String>,
@@ -1858,7 +1850,11 @@ mod tests {
 
     /// Build a fixed HTTP/1.1 response, with `Content-Length` and
     /// `Connection: close` set from `body`.
-    fn stub_response(status_line: &str, extra_headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    pub(crate) fn stub_response(
+        status_line: &str,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Vec<u8> {
         use std::fmt::Write as _;
 
         let mut head = format!("{status_line}\r\n");
@@ -1875,7 +1871,9 @@ mod tests {
     /// Start a stub HTTP/1.1 server, on `127.0.0.1`, for exactly one
     /// request. It answers with `response`, then gives the captured
     /// request back through the returned handle.
-    async fn spawn_stub(response: Vec<u8>) -> (String, tokio::task::JoinHandle<StubRequest>) {
+    pub(crate) async fn spawn_stub(
+        response: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<StubRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub listener");
@@ -1925,6 +1923,41 @@ mod tests {
         (format!("127.0.0.1:{}", addr.port()), handle)
     }
 
+    /// Start a stub ingest server, on `127.0.0.1`, that accepts any number
+    /// of requests and counts them. Each request gets an `accepted` answer.
+    /// A test of `stophammer` ADR 0074 §3a reads the count to prove that a
+    /// body that does not parse sends no ingest. The counter goes up before
+    /// the answer, so a caller that awaits its ingest sees the count.
+    pub(crate) async fn spawn_counting_ingest_stub() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        let response = stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        );
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = read_stub_request(&mut stream).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), count, handle)
+    }
+
     /// A fetch client with no redirect policy of its own (`stophammer` ADR
     /// 0052 §2), the same as every feed fetch client in production. A test
     /// that answers a redirect needs this, or `reqwest` follows the
@@ -1955,7 +1988,7 @@ mod tests {
     /// that fetch such a stub. One test turns the check back on, to test
     /// the check itself. See
     /// `a_private_target_fails_before_any_request_reaches_it`.
-    fn test_config(ingest_url: String) -> CrawlConfig {
+    pub(crate) fn test_config(ingest_url: String) -> CrawlConfig {
         let mut config =
             CrawlConfig::dry_run("stophammer-crawler-test/1.0", Duration::from_secs(5));
         config.ingest_url = ingest_url;
@@ -1972,6 +2005,12 @@ mod tests {
     <podcast:medium>music</podcast:medium>
   </channel>
 </rss>"#;
+
+    /// A minimal fresh body that `parse_feed_xml` accepts. It differs from
+    /// [`KEPT_BODY`], so its hash differs from the hash of a seeded row.
+    /// `stophammer` ADR 0074 §3a: a body with no `podcast:guid` sends no
+    /// ingest, so each test that expects a POST uses a body with a GUID.
+    const FRESH_BODY: &str = r#"<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Feed</title><podcast:guid>fresh-feed-guid</podcast:guid></channel></rss>"#;
 
     fn kept_body_hash() -> String {
         hex::encode(sha2::Sha256::digest(KEPT_BODY.as_bytes()))
@@ -2015,7 +2054,7 @@ mod tests {
     /// with the response's `ETag`, the body hash, and the node's answer.
     #[tokio::test]
     async fn stub_200_caches_the_row_and_posts_the_ingest() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -2034,7 +2073,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let feed_request = feed_handle.await.expect("feed stub task");
         let ingest_request = ingest_handle.await.expect("ingest stub task");
@@ -2073,7 +2112,7 @@ mod tests {
     /// so a later `304` submits the kept body again.
     #[tokio::test]
     async fn stub_200_with_a_source_conflict_leaves_the_row_with_no_node_answer() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -2092,7 +2131,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -2123,7 +2162,7 @@ mod tests {
     /// unblock takes effect on the next `304` with no changed body.
     #[tokio::test]
     async fn stub_200_with_a_blocked_answer_leaves_the_row_with_no_node_answer() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -2142,7 +2181,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -2173,7 +2212,7 @@ mod tests {
     /// `plan_after_response_304_no_force_rejected_skips_ingest`).
     #[tokio::test]
     async fn stub_200_with_an_ordinary_rejection_still_caches_the_node_answer() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -2192,7 +2231,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -2221,7 +2260,7 @@ mod tests {
     /// next fetch of the feed, so the body is never used again.
     #[tokio::test]
     async fn stub_200_with_a_medium_rejection_keeps_no_cache_row() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -2240,7 +2279,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -2275,7 +2314,7 @@ mod tests {
         // No ingest stub: a SkipIngest report must send no POST.
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let feed_request = feed_handle.await.expect("feed stub task");
         assert_eq!(
@@ -2356,7 +2395,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let feed_request = feed_handle.await.expect("feed stub task");
         assert_eq!(
@@ -2402,7 +2441,7 @@ mod tests {
         let mut config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         config.force_reingest = true;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let ingest_request = ingest_handle.await.expect("ingest stub task");
         feed_handle.await.expect("feed stub task");
@@ -2460,7 +2499,7 @@ mod tests {
         let mut config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         config.force_reingest = true;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         ingest_handle.await.expect("ingest stub task");
         feed_handle.await.expect("feed stub task");
@@ -2507,7 +2546,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let ingest_request = ingest_handle.await.expect("ingest stub task");
         feed_handle.await.expect("feed stub task");
@@ -2535,7 +2574,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
         feed_handle.await.expect("feed stub task");
 
         match &report.outcome {
@@ -2565,7 +2604,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
         let request = feed_handle.await.expect("feed stub task");
 
         assert!(
@@ -2599,7 +2638,7 @@ mod tests {
         let mut config = test_config(String::new());
         config.revalidate = false;
 
-        let _report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let _report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let feed_request = feed_handle.await.expect("feed stub task");
         assert_eq!(
@@ -2625,7 +2664,7 @@ mod tests {
         let mut config = test_config(String::new());
         config.revalidate = false;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         assert!(
             matches!(report.outcome, CrawlOutcome::FetchError { .. }),
@@ -2676,7 +2715,7 @@ mod tests {
             "https://example.com/feed.xml",
             200,
             "hash",
-            None,
+            &sample_feed_data(),
             &config,
             &[],
         )
@@ -2725,7 +2764,7 @@ mod tests {
             "https://example.com/feed.xml",
             200,
             "hash",
-            None,
+            &sample_feed_data(),
             &config,
             &[],
         )
@@ -2755,7 +2794,7 @@ mod tests {
             "https://example.com/feed.xml",
             200,
             "hash",
-            None,
+            &sample_feed_data(),
             &config,
             &[],
         )
@@ -2786,7 +2825,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_redirect_to_a_second_url_gives_one_hop_and_that_url_as_the_final_url() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (addr_b, handle_b) = spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
         let url_b = format!("http://{addr_b}/feed.xml");
 
@@ -2803,7 +2842,7 @@ mod tests {
         let client = no_redirect_client();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+        let report = crawl_feed_report(&client, &url_a, &config, None).await;
 
         handle_a.await.expect("stub a task");
         handle_b.await.expect("stub b task");
@@ -2826,7 +2865,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_302_then_a_301_gives_two_hops_in_order() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (addr_c, handle_c) = spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
         let url_c = format!("http://{addr_c}/feed.xml");
 
@@ -2851,7 +2890,7 @@ mod tests {
         let client = no_redirect_client();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+        let report = crawl_feed_report(&client, &url_a, &config, None).await;
 
         handle_a.await.expect("stub a task");
         handle_b.await.expect("stub b task");
@@ -2877,7 +2916,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_relative_location_resolves_against_the_current_url() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let responses = vec![
             stub_response(
                 "HTTP/1.1 301 Moved Permanently",
@@ -2895,7 +2934,7 @@ mod tests {
         let client = no_redirect_client();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         let requests = feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -2930,7 +2969,7 @@ mod tests {
         let client = no_redirect_client();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &url, &config, None).await;
 
         let requests = handle.await.expect("stub task");
 
@@ -2981,7 +3020,7 @@ mod tests {
         let cache = test_cache();
         seed_cached_row(&cache, &url_a, None);
 
-        let _report = crawl_feed_report(&client, &url_a, None, &config, Some(&cache)).await;
+        let _report = crawl_feed_report(&client, &url_a, &config, Some(&cache)).await;
 
         handle_a.await.expect("stub a task");
         handle_b.await.expect("stub b task");
@@ -2998,7 +3037,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fetch_with_no_redirect_sends_an_empty_redirects_list() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) =
             spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
         let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
@@ -3007,7 +3046,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
         let ingest_request = ingest_handle.await.expect("ingest stub task");
@@ -3050,7 +3089,7 @@ mod tests {
         let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
         config.report_gone = true;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
         let node_request = node_handle.await.expect("node stub task");
@@ -3096,7 +3135,7 @@ mod tests {
         let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
         config.report_gone = true;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
         let node_request = node_handle.await.expect("node stub task");
@@ -3143,7 +3182,7 @@ mod tests {
         let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
         config.report_gone = true;
 
-        let report = crawl_feed_report(&client, &url_a, None, &config, None).await;
+        let report = crawl_feed_report(&client, &url_a, &config, None).await;
 
         handle_a.await.expect("stub a task");
         handle_b.await.expect("stub b task");
@@ -3181,7 +3220,7 @@ mod tests {
         let mut config = test_config(format!("http://{node_addr}/ingest/feed"));
         config.report_gone = true;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
 
@@ -3214,7 +3253,7 @@ mod tests {
         // `test_config` leaves `report_gone` at its default, `false`.
         let config = test_config(format!("http://{node_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
 
@@ -3246,7 +3285,7 @@ mod tests {
         let mut config = test_config(String::new());
         config.allow_private_targets = false;
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(200), feed_handle)
@@ -3312,7 +3351,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
         feed_handle.await.expect("feed stub task");
 
         assert!(
@@ -3356,7 +3395,7 @@ mod tests {
 
         let report = tokio::time::timeout(
             Duration::from_secs(5),
-            crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)),
+            crawl_feed_report(&client, &feed_url, &config, Some(&cache)),
         )
         .await
         .expect(
@@ -3389,9 +3428,9 @@ mod tests {
     /// exactly as it was before the limit existed.
     #[tokio::test]
     async fn a_body_of_1_mib_is_accepted_as_before() {
-        let padding = "a".repeat(1024 * 1024 - 120);
+        let padding = "a".repeat(1024 * 1024 - 300);
         let body = format!(
-            "<rss><channel><title>Feed</title><description>{padding}</description></channel></rss>"
+            "<rss xmlns:podcast=\"https://podcastindex.org/namespace/1.0\"><channel><title>Feed</title><podcast:guid>fresh-feed-guid</podcast:guid><description>{padding}</description></channel></rss>"
         );
         let body = body.into_bytes();
         assert!(
@@ -3408,7 +3447,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
 
@@ -3458,7 +3497,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let _report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
         let ingest_request = ingest_handle.await.expect("ingest stub task");
@@ -3492,7 +3531,7 @@ mod tests {
     /// and the crawler submits the new body.
     #[tokio::test]
     async fn stub_200_with_source_blocked_keeps_node_answer_in_cache() {
-        let body = b"<rss><channel><title>Feed</title></channel></rss>";
+        let body = FRESH_BODY.as_bytes();
         let (feed_addr, feed_handle) = spawn_stub(stub_response(
             "HTTP/1.1 200 OK",
             &[("etag", "\"v1\"")],
@@ -3511,7 +3550,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -3570,7 +3609,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
 
         feed_handle.await.expect("feed stub task");
         ingest_handle.await.expect("ingest stub task");
@@ -3611,7 +3650,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let _report = crawl_feed_report(&client, &feed_url, &config, None).await;
         let request = feed_handle.await.expect("feed stub task");
         ingest_handle.abort();
 
@@ -3658,7 +3697,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
         let _ = feed_handle.await;
         ingest_handle.abort();
 
@@ -3703,7 +3742,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
         let _ = feed_handle.await;
         ingest_handle.abort();
 
@@ -3735,7 +3774,7 @@ mod tests {
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let _report = crawl_feed_report(&client, &feed_url, &config, None).await;
         let request = feed_handle.await.expect("feed stub task");
         ingest_handle.abort();
 
@@ -3771,7 +3810,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let feed_request = feed_handle.await.expect("feed stub task");
         ingest_handle.abort();
@@ -3820,7 +3859,7 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let _ = feed_handle.await;
         ingest_handle.abort();
@@ -3854,7 +3893,7 @@ mod tests {
         let cache = test_cache();
         let feed_url = format!("http://{feed_addr}/feed.xml");
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let _ = feed_handle.await;
         ingest_handle.abort();
@@ -3879,10 +3918,76 @@ mod tests {
         let client = reqwest::Client::new();
         let config = test_config(String::new());
 
-        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+        let report = crawl_feed_report(&client, &feed_url, &config, Some(&cache)).await;
 
         let _ = feed_handle.await;
 
         assert!(!report.wasted_200, "a 304 must not be a wasted 200");
+    }
+    /// Proves `stophammer` ADR 0074 §3a: a music body with no `podcast:guid`
+    /// is a parse error with its `raw_medium`, and sends no ingest.
+    #[tokio::test]
+    async fn stub_200_with_no_guid_is_a_parse_error_and_sends_no_ingest() {
+        let body = br#"<rss xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel><title>Feed</title><podcast:medium>music</podcast:medium></channel></rss>"#;
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let (ingest_addr, ingest_count, ingest_handle) = spawn_counting_ingest_stub().await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        let CrawlOutcome::ParseError(reason) = &report.outcome else {
+            panic!("expected a parse error, got {}", report.outcome);
+        };
+        assert!(
+            reason.starts_with("missing podcast:guid"),
+            "the reason must name the missing GUID, got {reason}"
+        );
+        assert_eq!(
+            report.raw_medium.as_deref(),
+            Some("music"),
+            "the report must carry the medium of the failure"
+        );
+        assert_eq!(report.fetch_http_status, Some(200));
+        assert_eq!(
+            ingest_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a body with no GUID must send no ingest"
+        );
+    }
+
+    /// Proves `stophammer` ADR 0074 §3a: a body with no `<channel>` is a
+    /// parse error and sends no ingest.
+    #[tokio::test]
+    async fn stub_200_with_no_channel_is_a_parse_error_and_sends_no_ingest() {
+        let body = b"<rss version=\"2.0\"></rss>";
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 200 OK", &[], body)).await;
+        let (ingest_addr, ingest_count, ingest_handle) = spawn_counting_ingest_stub().await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, &config, None).await;
+        feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        assert!(
+            matches!(report.outcome, CrawlOutcome::ParseError(_)),
+            "expected a parse error, got {}",
+            report.outcome
+        );
+        assert_eq!(report.raw_medium, None);
+        assert_eq!(
+            ingest_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a body with no channel must send no ingest"
+        );
     }
 }
