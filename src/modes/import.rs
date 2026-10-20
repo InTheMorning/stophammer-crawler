@@ -955,6 +955,7 @@ fn build_import_timeout_report(timeout_secs: u64) -> CrawlReport {
         raw_xml: None,
         parsed_feed: None,
         redirects: Vec::new(),
+        wasted_200: false,
     }
 }
 
@@ -1575,6 +1576,10 @@ fn download_snapshot_archive(
 ) -> io::Result<SnapshotRefreshOutcome> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(SNAPSHOT_CONNECT_TIMEOUT_SECS))
+        // The snapshot is a `.tgz` archive. HTTP compression saves almost no
+        // bytes here, and costs CPU on both sides (`stophammer` ADR 0072 §3).
+        .no_gzip()
+        .no_brotli()
         .build()
         .map_err(io::Error::other)?;
     let mut request = client.get(db_url);
@@ -2007,14 +2012,14 @@ mod tests {
     use super::{
         CandidateRow, ImportAuditFetch, ImportAuditRow, ImportAuditSourceDb, ImportAuditWriter,
         ImportMemoryRow, ImportScope, ImportStateWriter, KnownSkipKind, LockIdentity,
-        ProgressStore, SNAPSHOT_FREE_SPACE_MARGIN_BYTES, WAVLAKE_HOSTS, batch_max_id,
-        build_import_audit_row, build_import_timeout_report, current_lock_identity,
-        effective_audit_append, enqueue_import_audit, enqueue_import_memory,
-        extract_snapshot_archive, format_if_modified_since_value, is_skip_known_non_music,
-        known_skip_kind, legacy_lock_matches_process, load_known_import_memory,
-        open_state_connection, query_batch, read_lock_identity, resolve_start_cursor,
-        snapshot_refresh_required_bytes, snapshot_space_shortfall, upsert_import_memory,
-        wavlake_throttle_delay,
+        ProgressStore, SNAPSHOT_FREE_SPACE_MARGIN_BYTES, SnapshotRefreshOutcome, WAVLAKE_HOSTS,
+        batch_max_id, build_import_audit_row, build_import_timeout_report, current_lock_identity,
+        download_snapshot_archive, effective_audit_append, enqueue_import_audit,
+        enqueue_import_memory, extract_snapshot_archive, format_if_modified_since_value,
+        is_skip_known_non_music, known_skip_kind, legacy_lock_matches_process,
+        load_known_import_memory, open_state_connection, query_batch, read_lock_identity,
+        resolve_start_cursor, snapshot_refresh_required_bytes, snapshot_space_shortfall,
+        upsert_import_memory, wavlake_throttle_delay,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use flate2::Compression;
@@ -2123,6 +2128,7 @@ mod tests {
             raw_xml: Some("<rss/>".to_string()),
             parsed_feed: Some(sample_parsed_feed()),
             redirects: Vec::new(),
+            wasted_200: false,
         }
     }
 
@@ -2244,6 +2250,54 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!db_path.exists());
+    }
+
+    /// Proves ADR 0072 §3: the snapshot client sends no `Accept-Encoding`.
+    /// The snapshot is a `.tgz` archive, so HTTP compression saves almost no
+    /// bytes and costs CPU on both sides.
+    #[test]
+    fn download_snapshot_archive_sends_no_accept_encoding() {
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub local addr");
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept stub connection");
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line).expect("read stub header line");
+                if read == 0 || line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+                .expect("write stub response");
+            head
+        });
+
+        let db_url = format!("http://{addr}/snapshot.tgz");
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("podcastindex_feeds.db");
+
+        // `if_modified_since` is set, so a `304` from the stub is a correct
+        // answer to the request it sends.
+        let outcome = download_snapshot_archive(&db_url, &db_path, Some(SystemTime::now()))
+            .expect("download snapshot archive");
+
+        let head = handle.join().expect("stub thread");
+
+        assert_eq!(outcome, SnapshotRefreshOutcome::Unchanged);
+        assert!(
+            !head.to_ascii_lowercase().contains("accept-encoding"),
+            "request head sent accept-encoding: {head:?}"
+        );
     }
 
     #[test]
@@ -2512,6 +2566,7 @@ mod tests {
             raw_xml: Some("<rss/>".to_string()),
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         };
 
         assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
@@ -2534,6 +2589,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         };
 
         assert!(build_import_audit_row(&candidate, &report, 1_700_000_000).is_none());
@@ -2981,6 +3037,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         };
 
         assert_eq!(wavlake_throttle_delay(&report, 1), Duration::from_secs(301));
@@ -2998,6 +3055,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         };
 
         assert_eq!(

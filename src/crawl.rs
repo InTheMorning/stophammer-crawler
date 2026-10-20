@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::header::{
-    ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
+    ACCEPT, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, RETRY_AFTER,
 };
 use sha2::{Digest, Sha256};
 use stophammer_parser::profile;
@@ -431,6 +431,11 @@ pub struct CrawlReport {
     /// (`stophammer` ADR 0052 §2). Empty when the fetch had no redirect, or
     /// when the report did not come from a live fetch.
     pub redirects: Vec<RedirectHop>,
+    /// `true` when this report is a wasted `200` (`stophammer` ADR 0072 §6,
+    /// which amends ADR 0050 §6): a conditional request got back a `200`
+    /// whose body hashes the same as the cached row. `false` by default,
+    /// and on every report that is not a live `200` fetch.
+    pub wasted_200: bool,
 }
 
 impl CrawlReport {
@@ -574,6 +579,10 @@ fn build_crawl_report(
         raw_xml,
         parsed_feed: feed_data.cloned(),
         redirects,
+        // ADR 0072 §6: this constructor never sees the cached row, so it
+        // cannot tell a wasted `200`. `crawl_feed_report` sets the field
+        // itself, on the one report that can be one.
+        wasted_200: false,
     }
 }
 
@@ -1146,6 +1155,54 @@ fn skip_ingest_with_kept_body(cached: &CachedFeed, fallback_guid: Option<&str>) 
     )
 }
 
+/// Content types a feed request accepts, most preferred first (`stophammer`
+/// ADR 0072 §2). The `reqwest` client decodes `gzip` and `br` on its own,
+/// through the crate features; this header only states the feed types.
+const FEED_ACCEPT: &str =
+    "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8";
+
+/// Suffixes a server adds to a compressed body's `ETag` (`stophammer` ADR
+/// 0072 §5). An Apache server with `mod_deflate` adds one of these to the
+/// `ETag` it sends for a compressed body, but keeps the plain `ETag` for an
+/// uncompressed body of the same content.
+const ETAG_COMPRESSION_SUFFIXES: &[&str] = &["-gzip", "-br"];
+
+/// Builds the `If-None-Match` value for a stored `ETag` (`stophammer` ADR
+/// 0072 §5, which amends ADR 0050 §2). When the tag ends with a compression
+/// suffix before its closing quote, this sends a list of the stored tag and
+/// the same tag with the suffix removed. A server with `mod_deflate` sends a
+/// `-gzip` tag for a compressed body but matches only the plain tag, so the
+/// list lets the crawler match either server's own `ETag`. The stored value
+/// never changes; only the request carries the extra tag.
+fn if_none_match_value(etag: &str) -> String {
+    let trimmed = etag.trim();
+
+    // A weak validator's `W/` prefix is not part of the quoted tag. Split it
+    // off here, so it can be put back on both tags below.
+    let (weak_prefix, quoted) = trimmed
+        .strip_prefix("W/")
+        .map_or(("", trimmed), |rest| ("W/", rest));
+
+    // A suffix can only be found before a closing quote. A tag with no
+    // quotes, or an empty tag, carries no suffix to strip.
+    let Some(inner) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return trimmed.to_string();
+    };
+
+    for suffix in ETAG_COMPRESSION_SUFFIXES {
+        if let Some(base) = inner.strip_suffix(suffix) {
+            // An empty base tag is not a useful second value. Keep the
+            // stored tag unchanged, as the "Constraints" table requires.
+            if base.is_empty() {
+                continue;
+            }
+            return format!("{trimmed}, {weak_prefix}\"{base}\"");
+        }
+    }
+
+    trimmed.to_string()
+}
+
 /// Builds one hop's request (`stophammer` ADR 0052 §2). Adds the
 /// conditional headers of ADR 0050 when `row` is given.
 fn build_hop_request(
@@ -1157,12 +1214,13 @@ fn build_hop_request(
     let mut request = client
         .get(hop_url)
         .header("User-Agent", &config.user_agent)
+        .header(ACCEPT, FEED_ACCEPT)
         .timeout(config.fetch_timeout);
     let Some(row) = row else {
         return request;
     };
     if let Some(etag) = &row.etag {
-        request = request.header(IF_NONE_MATCH, etag.as_str());
+        request = request.header(IF_NONE_MATCH, if_none_match_value(etag));
     }
     if let Some(last_modified) = &row.last_modified {
         request = request.header(IF_MODIFIED_SINCE, last_modified.as_str());
@@ -1244,7 +1302,7 @@ pub async fn crawl_feed_report(
 
     match plan_after_response(status, conditional_row, config.force_reingest) {
         FetchAction::IngestFresh => {
-            ingest_fresh_and_cache(
+            let mut report = ingest_fresh_and_cache(
                 url,
                 final_url,
                 &headers,
@@ -1254,7 +1312,16 @@ pub async fn crawl_feed_report(
                 cache,
                 &redirects,
             )
-            .await
+            .await;
+            // ADR 0072 §6 (`stophammer` repository): a `200` to a
+            // conditional request, with a body that hashes the same as the
+            // cached row, wasted its transfer. `conditional_row` is the row
+            // the request carried, and `report.content_sha256` is the hash
+            // of the body this fetch just read.
+            report.wasted_200 = conditional_row.is_some_and(|row| {
+                report.content_sha256.as_deref() == Some(row.content_sha256.as_str())
+            });
+            report
         }
         FetchAction::IngestKept => {
             let row = cached
@@ -1295,9 +1362,9 @@ mod tests {
         CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, MAX_FEED_BODY_BYTES,
         NODE_RATE_LIMIT_ATTEMPTS, NODE_RATE_LIMIT_MAX_WAIT_SECS, RedirectHop, body_preview,
         build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
-        is_retryable_http_status, is_retryable_ingest_status, is_uncached_node_answer,
-        node_rate_limit_wait, normalize_rejection_reason, parse_feed_xml, plan_after_response,
-        post_ingest_payload,
+        if_none_match_value, is_retryable_http_status, is_retryable_ingest_status,
+        is_uncached_node_answer, node_rate_limit_wait, normalize_rejection_reason, parse_feed_xml,
+        plan_after_response, post_ingest_payload,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -1913,12 +1980,25 @@ mod tests {
     /// Seed a cache row for `url`, with the kept body and its hash. Also
     /// record `node_answer`, when one is given.
     fn seed_cached_row(cache: &FeedCache, url: &str, node_answer: Option<&str>) {
+        seed_cached_row_with_etag(cache, url, "\"v1\"", node_answer);
+    }
+
+    /// Seed a cache row for `url`, with the kept body, its hash and a chosen
+    /// `etag`. Also record `node_answer`, when one is given. A test of ADR
+    /// 0072 §5 (`stophammer` repository) uses this to store a stored `ETag`
+    /// with a compression suffix.
+    fn seed_cached_row_with_etag(
+        cache: &FeedCache,
+        url: &str,
+        etag: &str,
+        node_answer: Option<&str>,
+    ) {
         let db = cache.lock().expect("cache lock");
         db.put(
             url,
             &FetchedFeed {
                 final_url: url,
-                etag: Some("\"v1\""),
+                etag: Some(etag),
                 last_modified: None,
                 content_sha256: &kept_body_hash(),
                 body: KEPT_BODY,
@@ -2209,6 +2289,93 @@ mod tests {
         assert!(
             report.parsed_feed.is_some(),
             "a SkipIngest report must still carry the parsed feed"
+        );
+    }
+
+    /// Proves ADR 0072 §5 (`stophammer` repository), the "Constraints" table:
+    /// a stored `ETag` that ends with a compression suffix gives a list of
+    /// the stored tag and its base tag.
+    #[test]
+    fn if_none_match_value_adds_the_base_tag_after_a_gzip_suffix() {
+        assert_eq!(
+            if_none_match_value("\"1288-63c94b87e7da9-gzip\""),
+            "\"1288-63c94b87e7da9-gzip\", \"1288-63c94b87e7da9\""
+        );
+    }
+
+    /// Proves the table row for a weak validator: the `W/` prefix stays on
+    /// both tags.
+    #[test]
+    fn if_none_match_value_keeps_a_weak_prefix_on_both_tags() {
+        assert_eq!(
+            if_none_match_value("W/\"abc-br\""),
+            "W/\"abc-br\", W/\"abc\""
+        );
+    }
+
+    /// Proves the table row for a tag with no compression suffix: the
+    /// stored value is unchanged.
+    #[test]
+    fn if_none_match_value_is_unchanged_with_no_suffix() {
+        assert_eq!(if_none_match_value("\"abc\""), "\"abc\"");
+    }
+
+    /// Proves the table row for a suffix that is not at the end of the tag:
+    /// the stored value is unchanged.
+    #[test]
+    fn if_none_match_value_is_unchanged_when_the_suffix_is_not_at_the_end() {
+        assert_eq!(if_none_match_value("\"abc-gzip-x\""), "\"abc-gzip-x\"");
+    }
+
+    /// Proves the table row for a tag that is only the suffix: the base tag
+    /// would be empty, so the stored value is unchanged.
+    #[test]
+    fn if_none_match_value_keeps_a_suffix_only_tag_because_the_base_is_empty() {
+        assert_eq!(if_none_match_value("\"-gzip\""), "\"-gzip\"");
+    }
+
+    /// Proves the table row for a tag with no quotes: the stored value is
+    /// unchanged, since no closing quote marks a suffix to strip.
+    #[test]
+    fn if_none_match_value_is_unchanged_with_no_quotes() {
+        assert_eq!(if_none_match_value("abc-gzip"), "abc-gzip");
+    }
+
+    /// Proves the acceptance criterion of ADR 0072 §5 (`stophammer`
+    /// repository): a cached row with a `-gzip` `ETag` sends the stored tag
+    /// and its base tag, and a `304` leaves the stored value unchanged.
+    #[tokio::test]
+    async fn stub_304_with_a_gzip_etag_sends_the_base_tag_and_keeps_the_stored_value() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row_with_etag(&cache, &feed_url, "\"v1-gzip\"", Some("accepted"));
+
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        assert_eq!(
+            feed_request.header("if-none-match"),
+            Some("\"v1-gzip\", \"v1\""),
+            "the request must carry the stored ETag and its base tag"
+        );
+
+        assert_eq!(report.outcome, CrawlOutcome::NoChange);
+
+        assert_eq!(
+            cache
+                .lock()
+                .expect("cache lock")
+                .get(&feed_url)
+                .expect("cache row")
+                .etag,
+            Some("\"v1-gzip\"".to_string()),
+            "a 304 must not change the stored ETag"
         );
     }
 
@@ -3422,5 +3589,300 @@ mod tests {
             follow_urls.is_empty(),
             "ADR 0057 task 003: a rejected feed must give no follow URLs"
         );
+    }
+
+    /// Proves ADR 0072 §1 and §2: a feed request from the production client
+    /// advertises compression and feed content types.
+    #[tokio::test]
+    async fn claim_feed_request_advertises_compression_and_feed_types() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/rss+xml")],
+            KEPT_BODY.as_bytes(),
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+        let client = crate::modes::batch::build_feed_fetch_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let request = feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        let encoding = request.header("accept-encoding").unwrap_or("");
+        assert!(
+            encoding.contains("gzip"),
+            "accept-encoding sent: {encoding:?}"
+        );
+        let accept = request.header("accept").unwrap_or("");
+        assert!(
+            accept.contains("application/rss+xml"),
+            "accept sent: {accept:?}"
+        );
+    }
+
+    /// Proves ADR 0072 §1 and §4: a feed body that a host sends with
+    /// `content-encoding: gzip` is decoded, parsed and accepted.
+    #[tokio::test]
+    async fn claim_gzip_encoded_feed_is_decoded_and_accepted() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(KEPT_BODY.as_bytes())
+            .expect("gzip the body");
+        let gzipped = encoder.finish().expect("finish gzip");
+
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[
+                ("content-type", "application/rss+xml"),
+                ("content-encoding", "gzip"),
+            ],
+            &gzipped,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+        let client = crate::modes::batch::build_feed_fetch_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let _ = feed_handle.await;
+        ingest_handle.abort();
+
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            },
+            "a gzip feed must parse like the same feed sent plain"
+        );
+    }
+
+    /// Proves ADR 0072 §4: a gzip-encoded transfer and a plain transfer of
+    /// the same body give the same content hash. The hash is over the
+    /// decoded body, so the wire form the host chose does not change it.
+    #[tokio::test]
+    async fn gzip_and_plain_feed_give_same_content_hash() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(KEPT_BODY.as_bytes())
+            .expect("gzip the body");
+        let gzipped = encoder.finish().expect("finish gzip");
+
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[
+                ("content-type", "application/rss+xml"),
+                ("content-encoding", "gzip"),
+            ],
+            &gzipped,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+        let client = crate::modes::batch::build_feed_fetch_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let _ = feed_handle.await;
+        ingest_handle.abort();
+
+        assert_eq!(
+            report.content_sha256.as_deref(),
+            Some(kept_body_hash().as_str()),
+            "a gzip transfer must hash the same as the plain body it decodes to"
+        );
+    }
+
+    /// Proves ADR 0072 §1 and §2: the gossip mode's feed-fetch client also
+    /// sends `FEED_ACCEPT`, since the header is set per request in
+    /// `build_hop_request`, not on one client's `default_headers`.
+    #[tokio::test]
+    async fn gossip_feed_client_also_sends_feed_accept() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/rss+xml")],
+            KEPT_BODY.as_bytes(),
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+        let client = crate::modes::gossip::create_async_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let _report = crawl_feed_report(&client, &feed_url, None, &config, None).await;
+        let request = feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        let accept = request.header("accept").unwrap_or("");
+        assert!(
+            accept.contains("application/rss+xml"),
+            "accept sent: {accept:?}"
+        );
+    }
+
+    /// Proves ADR 0072 §6 (`stophammer` repository), the first "Acceptance
+    /// Criteria" row: a conditional request that gets back a `200` with the
+    /// same body hash as the cached row is a wasted `200`.
+    #[tokio::test]
+    async fn stub_200_with_the_cached_hash_is_a_wasted_200() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v2\"")],
+            KEPT_BODY.as_bytes(),
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let feed_request = feed_handle.await.expect("feed stub task");
+        ingest_handle.abort();
+
+        assert_eq!(
+            feed_request.header("if-none-match"),
+            Some("\"v1\""),
+            "the request must carry the stored ETag, so the answer came back to a conditional request"
+        );
+        assert!(
+            report.wasted_200,
+            "a 200 whose body hashes the same as the cached row must be a wasted 200"
+        );
+    }
+
+    /// Proves ADR 0072 §6, the second "Acceptance Criteria" row: a `200`
+    /// with a body that hashes differently from the cached row is not a
+    /// wasted `200`.
+    #[tokio::test]
+    async fn stub_200_with_a_different_hash_is_not_a_wasted_200() {
+        let different_body = br#"<?xml version="1.0"?>
+<rss xmlns:podcast="https://podcastindex.org/namespace/1.0">
+  <channel>
+    <title>New Feed</title>
+    <podcast:guid>new-feed-guid</podcast:guid>
+    <podcast:medium>music</podcast:medium>
+  </channel>
+</rss>"#;
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v2\"")],
+            different_body,
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let _ = feed_handle.await;
+        ingest_handle.abort();
+
+        assert!(
+            !report.wasted_200,
+            "a 200 whose body hashes differently from the cached row must not be a wasted 200"
+        );
+    }
+
+    /// Proves ADR 0072 §6, the third "Acceptance Criteria" row: a `200`
+    /// with no cached row is not a wasted `200`, because the request carried
+    /// no conditional header to waste.
+    #[tokio::test]
+    async fn stub_200_with_no_cached_row_is_not_a_wasted_200() {
+        let (feed_addr, feed_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("etag", "\"v1\"")],
+            KEPT_BODY.as_bytes(),
+        ))
+        .await;
+        let (ingest_addr, ingest_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            br#"{"accepted":true}"#,
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let _ = feed_handle.await;
+        ingest_handle.abort();
+
+        assert!(
+            !report.wasted_200,
+            "a 200 with no cached row must not be a wasted 200"
+        );
+    }
+
+    /// Proves ADR 0072 §6, the fourth "Acceptance Criteria" row: a `304` is
+    /// not a wasted `200`, whatever the cached row holds.
+    #[tokio::test]
+    async fn stub_304_is_not_a_wasted_200() {
+        let (feed_addr, feed_handle) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let feed_url = format!("http://{feed_addr}/feed.xml");
+
+        let cache = test_cache();
+        seed_cached_row(&cache, &feed_url, Some("accepted"));
+
+        let client = reqwest::Client::new();
+        let config = test_config(String::new());
+
+        let report = crawl_feed_report(&client, &feed_url, None, &config, Some(&cache)).await;
+
+        let _ = feed_handle.await;
+
+        assert!(!report.wasted_200, "a 304 must not be a wasted 200");
     }
 }

@@ -228,12 +228,16 @@ pub(crate) fn report_follow_urls(report: &CrawlReport, level: FollowLevel) -> Ve
 /// final report for a URL. A wave task sees only that report, so
 /// [`FetchCounts::note`] reads one `fetch_http_status` for each URL in each
 /// wave. A retry never adds a second count.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct FetchCounts {
     ok: u32,
     not_modified: u32,
     rate_limited: u32,
     other: u32,
+    /// Wasted `200` answers, by host (`stophammer` ADR 0072 §6, which
+    /// amends ADR 0050 §6). The host is taken from the URL the crawl
+    /// requested. A URL with no host counts under `"(none)"`.
+    wasted_by_host: std::collections::BTreeMap<String, u32>,
 }
 
 impl FetchCounts {
@@ -250,16 +254,45 @@ impl FetchCounts {
             _ => self.other += 1,
         }
     }
+
+    /// Add one wasted `200` (`stophammer` ADR 0072 §6), under the host of
+    /// `url`, the URL the crawl requested. A URL with no host counts under
+    /// `"(none)"`.
+    fn note_wasted_200(&mut self, url: &str) {
+        let host = host_key(url).unwrap_or_else(|| "(none)".to_string());
+        *self.wasted_by_host.entry(host).or_insert(0) += 1;
+    }
 }
 
 impl std::fmt::Display for FetchCounts {
-    /// Print the line ADR 0050 §6 asks for.
+    /// Print the line ADR 0050 §6 asks for, with the wasted-`200` total of
+    /// ADR 0072 §6. When the total is more than 0, a line after it gives
+    /// each host with its count, the highest count first, at most 20
+    /// hosts.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let wasted_total: u32 = self.wasted_by_host.values().sum();
         write!(
             f,
-            "fetch: ok={} not_modified={} rate_limited={} other={}",
+            "fetch: ok={} not_modified={} rate_limited={} other={} wasted_200={wasted_total}",
             self.ok, self.not_modified, self.rate_limited, self.other
-        )
+        )?;
+
+        if wasted_total == 0 {
+            return Ok(());
+        }
+
+        let mut hosts: Vec<(&str, u32)> = self
+            .wasted_by_host
+            .iter()
+            .map(|(host, count)| (host.as_str(), *count))
+            .collect();
+        hosts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+        write!(f, "\nwasted_200 by host:")?;
+        for (host, count) in hosts.into_iter().take(20) {
+            write!(f, " {host}={count}")?;
+        }
+        Ok(())
     }
 }
 
@@ -312,10 +345,15 @@ where
                         .expect("failed feed retry list mutex poisoned")
                         .push(url.clone());
                 }
-                fetch_counts
-                    .lock()
-                    .expect("fetch counts mutex poisoned")
-                    .note(report.fetch_http_status);
+                {
+                    let mut counts = fetch_counts.lock().expect("fetch counts mutex poisoned");
+                    counts.note(report.fetch_http_status);
+                    // ADR 0072 §6 (`stophammer` repository): a wasted 200
+                    // also counts under its host, for the end-of-pass line.
+                    if report.wasted_200 {
+                        counts.note_wasted_200(&url);
+                    }
+                }
                 eprintln!("  {}: {url}", report.outcome);
 
                 if let Some(level) = follow_level {
@@ -562,7 +600,10 @@ pub async fn run_urls(
 
     // ADR 0050 §6 (`stophammer` repository): one line, printed once, after
     // every wave has run. Always printed, even when every count is zero.
-    let counts = *fetch_counts.lock().expect("fetch counts mutex poisoned");
+    let counts = fetch_counts
+        .lock()
+        .expect("fetch counts mutex poisoned")
+        .clone();
     eprintln!("{counts}");
 
     // ADR 0054 §3 (`stophammer` repository): one line, printed once, at the
@@ -654,6 +695,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: Some(feed),
             redirects: Vec::new(),
+            wasted_200: false,
         }
     }
 
@@ -732,6 +774,67 @@ mod tests {
     }
 
     #[test]
+    fn fetch_counts_note_wasted_200_counts_by_host_with_none_for_no_host() {
+        let mut counts = FetchCounts::default();
+        counts.note_wasted_200("https://a.example/feed.xml");
+        counts.note_wasted_200("not-a-url");
+
+        assert_eq!(
+            counts,
+            FetchCounts {
+                wasted_by_host: std::collections::BTreeMap::from([
+                    ("a.example".to_string(), 1),
+                    ("(none)".to_string(), 1),
+                ]),
+                ..FetchCounts::default()
+            },
+            "a wasted 200 counts under its own host, and a URL with no host counts under (none)"
+        );
+    }
+
+    /// Proves ADR 0072 §6 (`stophammer` repository), the first batch
+    /// "Acceptance Criteria" row: three wasted reports for one host and one
+    /// for another give `wasted_200=4`, with the busier host first in the
+    /// host line.
+    #[test]
+    fn fetch_counts_display_lists_wasted_hosts_by_count_with_the_highest_first() {
+        let mut counts = FetchCounts::default();
+        counts.note_wasted_200("https://a.example/feed1.xml");
+        counts.note_wasted_200("https://a.example/feed2.xml");
+        counts.note_wasted_200("https://a.example/feed3.xml");
+        counts.note_wasted_200("https://b.example/feed.xml");
+
+        let line = counts.to_string();
+        assert!(
+            line.contains("wasted_200=4"),
+            "the line must give the wasted total: {line}"
+        );
+        let a_index = line
+            .find("a.example")
+            .expect("host a.example must be in the line");
+        let b_index = line
+            .find("b.example")
+            .expect("host b.example must be in the line");
+        assert!(
+            a_index < b_index,
+            "the host with more wasted answers must come first: {line}"
+        );
+    }
+
+    /// Proves ADR 0072 §6, the second batch "Acceptance Criteria" row: with
+    /// no wasted report, the line is the line of today plus `wasted_200=0`,
+    /// and no host line follows.
+    #[test]
+    fn fetch_counts_display_gives_wasted_200_0_with_no_host_line_when_nothing_was_wasted() {
+        let counts = FetchCounts::default();
+        assert_eq!(
+            counts.to_string(),
+            "fetch: ok=0 not_modified=0 rate_limited=0 other=0 wasted_200=0",
+            "wasted_200=0 must follow the line of today, with no host line"
+        );
+    }
+
+    #[test]
     fn wave_2_is_the_follow_urls_less_wave_1_with_no_duplicates() {
         let music_feed = feed(
             "music",
@@ -806,6 +909,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         };
 
         assert_eq!(
@@ -1061,6 +1165,7 @@ mod tests {
                     raw_xml: None,
                     parsed_feed: None,
                     redirects: Vec::new(),
+                    wasted_200: false,
                 },
                 other => panic!("unexpected fetch of {other}"),
             };
@@ -1130,6 +1235,7 @@ mod tests {
                     raw_xml: None,
                     parsed_feed: None,
                     redirects: Vec::new(),
+                    wasted_200: false,
                 },
                 "https://pub2.example/feed.xml" => CrawlReport {
                     outcome: CrawlOutcome::FetchError {
@@ -1145,6 +1251,7 @@ mod tests {
                     raw_xml: None,
                     parsed_feed: None,
                     redirects: Vec::new(),
+                    wasted_200: false,
                 },
                 other => panic!("unexpected fetch of {other}"),
             };
@@ -1176,6 +1283,7 @@ mod tests {
                 not_modified: 1,
                 rate_limited: 1,
                 other: 1,
+                ..FetchCounts::default()
             },
             "the fetch counts must add up over both waves: one 200, one 304, \
              one 429 and one fetch with no status"

@@ -8,7 +8,7 @@ description = "Unified RSS feed crawler with crawl, import, ndjson, and gossip m
 [dependencies]
 stophammer-parser = { path = "../stophammer-parser" }
 tokio       = { version = "1", features = ["full"] }
-reqwest     = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+reqwest     = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream", "gzip", "brotli"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 sha2        = "0.10"

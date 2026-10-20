@@ -227,6 +227,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         }
     }
 

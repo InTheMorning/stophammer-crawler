@@ -16,13 +16,15 @@ use crate::modes::import::{
     ImportAuditCommand, ImportAuditWriter, build_audit_row_from_url, enqueue_import_audit,
 };
 use crate::ping_window::PingDecision;
-use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS};
+use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS, host_key};
 
 /// Builds a client for a feed fetch (`stophammer` ADR 0052 §2).
 ///
 /// Redirects are off. The crawler follows a redirect chain itself, so it
-/// can put a conditional header on every hop, and record each hop.
-fn create_async_client() -> reqwest::Client {
+/// can put a conditional header on every hop, and record each hop. The
+/// client accepts and decodes `gzip` and `br` bodies (`stophammer` ADR 0072
+/// §1), through the crate's `reqwest` features.
+pub(crate) fn create_async_client() -> reqwest::Client {
     reqwest::Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
@@ -39,10 +41,15 @@ fn create_async_client() -> reqwest::Client {
 /// This request must follow its own redirect, so it does not share
 /// [`create_async_client`]'s policy. That policy turns redirects off, for
 /// the manual chain a feed fetch builds (`stophammer` ADR 0052 §2).
+///
+/// The stream is not a feed fetch, so it does not ask for compression
+/// (`stophammer` ADR 0072 §1).
 fn create_sse_client() -> reqwest::Client {
     reqwest::Client::builder()
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
+        .no_gzip()
+        .no_brotli()
         .build()
         .expect("failed to create async HTTP client")
 }
@@ -547,6 +554,14 @@ async fn process_notification_urls(
                     if !(quiet && report.outcome.is_medium_rejection()) {
                         eprintln!("  {}: {url}", report.outcome);
                     }
+                    if report.wasted_200 {
+                        // ADR 0072 §6 (`stophammer` repository): prints
+                        // even in a quiet pass, so an operator can still
+                        // see a host that sends a validator which does not
+                        // match its own body.
+                        let host = host_key(&url).unwrap_or_else(|| "(none)".to_string());
+                        eprintln!("  wasted_200: {host} {url}");
+                    }
 
                     if let Some(ref tx) = audit_tx {
                         let fetched_at = SystemTime::now()
@@ -892,6 +907,12 @@ fn record_follow_outcome(
 ) {
     if !(quiet && report.outcome.is_medium_rejection()) {
         eprintln!("  follow {}: {url}", report.outcome);
+    }
+    if report.wasted_200 {
+        // ADR 0072 §6 (`stophammer` repository): prints even in a quiet
+        // pass, the same as the notification crawl's own wasted-200 line.
+        let host = host_key(url).unwrap_or_else(|| "(none)".to_string());
+        eprintln!("  wasted_200: {host} {url}");
     }
 
     skip_db
@@ -2335,6 +2356,7 @@ mod tests {
             raw_xml: None,
             parsed_feed: None,
             redirects: Vec::new(),
+            wasted_200: false,
         }
     }
 
