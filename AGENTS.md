@@ -51,7 +51,7 @@ most 1,000 URLs for a `musicL` list feed (ADR 0060 §6).
 one batch pass, and in one gossip replay, reconciliation batch or SSE
 session.
 
-[stophammer ADR 0060](../docs/adr/0060-a-list-feed-keeps-its-items.md) task 003
+[stophammer ADR 0060](../docs/adr/archive/0060-a-list-feed-keeps-its-items.md) task 003
 is complete and deployed on 2026-09-26. A `musicL` feed gives the `remote_feed_url` of
 each channel remote item with the `medium` `music` or with no `medium` (ADR
 0060 §5). A feed reached through a list is fetched at
@@ -95,8 +95,8 @@ during a corrective pass.
   5 minutes in `src/dedup.rs`.
 - **`feed`, `refresh` and `gossip` follow a publisher link or a list feed.**
   The tests of the archived stophammer ADR 0049 section 2 own the publisher
-  rule. ADR 0060 sections 5 and 6 own
-  the list rule.
+  rule. The tests of the archived ADR 0060 sections 5 and 6 own the list
+  rule.
 - **The node owns the index.** Local SQLite holds progress and memory of
   attempts only.
 - Lints are `[lints.clippy] pedantic = "deny"` and nothing more.
