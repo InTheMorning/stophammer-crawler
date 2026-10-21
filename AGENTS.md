@@ -58,7 +58,7 @@ each channel remote item with the `medium` `music` or with no `medium` (ADR
 `FollowLevel::Publisher`. A music feed gives no follow URL at that level, so
 the walk stops after one level.
 
-[stophammer ADR 0057](../docs/adr/0057-a-feed-can-block-this-index.md) task 003
+[stophammer ADR 0057](../docs/adr/archive/0057-a-feed-can-block-this-index.md) task 003
 is complete. The parser sends the `blocks` field in `IngestFeedData`. The
 crawler submits it unchanged. `source_blocked` is not in
 `UNCACHED_NODE_REASONS` (ADR 0051 §5, ADR 0053 §1), so the crawler keeps it as
