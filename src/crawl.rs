@@ -1355,10 +1355,10 @@ pub(crate) mod tests {
     use super::{
         CachedFeed, CrawlConfig, CrawlOutcome, FeedCache, FetchAction, MAX_FEED_BODY_BYTES,
         NODE_RATE_LIMIT_ATTEMPTS, NODE_RATE_LIMIT_MAX_WAIT_SECS, RedirectHop, body_preview,
-        build_crawl_report, crawl_feed_report, format_http_fetch_error, format_ingest_http_error,
-        if_none_match_value, is_retryable_http_status, is_retryable_ingest_status,
-        is_uncached_node_answer, node_rate_limit_wait, normalize_rejection_reason, parse_feed_xml,
-        plan_after_response, post_ingest_payload,
+        build_crawl_report, crawl_feed_report, fetch_following_redirects, format_http_fetch_error,
+        format_ingest_http_error, if_none_match_value, is_retryable_http_status,
+        is_retryable_ingest_status, is_uncached_node_answer, node_rate_limit_wait,
+        normalize_rejection_reason, parse_feed_xml, plan_after_response, post_ingest_payload,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -3304,6 +3304,40 @@ pub(crate) mod tests {
             ),
             "a private target must be a non-retryable fetch_target_not_public error, got {:?}",
             report.outcome
+        );
+    }
+
+    /// `stophammer` ADR 0054 §1 and §5: the fetch applies the rule to each
+    /// redirect hop. The first URL is a public literal address, so it passes
+    /// the guard. The request builder sends it to a stub that redirects to
+    /// `127.0.0.1`. The guard must reject that hop before a second request.
+    #[tokio::test]
+    async fn a_public_url_that_redirects_to_loopback_is_rejected_at_the_hop() {
+        let (stub_addr, stub_handle) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", "http://127.0.0.1:9/feed.xml")],
+            b"",
+        ))
+        .await;
+        let stub_url = format!("http://{stub_addr}/");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+
+        let result = fetch_following_redirects("http://93.184.216.34/feed.xml", false, |_url| {
+            client.get(&stub_url)
+        })
+        .await;
+
+        stub_handle
+            .await
+            .expect("the stub received the first request");
+        let err = result.expect_err("a hop to 127.0.0.1 must be rejected");
+        assert!(
+            !err.retryable,
+            "ADR 0054 §1: a rejected hop is a final fetch error, got {:?}",
+            err.reason
         );
     }
 
