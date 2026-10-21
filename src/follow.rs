@@ -120,16 +120,31 @@ pub fn follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
         "ADR 0054 §3"
     };
 
-    if urls.len() > max_urls {
-        let dropped = urls.len() - max_urls;
-        urls.truncate(max_urls);
-        eprintln!(
-            "follow: dropped {dropped} follow URL(s) of {fetched_url}, {owner} caps this \
-             feed at {max_urls}"
-        );
+    if let Some(report) = cap_follow_urls(&mut urls, max_urls, fetched_url, owner) {
+        eprintln!("{report}");
     }
 
     urls
+}
+
+/// Keeps at most `max_urls` of `urls`. When it drops URLs, it gives the
+/// report line that names `fetched_url` and the number dropped
+/// (`stophammer` ADR 0054 §3, ADR 0060 §6).
+fn cap_follow_urls(
+    urls: &mut Vec<String>,
+    max_urls: usize,
+    fetched_url: &str,
+    owner: &str,
+) -> Option<String> {
+    if urls.len() <= max_urls {
+        return None;
+    }
+    let dropped = urls.len() - max_urls;
+    urls.truncate(max_urls);
+    Some(format!(
+        "follow: dropped {dropped} follow URL(s) of {fetched_url}, {owner} caps this \
+         feed at {max_urls}"
+    ))
 }
 
 /// Gives every follow URL of `feed`, with no cap. [`follow_urls`] is the
@@ -198,7 +213,7 @@ fn is_followable_url(url: &str) -> bool {
 mod tests {
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef, IngestTrackData};
 
-    use super::{FollowLevel, follow_urls, follow_urls_at_level};
+    use super::{FollowLevel, cap_follow_urls, follow_urls, follow_urls_at_level};
 
     /// The URL these tests treat as the one the crawler fetched. None of
     /// the feeds these tests build declares this as its `new_feed_url`,
@@ -588,6 +603,31 @@ mod tests {
             follow_urls(&data, FETCHED_URL).len(),
             200,
             "ADR 0060 §6: a feed that is not a list keeps the limit of 200 (ADR 0054 §3)"
+        );
+    }
+
+    #[test]
+    fn a_cap_reports_the_number_of_urls_that_it_does_not_follow() {
+        let mut urls: Vec<String> = (0..300)
+            .map(|i| format!("https://album-{i}.example/feed.xml"))
+            .collect();
+        let report = cap_follow_urls(&mut urls, 200, FETCHED_URL, "ADR 0054 §3")
+            .expect("a cap that drops URLs gives a report");
+
+        assert_eq!(urls.len(), 200, "ADR 0054 §3: the cap keeps 200 URLs");
+        assert!(
+            report.contains("dropped 100 follow URL(s)") && report.contains(FETCHED_URL),
+            "ADR 0054 §3: the report names the feed and the number not followed: {report}"
+        );
+    }
+
+    #[test]
+    fn a_cap_that_drops_nothing_gives_no_report() {
+        let mut urls = vec!["https://album.example/feed.xml".to_string()];
+        assert_eq!(
+            cap_follow_urls(&mut urls, 200, FETCHED_URL, "ADR 0054 §3"),
+            None,
+            "ADR 0054 §3: no URL is dropped, so no report"
         );
     }
 
