@@ -38,7 +38,7 @@ RUN cd stophammer-crawler && cargo chef cook --release --recipe-path recipe.json
 COPY . ./stophammer-crawler
 RUN cd stophammer-crawler && cargo build --release
 
-FROM alpine:3.20 AS stophammer-crawler
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS stophammer-crawler
 RUN apk add --no-cache ca-certificates \
  && addgroup -S stophammer-crawler \
  && adduser -S -G stophammer-crawler stophammer-crawler \
