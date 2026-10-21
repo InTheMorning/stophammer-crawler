@@ -21,7 +21,7 @@ Accepted and implemented. The `refresh` mode in `src/modes/refresh.rs` takes
 its corpus from the feed list of the node. The index is what defines the feeds
 the node holds. The pass has run.
 
-[stophammer ADR 0049](../docs/adr/0049-publisher-relationships-are-rss-facts.md)
+[stophammer ADR 0049](../docs/adr/archive/0049-publisher-relationships-are-rss-facts.md)
 is Accepted and implemented here. `feed` and `refresh` follow a publisher
 link, through `src/follow.rs` and `src/modes/batch.rs`. The walk has three
 waves: the input feeds, the feeds they name, and the album list of a
@@ -37,7 +37,7 @@ each hop with its status. `follow_urls` also returns a declared
 `itunes:new-feed-url`. The gossip SSE stream keeps its own client with the
 default redirect policy.
 
-[stophammer ADR 0054](../docs/adr/0054-a-fetch-reaches-only-public-feed-hosts.md)
+[stophammer ADR 0054](../docs/adr/archive/0054-a-fetch-reaches-only-public-feed-hosts.md)
 tasks 001 and 002 are complete and deployed on 2026-09-25. `src/fetch_guard.rs` holds
 `is_public_ip`, `check_target` and `PublicOnlyResolver`. Each feed fetch client
 resolves through `PublicOnlyResolver`, and `fetch_following_redirects` calls
@@ -94,7 +94,8 @@ during a corrective pass.
   changes nothing. The skip list runs before the window. A follow URL keeps its own cooldown of
   5 minutes in `src/dedup.rs`.
 - **`feed`, `refresh` and `gossip` follow a publisher link or a list feed.**
-  ADR 0049 section 2 owns the publisher rule. ADR 0060 sections 5 and 6 own
+  The tests of the archived stophammer ADR 0049 section 2 own the publisher
+  rule. ADR 0060 sections 5 and 6 own
   the list rule.
 - **The node owns the index.** Local SQLite holds progress and memory of
   attempts only.
