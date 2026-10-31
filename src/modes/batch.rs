@@ -12,6 +12,22 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const CRAWL_ATTEMPTS: u32 = 3;
 
+/// A function that gets each URL and its report as soon as a fetch ends.
+///
+/// The sink runs inside an async task. It must not block for long.
+pub(crate) type OutcomeSink = Arc<dyn Fn(&str, &CrawlReport) + Send + Sync>;
+
+/// The settings of one pass of the batch pipeline.
+#[derive(Debug, Clone)]
+pub(crate) struct UrlPass {
+    pub(crate) concurrency: usize,
+    pub(crate) host_delay_ms: u64,
+    pub(crate) failed_feeds_output: String,
+    pub(crate) force: bool,
+    pub(crate) feed_cache: String,
+    pub(crate) revalidate: bool,
+}
+
 /// Builds a client for a feed fetch (`stophammer` ADR 0052 §2). `import`
 /// uses this client too.
 ///
@@ -321,6 +337,7 @@ async fn run_wave<S, Fut>(
     fetch_counts: &Arc<std::sync::Mutex<FetchCounts>>,
     step: &Arc<S>,
     follow_level: Option<FollowLevel>,
+    sink: Option<&OutcomeSink>,
 ) -> Vec<String>
 where
     S: Fn(String) -> Fut + Send + Sync + 'static,
@@ -337,8 +354,12 @@ where
             let failed_feeds = Arc::clone(failed_feeds);
             let fetch_counts = Arc::clone(fetch_counts);
             let follow_by_index = Arc::clone(&follow_by_index);
+            let sink = sink.cloned();
             move || async move {
                 let report = step(url.clone()).await;
+                if let Some(sink) = &sink {
+                    sink(&url, &report);
+                }
                 if report.is_retryable() {
                     failed_feeds
                         .lock()
@@ -431,6 +452,10 @@ fn admit_follow_urls(urls: Vec<String>, queue: &FollowQueueLimit) -> Vec<String>
 ///
 /// `step` fetches and ingests one URL and gives its crawl report. A test
 /// gives a stub `step` and needs no network.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the optional outcome sink is the eighth input of a private function with one caller"
+)]
 async fn run_waves<S, Fut>(
     wave1_urls: Vec<String>,
     concurrency: usize,
@@ -439,6 +464,7 @@ async fn run_waves<S, Fut>(
     fetch_counts: &Arc<std::sync::Mutex<FetchCounts>>,
     follow_queue: &FollowQueueLimit,
     step: &Arc<S>,
+    sink: Option<&OutcomeSink>,
 ) where
     S: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = CrawlReport> + Send + 'static,
@@ -452,6 +478,7 @@ async fn run_waves<S, Fut>(
         fetch_counts,
         step,
         Some(FollowLevel::Input),
+        sink,
     )
     .await;
 
@@ -481,6 +508,7 @@ async fn run_waves<S, Fut>(
         fetch_counts,
         step,
         Some(FollowLevel::Publisher),
+        sink,
     )
     .await;
 
@@ -504,6 +532,7 @@ async fn run_waves<S, Fut>(
         fetch_counts,
         step,
         None,
+        sink,
     )
     .await;
 }
@@ -557,6 +586,33 @@ pub async fn run_urls(
     feed_cache: String,
     revalidate: bool,
 ) {
+    let pass = UrlPass {
+        concurrency,
+        host_delay_ms,
+        failed_feeds_output,
+        force,
+        feed_cache,
+        revalidate,
+    };
+    run_urls_with_sink(urls, pass, None).await;
+}
+
+/// Run the batch pipeline as [`run_urls`] does, and call `sink` with each
+/// URL and its report as soon as that fetch ends. The sink gets the URL that
+/// the step got, in each wave.
+pub(crate) async fn run_urls_with_sink(
+    urls: Vec<String>,
+    pass: UrlPass,
+    sink: Option<OutcomeSink>,
+) {
+    let UrlPass {
+        concurrency,
+        host_delay_ms,
+        failed_feeds_output,
+        force,
+        feed_cache,
+        revalidate,
+    } = pass;
     let urls = interleave_by_host(urls, |url| host_key(url));
 
     eprintln!(
@@ -595,6 +651,7 @@ pub async fn run_urls(
         &fetch_counts,
         &follow_queue,
         &step,
+        sink.as_ref(),
     )
     .await;
 
@@ -970,6 +1027,7 @@ mod tests {
             &fetch_counts,
             &step,
             Some(FollowLevel::Input),
+            None,
         )
         .await;
 
@@ -1049,6 +1107,7 @@ mod tests {
             &fetch_counts,
             &follow_queue,
             &step,
+            None,
         )
         .await;
 
@@ -1116,6 +1175,7 @@ mod tests {
             &fetch_counts,
             &follow_queue,
             &step,
+            None,
         )
         .await;
 
@@ -1184,6 +1244,7 @@ mod tests {
             &fetch_counts,
             &follow_queue,
             &step,
+            None,
         )
         .await;
 
@@ -1273,6 +1334,7 @@ mod tests {
             &fetch_counts,
             &follow_queue,
             &step,
+            None,
         )
         .await;
 
@@ -1451,5 +1513,55 @@ mod tests {
             .get(&feed_url)
             .expect("crawl_feed_with_retries must pass its cache to crawl_feed_report");
         assert_eq!(cached.etag.as_deref(), Some("\"v1\""));
+    }
+
+    /// The sink gets one call for each URL of wave 1, with that URL.
+    #[tokio::test]
+    async fn the_sink_is_called_once_for_each_url_of_wave_1_with_that_url() {
+        let step: Arc<_> =
+            Arc::new(|_url: String| async move { accepted_report(feed("music", Vec::new())) });
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in_sink = Arc::clone(&seen);
+        let sink: super::OutcomeSink = Arc::new(move |url: &str, report: &CrawlReport| {
+            assert_eq!(
+                report.outcome.label(),
+                "accepted",
+                "the sink must get the report of the step"
+            );
+            seen_in_sink
+                .lock()
+                .expect("seen list mutex poisoned")
+                .push(url.to_string());
+        });
+
+        let failed_feeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fetch_counts = Arc::new(std::sync::Mutex::new(FetchCounts::default()));
+        let follow_queue = FollowQueueLimit::new(MAX_FOLLOW_QUEUE_URLS);
+
+        run_waves(
+            vec![
+                "https://one.example/feed.xml".to_string(),
+                "https://two.example/feed.xml".to_string(),
+            ],
+            2,
+            0,
+            &failed_feeds,
+            &fetch_counts,
+            &follow_queue,
+            &step,
+            Some(&sink),
+        )
+        .await;
+
+        let mut called = seen.lock().expect("seen list mutex poisoned").clone();
+        called.sort();
+        assert_eq!(
+            called,
+            vec![
+                "https://one.example/feed.xml".to_string(),
+                "https://two.example/feed.xml".to_string(),
+            ],
+            "the sink must get each wave-1 URL one time"
+        );
     }
 }

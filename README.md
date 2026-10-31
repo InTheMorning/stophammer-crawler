@@ -190,6 +190,54 @@ stophammer-crawler refresh --force 2>&1 | tee run.log
 analysis/bin/refresh_log_summary.sh run.log .
 ```
 
+### podcastindex
+
+Run one pass over the PodcastIndex music list. The mode reads the list from
+the PodcastIndex API and the feed list of the node. It sends each music feed
+that the node does not hold to the same pipeline as `feed`. stophammer ADR
+0081 owns this decision.
+
+The API needs a key and a secret. Set `PODCASTINDEX_API_KEY` and
+`PODCASTINDEX_API_SECRET` in the environment. Keep them outside Git.
+
+```bash
+CRAWL_TOKEN=secret \
+INGEST_URL=http://127.0.0.1:8008/ingest/feed \
+PODCASTINDEX_API_KEY=key \
+PODCASTINDEX_API_SECRET=secret \
+stophammer-crawler podcastindex \
+  --dry-run
+```
+
+Remove `--dry-run` after the first report looks correct.
+
+#### podcastindex options
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--state <path>` | | `./import_state.db` | State database. It holds `music_list_attempts`, `import_gap_passes` and `import_gap_rows` |
+| `--skip-db <path>` | | `./feed_skip.db` | Shared skip database. The pass writes each fetch outcome with the source mode `podcastindex` |
+| `--feed-cache <path>` | `FEED_CACHE_DB` | `./feed_cache.db` | Shared cross-mode fetch cache (ADR 0050) |
+| `--api-base <url>` | `PODCASTINDEX_API_BASE` | `https://api.podcastindex.org/api/1.0` | API base URL. Use another value only with a local test server |
+| `--concurrency <n>` | `CONCURRENCY` | `5` | Parallel fetch+ingest workers |
+| `--host-delay-ms <ms>` | `HOST_DELAY_MS` | `1500` | Minimum ms between fetches to the same host |
+| `--failed-feeds-output <path>` | `FAILED_FEEDS_OUTPUT` | `./failed_feeds.txt` | Plain-text output file for retryable feed URLs |
+| `--dry-run` | | off | Read both lists and print the report. Send no URL to the pipeline |
+
+The global flags `--force` and `--no-revalidate` apply as in the other modes.
+
+At the end of the pass, the mode writes one report line to standard error:
+
+```text
+podcastindex: rows=8601 held=8403 candidates=198 waiting=142 sent=56 accepted=56 rejected=0 import_gap=none
+```
+
+A dry run also prints `podcastindex: dry run, no URL went to the pipeline`.
+
+A candidate that fails waits 7 days before the next attempt. The wait is in
+`music_list_attempts`. `import` keeps its schedule until the measurement of
+ADR 0081 section 10 is complete.
+
 ### import
 
 Batch-scan a PodcastIndex snapshot for music feeds:
@@ -541,6 +589,12 @@ replay:
 - **`PODCASTINDEX_DB_URL`** --
   Override the PodcastIndex snapshot archive URL for
   import mode.
+- **`PODCASTINDEX_API_KEY`** and **`PODCASTINDEX_API_SECRET`** --
+  Credentials for the PodcastIndex API (podcastindex mode, ADR 0081). Keep
+  them outside Git.
+- **`PODCASTINDEX_API_BASE`** --
+  Base URL of the PodcastIndex API. Use another value only with a local test
+  server. Default: `https://api.podcastindex.org/api/1.0`
 
 ## Architecture
 

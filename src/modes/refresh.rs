@@ -11,6 +11,8 @@
 //! A page that fails stops the whole pass. [`run_corrective_pass`] never
 //! calls its pipeline callback with a partial corpus.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::modes::batch;
@@ -29,21 +31,26 @@ const PAGE_LIMIT: u32 = 100;
 /// owns this.
 const ALL_MEDIUMS: &str = "all";
 
+/// One feed of `GET /v1/feeds/recent`. The mode `podcastindex` also reads it
+/// (`stophammer` ADR 0081 §4).
 #[derive(Debug, Deserialize)]
-struct FeedsRecentItem {
-    feed_url: String,
+pub(crate) struct FeedsRecentItem {
+    pub(crate) feed_guid: String,
+    pub(crate) feed_url: String,
 }
 
+/// The pagination block of `GET /v1/feeds/recent`.
 #[derive(Debug, Deserialize)]
-struct FeedsRecentPagination {
-    cursor: Option<String>,
-    has_more: bool,
+pub(crate) struct FeedsRecentPagination {
+    pub(crate) cursor: Option<String>,
+    pub(crate) has_more: bool,
 }
 
+/// One page of `GET /v1/feeds/recent`.
 #[derive(Debug, Deserialize)]
-struct FeedsRecentPage {
-    data: Vec<FeedsRecentItem>,
-    pagination: FeedsRecentPagination,
+pub(crate) struct FeedsRecentPage {
+    pub(crate) data: Vec<FeedsRecentItem>,
+    pub(crate) pagination: FeedsRecentPagination,
 }
 
 /// One count from the `data` object of `/v1/publisher-links/stats`.
@@ -65,14 +72,15 @@ struct PublisherLinkStatsResponse {
     data: PublisherLinkStats,
 }
 
-fn ingest_url_from_env() -> String {
+/// Read `INGEST_URL`, or give the default.
+pub(crate) fn ingest_url_from_env() -> String {
     std::env::var("INGEST_URL").unwrap_or_else(|_| DEFAULT_INGEST_URL.to_string())
 }
 
 /// Strip the ingest path from `INGEST_URL` to get the node's origin, e.g.
 /// `http://host:8008/ingest/feed` becomes `http://host:8008`. Needs no
 /// network; parses the URL and reads its origin.
-fn query_origin_from_ingest_url(ingest_url: &str) -> Result<String, String> {
+pub(crate) fn query_origin_from_ingest_url(ingest_url: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(ingest_url)
         .map_err(|err| format!("INGEST_URL {ingest_url:?} is not a valid URL: {err}"))?;
     let origin = url.origin().ascii_serialization();
@@ -84,36 +92,85 @@ fn query_origin_from_ingest_url(ingest_url: &str) -> Result<String, String> {
     Ok(origin)
 }
 
+/// The most `429` answers one page read waits through.
+const MAX_429_ATTEMPTS: u32 = 5;
+/// The longest wait after one `429`, in seconds.
+const MAX_429_WAIT_SECS: u64 = 30;
+
+/// Give the wait before the next try after a `429`, or `None` to stop.
+///
+/// `attempt` counts from 1 and names the try that got the `429`. The result
+/// is `None` when `attempt` is 5 or more. Else it is the `Retry-After`
+/// seconds, at most 30, when the header is an integer. With no usable header
+/// it is 1 second. A date form of `Retry-After` is not usable.
+///
+/// `stophammer` ADR 0081 §4 owns this rule. On 2026-10-31, a `--dry-run` pass
+/// of the `podcastindex` mode read 106 pages in less than one second. A second
+/// pass 2 seconds later got a `429` and stopped. `refresh` uses the same
+/// reader.
+pub(crate) fn wait_after_429(retry_after: Option<&str>, attempt: u32) -> Option<Duration> {
+    if attempt >= MAX_429_ATTEMPTS {
+        return None;
+    }
+    let secs = retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(1, |secs| secs.min(MAX_429_WAIT_SECS));
+    Some(Duration::from_secs(secs))
+}
+
 /// Fetch one page of `GET /v1/feeds/recent` at `limit=100` across every
 /// medium, honoring the pagination cursor.
-async fn fetch_feeds_recent_page(
+///
+/// A `429` makes the call wait and send the page again, at most 5 times
+/// (see [`wait_after_429`]). Each other status is final.
+pub(crate) async fn fetch_feeds_recent_page(
     client: &reqwest::Client,
     origin: &str,
     cursor: Option<&str>,
 ) -> Result<FeedsRecentPage, String> {
-    let mut request = client
-        .get(format!("{origin}{FEEDS_RECENT_PATH}"))
-        .query(&[("limit", PAGE_LIMIT.to_string())])
-        .query(&[("medium", ALL_MEDIUMS)]);
-    if let Some(cursor) = cursor {
-        request = request.query(&[("cursor", cursor)]);
+    let mut attempt: u32 = 1;
+    loop {
+        let mut request = client
+            .get(format!("{origin}{FEEDS_RECENT_PATH}"))
+            .query(&[("limit", PAGE_LIMIT.to_string())])
+            .query(&[("medium", ALL_MEDIUMS)]);
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| format!("GET {FEEDS_RECENT_PATH} failed: {err}"))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            if let Some(wait) = wait_after_429(retry_after.as_deref(), attempt) {
+                eprintln!(
+                    "feeds/recent: 429, waiting {} s before try {}",
+                    wait.as_secs(),
+                    attempt + 1
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("GET {FEEDS_RECENT_PATH} returned {status}: {body}"));
+        }
+
+        return response
+            .json::<FeedsRecentPage>()
+            .await
+            .map_err(|err| format!("GET {FEEDS_RECENT_PATH} returned an unreadable body: {err}"));
     }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("GET {FEEDS_RECENT_PATH} failed: {err}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("GET {FEEDS_RECENT_PATH} returned {status}: {body}"));
-    }
-
-    response
-        .json::<FeedsRecentPage>()
-        .await
-        .map_err(|err| format!("GET {FEEDS_RECENT_PATH} returned an unreadable body: {err}"))
 }
 
 /// Decode the body of `GET /v1/publisher-links/stats` into the printed
@@ -172,19 +229,21 @@ async fn report_publisher_link_stats(client: &reqwest::Client, origin: &str) {
 }
 
 /// Page through `fetch_page` while `has_more` is true, collecting every
-/// `feed_url`. Stops at the first page that fails and returns the error,
-/// never a partial list.
-async fn collect_feed_urls<F, Fut>(fetch_page: &mut F) -> Result<Vec<String>, String>
+/// feed. Stops at the first page that fails and returns the error, never a
+/// partial list.
+pub(crate) async fn collect_feeds<F, Fut>(
+    fetch_page: &mut F,
+) -> Result<Vec<FeedsRecentItem>, String>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<FeedsRecentPage, String>>,
 {
-    let mut urls = Vec::new();
+    let mut feeds = Vec::new();
     let mut cursor: Option<String> = None;
 
     loop {
         let page = fetch_page(cursor.take()).await?;
-        urls.extend(page.data.into_iter().map(|item| item.feed_url));
+        feeds.extend(page.data);
 
         if !page.pagination.has_more {
             break;
@@ -198,7 +257,18 @@ where
         cursor = Some(next_cursor);
     }
 
-    Ok(urls)
+    Ok(feeds)
+}
+
+/// Page through `fetch_page` and collect every `feed_url`. It has the
+/// behavior of [`collect_feeds`].
+async fn collect_feed_urls<F, Fut>(fetch_page: &mut F) -> Result<Vec<String>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<FeedsRecentPage, String>>,
+{
+    let feeds = collect_feeds(fetch_page).await?;
+    Ok(feeds.into_iter().map(|item| item.feed_url).collect())
 }
 
 /// Page the corpus through `fetch_page`, then hand it to `run_pipeline`.
@@ -288,9 +358,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        FeedsRecentItem, FeedsRecentPage, FeedsRecentPagination, format_link_stats,
-        query_origin_from_ingest_url, run_corrective_pass,
+        FeedsRecentItem, FeedsRecentPage, FeedsRecentPagination, collect_feeds,
+        fetch_feeds_recent_page, format_link_stats, query_origin_from_ingest_url,
+        run_corrective_pass, wait_after_429,
     };
+    use std::time::Duration;
 
     #[test]
     fn query_origin_strips_the_ingest_path() {
@@ -361,6 +433,7 @@ mod tests {
             data: urls
                 .iter()
                 .map(|url| FeedsRecentItem {
+                    feed_guid: format!("guid-of-{url}"),
                     feed_url: (*url).to_string(),
                 })
                 .collect(),
@@ -498,5 +571,150 @@ mod tests {
             0,
             "an empty corpus must perform no feed fetch"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_feeds_gives_each_item_with_its_guid_and_url() {
+        let pages = Arc::new(Mutex::new(vec![
+            page(&["https://a.example/feed.xml"], Some("c1"), true),
+            page(&["https://b.example/feed.xml"], None, false),
+        ]));
+        let mut fetch_page = move |_cursor: Option<String>| {
+            let pages = Arc::clone(&pages);
+            async move { Ok(pages.lock().expect("pages mutex poisoned").remove(0)) }
+        };
+
+        let feeds = collect_feeds(&mut fetch_page)
+            .await
+            .expect("a fully paged list must not error");
+
+        let pairs: Vec<(&str, &str)> = feeds
+            .iter()
+            .map(|item| (item.feed_guid.as_str(), item.feed_url.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "guid-of-https://a.example/feed.xml",
+                    "https://a.example/feed.xml"
+                ),
+                (
+                    "guid-of-https://b.example/feed.xml",
+                    "https://b.example/feed.xml"
+                ),
+            ],
+            "each item must keep its feed_guid and feed_url, in page order"
+        );
+    }
+
+    #[test]
+    fn wait_after_429_follows_the_rule_of_adr_0081() {
+        assert_eq!(wait_after_429(Some("3"), 1), Some(Duration::from_secs(3)));
+        assert_eq!(
+            wait_after_429(Some("120"), 1),
+            Some(Duration::from_secs(30)),
+            "the wait has a maximum of 30 seconds"
+        );
+        assert_eq!(
+            wait_after_429(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1),
+            Some(Duration::from_secs(1)),
+            "a date is not a usable header"
+        );
+        assert_eq!(wait_after_429(None, 1), Some(Duration::from_secs(1)));
+        assert_eq!(
+            wait_after_429(Some("1"), 5),
+            None,
+            "the fifth attempt is the last"
+        );
+    }
+
+    /// Serve one canned answer for each entry of `answers`, in order, then
+    /// stop. Returns the origin and the count of requests seen.
+    async fn stub_node(answers: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_for_task = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for answer in answers {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                seen_for_task.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (origin, seen)
+    }
+
+    fn answer(status: &str, extra_header: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{extra_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const ONE_FEED_BODY: &str = r#"{"data":[{"feed_guid":"g1","feed_url":"https://a.example/feed.xml"}],"pagination":{"cursor":null,"has_more":false}}"#;
+
+    #[tokio::test]
+    async fn a_429_then_a_200_gives_the_page_after_one_wait() {
+        let (origin, seen) = stub_node(vec![
+            answer("429 Too Many Requests", "Retry-After: 1\r\n", "{}"),
+            answer("200 OK", "", ONE_FEED_BODY),
+        ])
+        .await;
+
+        let page = fetch_feeds_recent_page(&reqwest::Client::new(), &origin, None)
+            .await
+            .expect("the second answer is a page");
+
+        assert_eq!(page.data.len(), 1, "the page holds one feed");
+        assert_eq!(page.data[0].feed_guid, "g1");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "the stub saw two requests");
+    }
+
+    #[tokio::test]
+    async fn six_429_answers_give_an_error_that_holds_429() {
+        let answers = (0..6)
+            .map(|_| answer("429 Too Many Requests", "Retry-After: 0\r\n", "{}"))
+            .collect();
+        let (origin, seen) = stub_node(answers).await;
+
+        let err = fetch_feeds_recent_page(&reqwest::Client::new(), &origin, None)
+            .await
+            .expect_err("no page after repeated 429 answers");
+
+        assert!(err.contains("429"), "error must name the status: {err}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            5,
+            "the reader stops after 5 tries"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_500_gives_an_error_at_once() {
+        let (origin, seen) = stub_node(vec![answer("500 Internal Server Error", "", "{}")]).await;
+
+        let err = fetch_feeds_recent_page(&reqwest::Client::new(), &origin, None)
+            .await
+            .expect_err("a 500 is final");
+
+        assert!(err.contains("500"), "error must name the status: {err}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "no retry after a 500");
     }
 }

@@ -6,6 +6,7 @@ mod fetch_guard;
 mod follow;
 mod modes;
 mod ping_window;
+mod podcastindex_api;
 mod pool;
 mod url_queue;
 
@@ -94,13 +95,13 @@ mod tests {
     }
 
     /// Proves ADR 0050 §1 and the phase plan decision 7 (`stophammer`
-    /// repository): `feed`, `refresh`, `gossip` and `import` each declare
+    /// repository): `feed`, `refresh`, `gossip`, `import` and `podcastindex` each declare
     /// `--feed-cache`, with env `FEED_CACHE_DB` and default
     /// `./feed_cache.db`.
     #[test]
     fn feed_cache_flag_has_the_expected_env_and_default_on_each_fetching_mode() {
         let command = Cli::command();
-        for mode in ["feed", "refresh", "gossip", "import"] {
+        for mode in ["feed", "refresh", "gossip", "import", "podcastindex"] {
             let subcommand = command
                 .find_subcommand(mode)
                 .unwrap_or_else(|| panic!("the {mode} subcommand must exist"));
@@ -152,6 +153,24 @@ mod tests {
                 "--{flag} must be global, so every mode can read it"
             );
         }
+    }
+
+    #[test]
+    fn podcastindex_parses_with_no_flags_and_the_default_api_base() {
+        let cli = Cli::try_parse_from(["stophammer-crawler", "podcastindex"])
+            .expect("podcastindex must parse with no flags");
+        let Mode::Podcastindex {
+            dry_run, api_base, ..
+        } = cli.mode
+        else {
+            panic!("expected the podcastindex subcommand");
+        };
+        assert!(!dry_run, "dry_run must default to false");
+        assert_eq!(
+            api_base,
+            crate::podcastindex_api::DEFAULT_API_BASE,
+            "the default api_base must be the PodcastIndex API"
+        );
     }
 
     #[test]
@@ -336,6 +355,52 @@ enum Mode {
         cursor: Option<i64>,
     },
 
+    /// Do one pass over the `PodcastIndex` music list (`stophammer` ADR 0081).
+    /// The pass sends each music feed that the node does not hold to the
+    /// `feed` pipeline. Set `PODCASTINDEX_API_KEY` and `PODCASTINDEX_API_SECRET`.
+    #[command(name = "podcastindex")]
+    Podcastindex {
+        /// Path to the import state database. It holds `music_list_attempts`
+        #[arg(long, default_value = "./import_state.db")]
+        state: String,
+
+        /// Path to the shared feed skip database. The pass writes each outcome
+        #[arg(long, default_value = "./feed_skip.db")]
+        skip_db: String,
+
+        /// Path to the shared fetch cache (ADR 0050 §1, `stophammer`
+        /// repository)
+        #[arg(long, env = "FEED_CACHE_DB", default_value = "./feed_cache.db")]
+        feed_cache: String,
+
+        /// Base URL of the `PodcastIndex` API. Use a local test server only
+        #[arg(
+            long,
+            env = "PODCASTINDEX_API_BASE",
+            default_value = podcastindex_api::DEFAULT_API_BASE
+        )]
+        api_base: String,
+
+        #[arg(long, env = "CONCURRENCY", default_value_t = 5, value_parser = parse_positive_usize)]
+        concurrency: usize,
+
+        /// Minimum spacing between fetches to the same host
+        #[arg(long, env = "HOST_DELAY_MS", default_value_t = 1500)]
+        host_delay_ms: u64,
+
+        /// Plain-text output file for retryable feed URLs
+        #[arg(
+            long,
+            env = "FAILED_FEEDS_OUTPUT",
+            default_value = "./failed_feeds.txt"
+        )]
+        failed_feeds_output: String,
+
+        /// Read both lists and print the report. Send no URL to the pipeline
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Replay cached NDJSON rows into stophammer without re-fetching feeds
     Ndjson {
         /// Path to cached feed NDJSON file
@@ -508,6 +573,30 @@ async fn main() {
                 feed_cache,
                 revalidate,
             )
+            .await;
+        }
+        Mode::Podcastindex {
+            state,
+            skip_db,
+            feed_cache,
+            api_base,
+            concurrency,
+            host_delay_ms,
+            failed_feeds_output,
+            dry_run,
+        } => {
+            modes::podcastindex::run(modes::podcastindex::PassOptions {
+                state,
+                skip_db,
+                feed_cache,
+                api_base,
+                concurrency,
+                host_delay_ms,
+                failed_feeds_output,
+                force,
+                revalidate,
+                dry_run,
+            })
             .await;
         }
         Mode::Ndjson {

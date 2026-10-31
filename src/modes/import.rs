@@ -1187,7 +1187,7 @@ fn initialize_state_schema(conn: &Connection) {
     }
 }
 
-fn open_state_connection(path: &str) -> Connection {
+pub(crate) fn open_state_connection(path: &str) -> Connection {
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1216,7 +1216,11 @@ fn set_last_processed_id(
     set_import_progress_value(conn, scope.cursor_key(), &id.to_string())
 }
 
-fn set_import_progress_value(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize> {
+pub(crate) fn set_import_progress_value(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+) -> rusqlite::Result<usize> {
     conn.execute(
         "INSERT INTO import_progress (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

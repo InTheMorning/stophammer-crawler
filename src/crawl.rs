@@ -13,6 +13,9 @@ use crate::fetch_guard;
 
 const HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
 
+/// The `User-Agent` value of a feed fetch, when no other value is set.
+pub const DEFAULT_USER_AGENT: &str = "stophammer-crawler/0.1";
+
 /// Shared fetch cache handle (ADR 0050 §1, `stophammer` repository).
 ///
 /// A mode opens one `FeedCacheDb` and shares this handle with every task
@@ -64,7 +67,7 @@ impl CrawlConfig {
             crawl_token: std::env::var("CRAWL_TOKEN").expect("CRAWL_TOKEN is required"),
             ingest_url: std::env::var("INGEST_URL")
                 .unwrap_or_else(|_| "http://localhost:8008/ingest/feed".to_string()),
-            user_agent: "stophammer-crawler/0.1".to_string(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
             fetch_timeout: Duration::from_secs(20),
             ingest_timeout,
             force_reingest,

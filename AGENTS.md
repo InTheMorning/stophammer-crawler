@@ -66,6 +66,13 @@ the cached node answer, and a later `304` skips the ingest. When the publisher
 removes the tag, the body changes, and the next `200` is submitted. A feed
 with a `source_blocked` answer gives no follow URL.
 
+[stophammer ADR 0081](../docs/adr/0081-a-daily-pass-reads-the-podcastindex-music-list.md)
+adds the `podcastindex` mode. The module `src/modes/podcastindex.rs` reads the
+PodcastIndex music list and the feed list of the node. It sends the missing
+music feeds through the `feed` pipeline, and a failed candidate waits 7 days.
+`import` keeps its schedule until the measurement of ADR 0081 section 10 is
+complete.
+
 The fetch cache keeps no row for a medium rejection or for an ingest answer
 of `413` (`CrawlOutcome::keeps_no_cache_row`). The skip list stops the next
 fetch of a non-music feed, and the node refuses a request body over 2 MiB each
@@ -82,8 +89,8 @@ during a corrective pass.
 
 - **This crawler is untrusted.** ADR 0006. The node verifies what this crate
   sends. Never move a check out of the node to save a request.
-- **Five modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip` and
-  `refresh`. `crawl` is an alias of `feed`. There is no `podping` mode. The
+- **Six modes**, in `src/modes/`: `feed`, `import`, `ndjson`, `gossip`,
+  `refresh` and `podcastindex`. `crawl` is an alias of `feed`. There is no `podping` mode. The
   `gossip` mode consumes the stream that carries podping notifications.
 - **A podping is never dropped.** [stophammer ADR
   0062](../docs/adr/0062-a-podping-is-never-dropped.md) owns the rule, and
