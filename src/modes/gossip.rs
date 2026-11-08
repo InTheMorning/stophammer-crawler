@@ -7,7 +7,9 @@ use rusqlite::{Connection, params};
 use std::sync::mpsc;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
+use crate::crawl::{
+    CrawlConfig, CrawlOutcome, CrawlReport, DEFAULT_USER_AGENT, FeedCache, crawl_feed_report,
+};
 use crate::dedup::Dedup;
 use crate::feed_cache::FeedCacheDb;
 use crate::feed_skip::is_index_medium;
@@ -27,6 +29,7 @@ use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS, host_key};
 /// §1), through the crate's `reqwest` features.
 pub(crate) fn create_async_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -47,6 +50,7 @@ pub(crate) fn create_async_client() -> reqwest::Client {
 /// (`stophammer` ADR 0072 §1).
 fn create_sse_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
         .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .no_gzip()

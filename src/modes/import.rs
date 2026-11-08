@@ -21,7 +21,9 @@ use stophammer_parser::types::{IngestFeedData, IngestPodcastNamespaceSnapshot};
 use tar::Archive;
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
 
-use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
+use crate::crawl::{
+    CrawlConfig, CrawlOutcome, CrawlReport, DEFAULT_USER_AGENT, FeedCache, crawl_feed_report,
+};
 use crate::feed_cache::FeedCacheDb;
 use crate::feed_skip::{is_index_medium, is_unparsed_channel_without_medium};
 use crate::modes::batch::build_feed_fetch_client;
@@ -1621,6 +1623,7 @@ fn download_snapshot_archive(
     if_modified_since: Option<SystemTime>,
 ) -> io::Result<SnapshotRefreshOutcome> {
     let client = reqwest::blocking::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
         .connect_timeout(Duration::from_secs(SNAPSHOT_CONNECT_TIMEOUT_SECS))
         // The snapshot is a `.tgz` archive. HTTP compression saves almost no
         // bytes here, and costs CPU on both sides (`stophammer` ADR 0072 §3).
@@ -1818,7 +1821,7 @@ pub async fn run(
 
     let config = Arc::new(if dry_run {
         CrawlConfig::dry_run(
-            "stophammer-crawler/0.1 (dry-run)",
+            DEFAULT_USER_AGENT,
             std::time::Duration::from_secs(IMPORT_FETCH_TIMEOUT_SECS),
         )
         .with_revalidate(revalidate)
@@ -2286,7 +2289,8 @@ mod tests {
 
     /// Proves ADR 0072 §3: the snapshot client sends no `Accept-Encoding`.
     /// The snapshot is a `.tgz` archive, so HTTP compression saves almost no
-    /// bytes and costs CPU on both sides.
+    /// bytes and costs CPU on both sides. It also proves that the client sends
+    /// the crawler `User-Agent`.
     #[test]
     fn download_snapshot_archive_sends_no_accept_encoding() {
         use std::io::{BufRead, BufReader, Write as _};
@@ -2329,6 +2333,13 @@ mod tests {
         assert!(
             !head.to_ascii_lowercase().contains("accept-encoding"),
             "request head sent accept-encoding: {head:?}"
+        );
+        assert!(
+            head.to_ascii_lowercase().contains(&format!(
+                "user-agent: {}",
+                crate::crawl::DEFAULT_USER_AGENT.to_ascii_lowercase()
+            )),
+            "the snapshot request must send the crawler User-Agent: {head:?}"
         );
     }
 

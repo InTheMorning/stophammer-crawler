@@ -241,7 +241,7 @@ pub async fn run(
 
     let config = Arc::new(if dry_run {
         CrawlConfig::dry_run(
-            "stophammer-crawler/0.1 (ndjson dry-run)",
+            crate::crawl::DEFAULT_USER_AGENT,
             std::time::Duration::from_secs(1),
         )
     } else {

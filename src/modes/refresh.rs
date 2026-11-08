@@ -323,7 +323,10 @@ pub async fn run(
 
     eprintln!("refresh: reading feed list from {origin}{FEEDS_RECENT_PATH}");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(crate::crawl::DEFAULT_USER_AGENT)
+        .build()
+        .expect("failed to build refresh HTTP client");
     let link_stats_client = client.clone();
     let link_stats_origin = origin.clone();
     let fetch_page = move |cursor: Option<String>| {

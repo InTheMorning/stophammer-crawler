@@ -3,7 +3,9 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::crawl::{CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, crawl_feed_report};
+use crate::crawl::{
+    CrawlConfig, CrawlOutcome, CrawlReport, DEFAULT_USER_AGENT, FeedCache, crawl_feed_report,
+};
 use crate::feed_cache::FeedCacheDb;
 use crate::follow::{FollowLevel, follow_urls_at_level};
 use crate::pool::run_pool;
@@ -39,6 +41,7 @@ pub(crate) struct UrlPass {
 /// §1). It pins the client to the address it resolved.
 pub(crate) fn build_feed_fetch_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(crate::fetch_guard::PublicOnlyResolver))
         .build()

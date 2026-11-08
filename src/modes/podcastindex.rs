@@ -593,7 +593,10 @@ pub async fn run(options: PassOptions) {
     let now = unix_now();
 
     let origin = query_origin_from_ingest_url(&ingest_url_from_env()).unwrap_or_else(|e| fail(&e));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .build()
+        .expect("failed to build podcastindex HTTP client");
 
     let list_client = client.clone();
     let api_base = options.api_base.clone();

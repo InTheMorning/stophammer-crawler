@@ -13,8 +13,14 @@ use crate::fetch_guard;
 
 const HTTP_ERROR_PREVIEW_LIMIT: usize = 160;
 
-/// The `User-Agent` value of a feed fetch, when no other value is set.
-pub const DEFAULT_USER_AGENT: &str = "stophammer-crawler/0.1";
+/// The `User-Agent` value of each request, when no other value is set. Some
+/// hosts refuse a request with no `User-Agent`: `files.catbox.moe` resets the
+/// connection, and `hogstory.net` gives `403`.
+pub const DEFAULT_USER_AGENT: &str = concat!(
+    "stophammer-crawler/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://musicindex.org)"
+);
 
 /// Shared fetch cache handle (ADR 0050 §1, `stophammer` repository).
 ///
@@ -113,6 +119,7 @@ impl CrawlConfig {
 
     fn build_ingest_client(timeout: Duration) -> reqwest::Client {
         reqwest::Client::builder()
+            .user_agent(DEFAULT_USER_AGENT)
             .pool_max_idle_per_host(0)
             .connect_timeout(timeout)
             .build()
