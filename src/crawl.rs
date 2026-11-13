@@ -951,6 +951,14 @@ fn plan_after_response(status: u16, cached: Option<&CachedFeed>, force: bool) ->
     }
 }
 
+/// Returns `true` when the fetch followed at least one redirect, and each
+/// hop was a permanent redirect, `301` or `308` (`stophammer` ADR 0052 §2).
+/// This is the redirect chain with which the node moves a record. A `302`,
+/// `303` or `307` hop gives `false`.
+fn followed_permanent_redirect(redirects: &[RedirectHop]) -> bool {
+    !redirects.is_empty() && redirects.iter().all(|hop| matches!(hop.status, 301 | 308))
+}
+
 /// The rejection reasons that mean the node holds no content for this URL
 /// under its own source URL, or that an operator decision on the URL may
 /// change with no changed body (`stophammer` ADR 0051 §5, ADR 0053 §1). The
@@ -1095,18 +1103,29 @@ async fn ingest_fresh_and_cache(
 }
 
 /// Submit the kept body for a `304` that must still reach the node (ADR
-/// 0050 §3, `stophammer` repository): a forced pass, or a row whose last
-/// answer does not prove the node holds this content.
+/// 0050 §3, `stophammer` repository): a forced pass, a row whose last
+/// answer does not prove the node holds this content, or a fetch that
+/// followed a permanent redirect.
+///
+/// When this fetch followed a redirect, the canonical URL is the URL at
+/// the end of the chain, `final_url`, as for a `200`. The node needs that
+/// URL to move the record (ADR 0052 §2). With no redirect, the canonical
+/// URL is the final URL of the kept row.
 async fn ingest_kept_body(
     url: &str,
+    final_url: Option<&str>,
     cached: &CachedFeed,
     config: &CrawlConfig,
     cache: Option<&FeedCache>,
     redirects: &[RedirectHop],
 ) -> CrawlReport {
+    let canonical_url = match final_url {
+        Some(end) if !redirects.is_empty() => end,
+        _ => cached.final_url.as_str(),
+    };
     let mut report = ingest_cached_feed_report(
         url,
-        &cached.final_url,
+        canonical_url,
         200,
         &cached.body,
         Some(&cached.content_sha256),
@@ -1312,7 +1331,17 @@ pub async fn crawl_feed_report(
         }
     };
 
-    match plan_after_response(status, conditional_row, config.force_reingest) {
+    // ADR 0050 §3, amended on 2026-11-13: a `304` after a permanent
+    // redirect submits the kept body, so the node sees the hops and moves
+    // the record (ADR 0052 §2).
+    let action = match plan_after_response(status, conditional_row, config.force_reingest) {
+        FetchAction::SkipIngest if followed_permanent_redirect(&redirects) => {
+            FetchAction::IngestKept
+        }
+        action => action,
+    };
+
+    match action {
         FetchAction::IngestFresh => {
             let mut report =
                 ingest_fresh_and_cache(url, final_url, &headers, &body, config, cache, &redirects)
@@ -1331,7 +1360,7 @@ pub async fn crawl_feed_report(
             let row = cached
                 .as_ref()
                 .expect("plan_after_response gives IngestKept only with a cached row");
-            ingest_kept_body(url, row, config, cache, &redirects).await
+            ingest_kept_body(url, final_url.as_deref(), row, config, cache, &redirects).await
         }
         FetchAction::SkipIngest => {
             let row = cached
@@ -3042,6 +3071,94 @@ pub(crate) mod tests {
             payload["redirects"],
             serde_json::json!([{"url": url_a, "status": 301}]),
             "the ingest payload must carry the hop of the conditional request that answered 304"
+        );
+    }
+
+    /// Proves ADR 0050 §3, amended on 2026-11-13 (`stophammer` repository):
+    /// a `304` after a `301` submits the kept body, even when the node has
+    /// answered for the row. The POST carries the hop and the URL at the
+    /// end of the chain, so the node can move the record (ADR 0052 §2).
+    #[tokio::test]
+    async fn a_301_then_a_304_with_a_node_answer_submits_the_kept_body_with_the_hop() {
+        let (addr_b, handle_b) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 301 Moved Permanently",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (ingest_addr, ingest_handle) = spawn_accepting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        seed_cached_row(&cache, &url_a, Some("accepted"));
+
+        let report = crawl_feed_report(&client, &url_a, &config, Some(&cache)).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+        let ingest_request = ingest_handle.await.expect("ingest stub task");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&ingest_request.body).expect("ingest payload must be JSON");
+        assert_eq!(
+            payload["redirects"],
+            serde_json::json!([{"url": url_a, "status": 301}]),
+            "a 304 after a permanent redirect must send the hop to the node"
+        );
+        assert_eq!(
+            payload["canonical_url"], url_b,
+            "the canonical URL must be the end of the redirect chain"
+        );
+        assert_eq!(payload["source_url"], url_a);
+        assert_eq!(
+            report.outcome,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new()
+            }
+        );
+    }
+
+    /// Proves the limit of the 2026-11-13 amendment of ADR 0050 §3
+    /// (`stophammer` repository): a `302` is not a permanent redirect, so a
+    /// `304` after it sends no ingest when the node has answered for the row.
+    #[tokio::test]
+    async fn a_302_then_a_304_with_a_node_answer_sends_no_ingest() {
+        let (addr_b, handle_b) =
+            spawn_stub(stub_response("HTTP/1.1 304 Not Modified", &[], b"")).await;
+        let url_b = format!("http://{addr_b}/feed.xml");
+
+        let (addr_a, handle_a) = spawn_stub(stub_response(
+            "HTTP/1.1 302 Found",
+            &[("location", &url_b)],
+            b"",
+        ))
+        .await;
+        let url_a = format!("http://{addr_a}/feed.xml");
+
+        let (ingest_addr, ingest_count, _ingest_handle) = spawn_counting_ingest_stub().await;
+
+        let client = no_redirect_client();
+        let config = test_config(format!("http://{ingest_addr}/ingest/feed"));
+        let cache = test_cache();
+        seed_cached_row(&cache, &url_a, Some("accepted"));
+
+        let report = crawl_feed_report(&client, &url_a, &config, Some(&cache)).await;
+
+        handle_a.await.expect("stub a task");
+        handle_b.await.expect("stub b task");
+
+        assert_eq!(report.outcome, CrawlOutcome::NoChange);
+        assert_eq!(
+            ingest_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a 304 after a 302 must send no ingest"
         );
     }
 
