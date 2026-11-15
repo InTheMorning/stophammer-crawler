@@ -64,6 +64,7 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+from xml.etree import ElementTree
 
 
 def open_read_only(path):
@@ -103,12 +104,37 @@ BAD_NODE_ADDRESS = (
     "(length(address) <> 66 OR address GLOB '*[^0-9a-fA-F]*')"
 )
 
-VALUE_TAG = re.compile(r"<[A-Za-z0-9_.-]+:value\b[^>]*>")
+# The start tag of a `value` or `valueRecipient` element, with a prefix or
+# with none. Only a body that is not well-formed XML uses these patterns.
+VALUE_TAG = re.compile(r"<(?:[A-Za-z0-9_.-]+:)?value\b[^>]*>")
+RECIPIENT_TAG = re.compile(r"<(?:[A-Za-z0-9_.-]+:)?valueRecipient\b[^>]*>")
 TYPE_ATTRIBUTE = re.compile(r"""\btype\s*=\s*["']([^"']*)["']""")
-RECIPIENT_TYPE_LIGHTNING = re.compile(
-    r"""<[A-Za-z0-9_.-]+:valueRecipient\b[^>]*\btype\s*=\s*["']\s*lightning\s*["']""",
-    re.IGNORECASE,
-)
+COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def element_types(raw_xml, name):
+    """Give the `type` text of each podcast namespace element with this name.
+
+    An element with no `type` gives an empty text. The text is trimmed and in
+    lowercase, as the parser gives it (stophammer ADR 0098 section 1).
+    """
+    try:
+        root = ElementTree.fromstring(raw_xml)
+    except (ElementTree.ParseError, ValueError):
+        pattern = VALUE_TAG if name == "value" else RECIPIENT_TAG
+        types = []
+        for tag in pattern.findall(COMMENT.sub("", raw_xml)):
+            found = TYPE_ATTRIBUTE.search(tag)
+            types.append(found.group(1).strip().lower() if found else "")
+        return types
+    types = []
+    for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue
+        namespace, _, local = element.tag.rpartition("}")
+        if local == name and "podcast" in namespace.lower():
+            types.append(element.get("type", "").strip().lower())
+    return types
 
 
 def load_bad_node_address_feeds(node_db):
@@ -136,14 +162,10 @@ def has_other_value_block(raw_xml):
     stophammer ADR 0098 section 6, the second set of the refill pass. A block
     with no `type` or an empty `type` is a `lightning` block (section 1).
     """
-    for tag in VALUE_TAG.findall(raw_xml):
-        found = TYPE_ATTRIBUTE.search(tag)
-        if found is None:
-            continue
-        block_type = found.group(1).strip().lower()
-        if block_type and block_type != "lightning":
-            return True
-    return False
+    return any(
+        block_type not in ("", "lightning")
+        for block_type in element_types(raw_xml, "value")
+    )
 
 
 def cache_rows(cache_db, since):
@@ -215,7 +237,7 @@ def export(
                 counts["hash_mismatch_exported"] += 1
             feed_guid, title = source
             if value_blocks:
-                if RECIPIENT_TYPE_LIGHTNING.search(raw_xml):
+                if "lightning" in element_types(raw_xml, "valueRecipient"):
                     counts["feeds_with_recipient_type_lightning"] += 1
                 bad_node = feed_guid in bad_node_feeds
                 other_block = has_other_value_block(raw_xml)
