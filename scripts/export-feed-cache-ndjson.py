@@ -27,6 +27,19 @@ This fills the item titles and the image of ADR 0058 section 1c with no
 request to a feed host. The `--copies` rows need `--force`, as the
 `--self-links` rows do.
 
+With `--value-blocks`, the script exports the feeds of the refill pass of
+stophammer ADR 0098 section 6. It exports a row at a source URL only when one
+of these conditions is true:
+
+- The feed has a stored `node` route with an address that is not 66
+  hexadecimal characters.
+- The body has a `podcast:value` block with a `type` that is not `lightning`.
+
+It also counts the feeds with a recipient of `type="lightning"`. The parser
+keeps that text, and `payment_routes` then does not give the recipient. The
+script does not export a feed for this count only. The `--value-blocks` rows
+need `--force`, because the body did not change.
+
 Both databases are opened read-only. The script writes only the output file.
 
 Usage:
@@ -34,7 +47,7 @@ Usage:
       --cache /data/feed_cache.db \\
       --node-db /data/stophammer.db \\
       --output /data/repair.ndjson \\
-      [--since UNIX_SECONDS] [--self-links | --copies]
+      [--since UNIX_SECONDS] [--self-links | --copies | --value-blocks]
 
 Then:
   stophammer-crawler --force ndjson --input /data/repair.ndjson \\
@@ -47,6 +60,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -83,6 +97,55 @@ def load_copy_feeds(node_db):
     return {url: (guid, title) for url, guid, title in rows}
 
 
+# A `node` route that is not a Lightning public key (ADR 0098 section 4).
+BAD_NODE_ADDRESS = (
+    "route_type = 'node' AND "
+    "(length(address) <> 66 OR address GLOB '*[^0-9a-fA-F]*')"
+)
+
+VALUE_TAG = re.compile(r"<[A-Za-z0-9_.-]+:value\b[^>]*>")
+TYPE_ATTRIBUTE = re.compile(r"""\btype\s*=\s*["']([^"']*)["']""")
+RECIPIENT_TYPE_LIGHTNING = re.compile(
+    r"""<[A-Za-z0-9_.-]+:valueRecipient\b[^>]*\btype\s*=\s*["']\s*lightning\s*["']""",
+    re.IGNORECASE,
+)
+
+
+def load_bad_node_address_feeds(node_db):
+    """Give the feed_guid of each feed with a `node` route that is no public key.
+
+    stophammer ADR 0098 section 6, the first set of the refill pass.
+    """
+    queries = (
+        f"SELECT DISTINCT feed_guid FROM payment_routes WHERE {BAD_NODE_ADDRESS}",
+        f"SELECT DISTINCT feed_guid FROM feed_payment_routes WHERE {BAD_NODE_ADDRESS}",
+        f"SELECT DISTINCT feed_guid FROM feed_list_value_raw WHERE {BAD_NODE_ADDRESS}",
+        "SELECT DISTINCT s.source_feed_guid FROM value_time_split_recipients r "
+        "JOIN value_time_splits s ON s.id = r.split_id "
+        f"WHERE r.{BAD_NODE_ADDRESS.replace('address', 'r.address')}",
+    )
+    guids = set()
+    for query in queries:
+        guids.update(guid for (guid,) in node_db.execute(query) if guid)
+    return guids
+
+
+def has_other_value_block(raw_xml):
+    """Tell if a `podcast:value` block has a `type` that is not `lightning`.
+
+    stophammer ADR 0098 section 6, the second set of the refill pass. A block
+    with no `type` or an empty `type` is a `lightning` block (section 1).
+    """
+    for tag in VALUE_TAG.findall(raw_xml):
+        found = TYPE_ATTRIBUTE.search(tag)
+        if found is None:
+            continue
+        block_type = found.group(1).strip().lower()
+        if block_type and block_type != "lightning":
+            return True
+    return False
+
+
 def cache_rows(cache_db, since):
     """Yield (url, final_url, content_sha256, body_gzip, fetched_at), by URL."""
     query = (
@@ -92,7 +155,15 @@ def cache_rows(cache_db, since):
     yield from cache_db.execute(query, (since,))
 
 
-def export(cache_path, node_db_path, output_path, since, self_links=False, copies=False):
+def export(
+    cache_path,
+    node_db_path,
+    output_path,
+    since,
+    self_links=False,
+    copies=False,
+    value_blocks=False,
+):
     """Write one NDJSON row for each cache row at a source URL. Return counts."""
     counts = {
         "cache_rows": 0,
@@ -101,6 +172,12 @@ def export(cache_path, node_db_path, output_path, since, self_links=False, copie
         "skipped_undecodable": 0,
         "hash_mismatch_exported": 0,
     }
+    if value_blocks:
+        counts["bad_node_address_feeds_in_node_db"] = 0
+        counts["selected_bad_node_address"] = 0
+        counts["selected_other_value_block"] = 0
+        counts["skipped_no_value_block_change"] = 0
+        counts["feeds_with_recipient_type_lightning"] = 0
     node_db = open_read_only(node_db_path)
     cache_db = open_read_only(cache_path)
     if copies:
@@ -109,6 +186,10 @@ def export(cache_path, node_db_path, output_path, since, self_links=False, copie
         sources = load_self_link_feeds(node_db)
     else:
         sources = load_source_feeds(node_db)
+    bad_node_feeds = set()
+    if value_blocks:
+        bad_node_feeds = load_bad_node_address_feeds(node_db)
+        counts["bad_node_address_feeds_in_node_db"] = len(bad_node_feeds)
     node_db.close()
 
     with open(output_path, "w", encoding="utf-8") as out:
@@ -133,6 +214,18 @@ def export(cache_path, node_db_path, output_path, since, self_links=False, copie
             if hashlib.sha256(body_bytes).hexdigest() != content_sha256:
                 counts["hash_mismatch_exported"] += 1
             feed_guid, title = source
+            if value_blocks:
+                if RECIPIENT_TYPE_LIGHTNING.search(raw_xml):
+                    counts["feeds_with_recipient_type_lightning"] += 1
+                bad_node = feed_guid in bad_node_feeds
+                other_block = has_other_value_block(raw_xml)
+                if not bad_node and not other_block:
+                    counts["skipped_no_value_block_change"] += 1
+                    continue
+                if bad_node:
+                    counts["selected_bad_node_address"] += 1
+                if other_block:
+                    counts["selected_other_value_block"] += 1
             row = {
                 "source_db": {"feed_guid": feed_guid, "feed_url": url, "title": title},
                 "fetch": {
@@ -173,10 +266,21 @@ def main():
         action="store_true",
         help="export the rows at the URL of a feed copy (ADR 0058 section 1c)",
     )
+    selection.add_argument(
+        "--value-blocks",
+        action="store_true",
+        help="export the feeds of the refill pass of ADR 0098 section 6",
+    )
     args = parser.parse_args()
 
     counts = export(
-        args.cache, args.node_db, args.output, args.since, args.self_links, args.copies
+        args.cache,
+        args.node_db,
+        args.output,
+        args.since,
+        args.self_links,
+        args.copies,
+        args.value_blocks,
     )
     for key, value in counts.items():
         print(f"{key}: {value}", file=sys.stderr)
