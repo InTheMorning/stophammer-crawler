@@ -1,7 +1,8 @@
 //! Finds the feed the crawler follows next after a publisher link.
 //!
-//! ADR 0049 §2 (in the `stophammer` repository) owns this decision. A music
-//! feed names its publisher feed. A publisher feed lists its music feeds.
+//! ADR 0049 §2 (in the `stophammer` repository) owns this decision, and
+//! `stophammer` ADR 0101 §2 and §3 change it. A music feed names its publisher
+//! feed. A publisher feed lists its music and `musicL` feeds.
 //! [`follow_urls`] gives the URLs on the other side of that link, for one
 //! feed. It reads only channel-level `podcast:remoteItem` references; an
 //! item-level reference, on a track, never comes back.
@@ -22,8 +23,8 @@ pub enum FollowLevel {
     /// to.
     Input,
     /// Reached through step 1: a music feed named this feed as its
-    /// publisher. Its own `medium="music"` links (step 2) count, but only
-    /// when this feed parses as a publisher feed.
+    /// publisher. Its own `music` and `musicL` links count only when this
+    /// feed parses as a publisher feed (`stophammer` ADR 0101 §2).
     Publisher,
     /// Reached through step 2: a publisher feed listed this feed as an
     /// album. No link of this feed counts. ADR 0049 §2 step 3 stops the
@@ -31,7 +32,7 @@ pub enum FollowLevel {
     Listed,
 }
 
-/// Gives the follow URLs of `feed`, filtered by the level it was fetched at
+/// Gives the follow URLs of `feed`, filtered by its fetch level
 /// (ADR 0049 §2, `stophammer` repository).
 ///
 /// `fetched_url` is the URL the crawler fetched to get `feed`. [`follow_urls`]
@@ -40,9 +41,9 @@ pub enum FollowLevel {
 ///
 /// [`FollowLevel::Input`] gives every URL [`follow_urls`] gives.
 /// [`FollowLevel::Publisher`] gives those URLs only when `feed`'s
-/// `raw_medium` is `publisher`, ASCII case ignored. A feed that does not
-/// parse as a publisher feed gives nothing at this level, even when it
-/// carries a link of its own. [`FollowLevel::Listed`] always gives nothing.
+/// `raw_medium` is `publisher`, ASCII case ignored. A publisher feed gives
+/// its `music` and `musicL` links. A `musicL` feed gives nothing at this
+/// level, even when it has a publisher reference. `Listed` gives nothing.
 #[must_use]
 pub fn follow_urls_at_level(
     feed: &IngestFeedData,
@@ -79,11 +80,11 @@ pub const MAX_FOLLOW_URLS_PER_LIST_FEED: usize = 1_000;
 /// A feed whose `raw_medium` is `music`, ignoring ASCII case, gives the
 /// `remote_feed_url` of each channel-level remote item whose `medium` is
 /// `publisher`. A feed whose `raw_medium` is `publisher` gives the
-/// `remote_feed_url` of each channel-level remote item whose `medium` is
-/// `music`. A feed whose `raw_medium` is `musicL` gives the `remote_feed_url`
-/// of each channel-level remote item whose `medium` is `music` or has no
-/// `medium`. Any other medium, including none, gives none of these links.
-/// (`stophammer` ADR 0060 §5 for list feeds.)
+/// `remote_feed_url` of each channel item with medium `music` or `musicL`.
+/// A `musicL` feed gives each item with medium `music`, no medium, or its
+/// publisher reference. It gives no other item with medium `publisher`.
+/// These rules follow `stophammer` ADR 0101 §2 and §3. Other feed media give
+/// no such links.
 ///
 /// An item's own `medium` comparison also ignores ASCII case, so
 /// `medium="Music"` counts. An item with no URL, or a URL whose scheme is
@@ -153,27 +154,33 @@ fn all_follow_urls(feed: &IngestFeedData, fetched_url: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut urls = Vec::new();
 
-    // Which item mediums a feed of this medium follows. A `musicL` feed
-    // also follows an item with no `medium` (ADR 0060 §5).
-    let (target_medium, list_feed) = match feed.raw_medium.as_deref() {
-        Some(medium) if medium.eq_ignore_ascii_case("music") => (Some("publisher"), false),
-        Some(medium) if medium.eq_ignore_ascii_case("publisher") => (Some("music"), false),
-        Some(medium) if medium.eq_ignore_ascii_case("musicL") => (Some("music"), true),
-        _ => (None, false),
-    };
+    let feed_medium = feed.raw_medium.as_deref();
+    let is_music_feed = feed_medium.is_some_and(|medium| medium.eq_ignore_ascii_case("music"));
+    let is_publisher_feed =
+        feed_medium.is_some_and(|medium| medium.eq_ignore_ascii_case("publisher"));
+    let list_feed = feed_medium.is_some_and(|medium| medium.eq_ignore_ascii_case("musicL"));
 
-    if let Some(target_medium) = target_medium {
+    if is_music_feed || is_publisher_feed || list_feed {
         let mut items_with_no_url = 0_usize;
         for item in &feed.remote_items {
             let accepted = match item.medium.as_deref() {
-                Some(medium) => medium.eq_ignore_ascii_case(target_medium),
+                Some(medium) if is_music_feed => medium.eq_ignore_ascii_case("publisher"),
+                Some(medium) if is_publisher_feed => {
+                    medium.eq_ignore_ascii_case("music") || medium.eq_ignore_ascii_case("musicL")
+                }
+                Some(medium) if list_feed => {
+                    medium.eq_ignore_ascii_case("music") || item.publisher_reference
+                }
                 None => list_feed,
+                Some(_) => false,
             };
             if !accepted {
                 continue;
             }
             let Some(url) = item.remote_feed_url.as_deref() else {
-                items_with_no_url += 1;
+                if !item.publisher_reference {
+                    items_with_no_url += 1;
+                }
                 continue;
             };
             if !is_followable_url(url) {
@@ -328,6 +335,42 @@ mod tests {
     }
 
     #[test]
+    fn a_publisher_feed_gives_music_and_musicl_urls_in_item_order() {
+        let data = feed(
+            Some("publisher"),
+            vec![
+                remote_item(0, Some("music"), Some("https://a.example/feed.xml")),
+                remote_item(1, Some("musicL"), Some("https://b.example/feed.xml")),
+            ],
+        );
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec![
+                "https://a.example/feed.xml".to_string(),
+                "https://b.example/feed.xml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_publisher_feed_accepts_musicl_with_ascii_case_ignored() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(
+                0,
+                Some("MusicL"),
+                Some("https://list.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls(&data, FETCHED_URL),
+            vec!["https://list.example/feed.xml".to_string()]
+        );
+    }
+
+    #[test]
     fn the_feed_medium_comparison_ignores_ascii_case() {
         let data = feed(
             Some("MUSIC"),
@@ -396,20 +439,29 @@ mod tests {
     }
 
     #[test]
-    fn a_musicl_feed_with_a_publisher_item_gives_nothing_for_it() {
+    fn a_musicl_feed_follows_only_its_publisher_reference() {
+        let mut publisher_reference = remote_item(
+            0,
+            Some("publisher"),
+            Some("https://publisher.example/feed.xml"),
+        );
+        publisher_reference.publisher_reference = true;
         let data = feed(
             Some("musicL"),
-            vec![remote_item(
-                0,
-                Some("publisher"),
-                Some("https://publisher.example/feed.xml"),
-            )],
+            vec![
+                publisher_reference,
+                remote_item(
+                    1,
+                    Some("publisher"),
+                    Some("https://other-publisher.example/feed.xml"),
+                ),
+            ],
         );
 
         assert_eq!(
             follow_urls(&data, FETCHED_URL),
-            Vec::<String>::new(),
-            "a musicL feed must not give URLs from publisher items (ADR 0060 §5)"
+            vec!["https://publisher.example/feed.xml".to_string()],
+            "a musicL feed follows its marked publisher reference only (stophammer ADR 0101 §3)"
         );
     }
 
@@ -569,6 +621,23 @@ mod tests {
     }
 
     #[test]
+    fn a_publisher_level_publisher_feed_gives_its_musicl_urls() {
+        let data = feed(
+            Some("publisher"),
+            vec![remote_item(
+                0,
+                Some("musicL"),
+                Some("https://list.example/feed.xml"),
+            )],
+        );
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
+            vec!["https://list.example/feed.xml".to_string()]
+        );
+    }
+
+    #[test]
     fn a_publisher_level_music_feed_that_names_a_publisher_gives_nothing() {
         let data = feed(
             Some("music"),
@@ -583,6 +652,22 @@ mod tests {
             follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
             Vec::<String>::new(),
             "FollowLevel::Publisher must give nothing when the fetched feed is not a publisher feed (ADR 0060 §5)"
+        );
+    }
+
+    #[test]
+    fn a_musicl_feed_at_publisher_level_gives_nothing_with_a_publisher_reference() {
+        let mut publisher_reference = remote_item(
+            0,
+            Some("publisher"),
+            Some("https://publisher.example/feed.xml"),
+        );
+        publisher_reference.publisher_reference = true;
+        let data = feed(Some("musicL"), vec![publisher_reference]);
+
+        assert_eq!(
+            follow_urls_at_level(&data, FollowLevel::Publisher, FETCHED_URL),
+            Vec::<String>::new()
         );
     }
 

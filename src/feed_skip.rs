@@ -157,10 +157,15 @@ impl FeedSkipDb {
             return Some(format!("known non-music medium: {m}"));
         }
 
-        // Prior medium-gate rejection
+        // Prior medium-gate rejection. A publisher feed that the node rejected
+        // before can pass now, because it can list only playlists
+        // (`stophammer` ADR 0101 §4). So its URL is not skipped.
         if matches!(outcome.as_str(), "rejected" | "skipped_known_irrelevant")
             && let Some(ref r) = reason
             && r.starts_with("[medium_music]")
+            && !medium
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("publisher"))
         {
             return Some(format!("prior medium-gate rejection: {r}"));
         }
@@ -327,6 +332,28 @@ mod tests {
             .should_skip("https://example.com/feed.xml", None)
             .expect("should skip");
         assert!(reason.contains("prior medium-gate rejection"));
+    }
+
+    #[test]
+    fn does_not_skip_publisher_after_medium_music_rejection() {
+        let db = FeedSkipDb::open(&temp_db());
+        let report = report_with(
+            CrawlOutcome::Rejected {
+                reason: "[medium_music] publisher feed has no remoteItem with medium='music'"
+                    .into(),
+                warnings: vec![],
+            },
+            Some(200),
+            Some("publisher"),
+            None,
+        );
+        db.record_outcome("https://example.com/feed.xml", &report, "test");
+
+        assert_eq!(
+            db.should_skip("https://example.com/feed.xml", None),
+            None,
+            "a publisher can list a playlist after this rejection (stophammer ADR 0101 §4)"
+        );
     }
 
     #[test]
