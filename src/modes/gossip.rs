@@ -825,7 +825,7 @@ async fn run_follow_fetch(
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
     let report = crawl_feed_report(&client, &url, &config, Some(&cache)).await;
-    host_throttle.release(&lease, Duration::ZERO).await;
+    host_throttle.release(&lease, &report, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     // ADR 0049 §2 (`stophammer` repository): read the level-2 follow URLs
@@ -888,7 +888,7 @@ async fn run_leaf_follow_fetch(
     let lease = host_throttle.acquire(&url).await;
     let start = Instant::now();
     let report = crawl_feed_report(&client, &url, &config, Some(&cache)).await;
-    host_throttle.release(&lease, Duration::ZERO).await;
+    host_throttle.release(&lease, &report, Duration::ZERO).await;
     let duration_ms = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     record_follow_outcome(&url, &report, duration_ms, quiet, &skip_db, &progress);

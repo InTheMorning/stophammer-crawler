@@ -571,7 +571,20 @@ fn parse_retry_after_secs(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| {
+            value.parse::<u64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(value)
+                    .ok()
+                    .map(|date| {
+                        u64::try_from(
+                            date.signed_duration_since(chrono::Utc::now())
+                                .num_seconds()
+                                .max(0),
+                        )
+                        .unwrap_or_default()
+                    })
+            })
+        })
 }
 
 fn normalize_rejection_reason(
@@ -1397,7 +1410,8 @@ pub(crate) mod tests {
         build_crawl_report, crawl_feed_report, fetch_following_redirects, format_http_fetch_error,
         format_ingest_http_error, if_none_match_value, is_retryable_http_status,
         is_retryable_ingest_status, is_uncached_node_answer, node_rate_limit_wait,
-        normalize_rejection_reason, parse_feed_xml, plan_after_response, post_ingest_payload,
+        normalize_rejection_reason, parse_feed_xml, parse_retry_after_secs, plan_after_response,
+        post_ingest_payload,
     };
     use crate::feed_cache::{FeedCacheDb, FetchedFeed};
     use reqwest::StatusCode;
@@ -2729,6 +2743,34 @@ pub(crate) mod tests {
             Duration::from_secs(NODE_RATE_LIMIT_MAX_WAIT_SECS),
             "a long Retry-After is capped"
         );
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("5"));
+        assert_eq!(parse_retry_after_secs(&headers), Some(5));
+
+        let future = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&future.to_rfc2822()).expect("valid Retry-After date"),
+        );
+        let seconds = parse_retry_after_secs(&headers).expect("date Retry-After parses");
+        assert!((59..=60).contains(&seconds));
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&past.to_rfc2822()).expect("valid past Retry-After date"),
+        );
+        assert_eq!(parse_retry_after_secs(&headers), Some(0));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("soon"));
+        assert_eq!(parse_retry_after_secs(&headers), None);
     }
 
     /// A `429` from the node sends the same POST again, so a rate limit

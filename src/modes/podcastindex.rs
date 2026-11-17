@@ -57,6 +57,14 @@ pub(crate) fn comparable_url(url: &str) -> String {
     }
 }
 
+/// Return the host of a compared URL (stophammer ADR 0104 §2).
+fn url_host(compared: &str) -> String {
+    compared
+        .split_once('/')
+        .map_or(compared, |(host, _)| host)
+        .to_lowercase()
+}
+
 /// The result of the comparison (ADR 0081 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Classification {
@@ -64,18 +72,29 @@ pub(crate) struct Classification {
     pub(crate) held: usize,
     /// The rows that the node does not hold, in the sequence of the list.
     pub(crate) candidates: Vec<MusicListRow>,
+    /// URL differences held for operator review (stophammer ADR 0104 §2).
+    pub(crate) url_differences: Vec<UrlDifference>,
 }
 
-/// Classify each row as held or as a candidate (ADR 0081 §4).
+/// A held list row whose URL has a different host (stophammer ADR 0104 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UrlDifference {
+    pub(crate) podcastindex_id: i64,
+    pub(crate) feed_guid: String,
+    pub(crate) node_url: String,
+    pub(crate) list_url: String,
+}
+
+/// Classify each row as held, a candidate, or a URL difference (stophammer ADR 0104 §2).
 ///
 /// A row is held when its `podcast_guid` matches a `feed_guid` of the node
 /// with no regard to letter case. A row is also held when its
 /// `comparable_url` matches that of a node feed. A row with no
 /// `podcast_guid` is compared by URL only.
 pub(crate) fn classify(rows: Vec<MusicListRow>, node: &[NodeFeed]) -> Classification {
-    let guids: HashSet<String> = node
+    let feeds_by_guid: HashMap<String, &NodeFeed> = node
         .iter()
-        .map(|feed| feed.feed_guid.to_lowercase())
+        .map(|feed| (feed.feed_guid.to_lowercase(), feed))
         .collect();
     let urls: HashSet<String> = node
         .iter()
@@ -84,18 +103,38 @@ pub(crate) fn classify(rows: Vec<MusicListRow>, node: &[NodeFeed]) -> Classifica
 
     let mut held = 0;
     let mut candidates = Vec::new();
+    let mut url_differences = Vec::new();
     for row in rows {
-        let by_guid = row
+        let node_feed = row
             .podcast_guid
             .as_ref()
-            .is_some_and(|guid| guids.contains(&guid.to_lowercase()));
+            .and_then(|guid| feeds_by_guid.get(&guid.to_lowercase()).copied());
+        let by_guid = node_feed.is_some();
+        if let Some(feed) = node_feed {
+            let list_url = comparable_url(&row.url);
+            let node_url = comparable_url(&feed.feed_url);
+            let list_host = url_host(&list_url);
+            let node_host = url_host(&node_url);
+            if list_url != node_url && list_host != node_host {
+                url_differences.push(UrlDifference {
+                    podcastindex_id: row.id,
+                    feed_guid: feed.feed_guid.clone(),
+                    node_url: feed.feed_url.clone(),
+                    list_url: row.url.clone(),
+                });
+            }
+        }
         if by_guid || urls.contains(&comparable_url(&row.url)) {
             held += 1;
         } else {
             candidates.push(row);
         }
     }
-    Classification { held, candidates }
+    Classification {
+        held,
+        candidates,
+        url_differences,
+    }
 }
 
 /// How long a failed candidate waits, in seconds (ADR 0081 §5).
@@ -150,6 +189,13 @@ impl AttemptStore {
                 podcastindex_id INTEGER NOT NULL,
                 feed_url        TEXT NOT NULL,
                 PRIMARY KEY (pass_at, podcastindex_id)
+            );
+            CREATE TABLE IF NOT EXISTS music_list_url_differences (
+                podcastindex_id INTEGER PRIMARY KEY,
+                feed_guid TEXT NOT NULL,
+                node_url TEXT NOT NULL,
+                list_url TEXT NOT NULL,
+                pass_at INTEGER NOT NULL
             );",
         )
         .expect("failed to create the podcastindex tables");
@@ -296,6 +342,31 @@ impl AttemptStore {
         }
         tx.commit()
     }
+
+    /// Replace the URL differences from the last pass (stophammer ADR 0104 §3).
+    pub(crate) fn replace_url_differences(
+        &self,
+        now: i64,
+        rows: &[UrlDifference],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM music_list_url_differences", [])?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO music_list_url_differences
+                     (podcastindex_id, feed_guid, node_url, list_url, pass_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.podcastindex_id,
+                    row.feed_guid,
+                    row.node_url,
+                    row.list_url,
+                    now
+                ],
+            )?;
+        }
+        tx.commit()
+    }
 }
 
 /// The most lines of counted rows that one pass prints.
@@ -379,6 +450,8 @@ pub(crate) fn check_limits(rows: usize, due: usize) -> Result<(), String> {
 }
 
 /// The numbers of one pass (ADR 0081 §8).
+///
+/// Example: `podcastindex: rows=8601 held=8403 candidates=198 url_differences=2 waiting=142 sent=56` (stophammer ADR 0104 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassReport {
     /// The rows of the music list.
@@ -387,6 +460,8 @@ pub(crate) struct PassReport {
     pub(crate) held: usize,
     /// The rows that the node does not hold, with those that wait.
     pub(crate) candidates: usize,
+    /// The held rows on another host (stophammer ADR 0104 §4).
+    pub(crate) url_differences: usize,
     /// The candidates that wait after a failed try.
     pub(crate) waiting: usize,
     /// The candidates that went to the pipeline.
@@ -402,8 +477,8 @@ impl fmt::Display for PassReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "podcastindex: rows={} held={} candidates={} waiting={} sent={}",
-            self.rows, self.held, self.candidates, self.waiting, self.sent
+            "podcastindex: rows={} held={} candidates={} url_differences={} waiting={} sent={}",
+            self.rows, self.held, self.candidates, self.url_differences, self.waiting, self.sent
         )?;
         for label in ["accepted", "rejected"] {
             write!(f, " {label}={}", self.outcomes.get(label).unwrap_or(&0))?;
@@ -466,6 +541,7 @@ fn candidate_sink(
 /// the sink for each fetch. A failed read or a limit error gives `Err` before
 /// `pipeline` runs. With `dry_run` set, `pipeline` does not run.
 ///
+/// The report includes URL differences held on another host (stophammer ADR 0104 §4).
 /// The pipeline gets `Vec<String>` and no API field (ADR 0081 §3).
 async fn run_pass<L, LFut, N, NFut, P, PFut>(
     store: &Arc<Mutex<AttemptStore>>,
@@ -488,7 +564,11 @@ where
     let list_ids: HashSet<i64> = list.iter().map(|row| row.id).collect();
     let node = read_node().await?;
 
-    let Classification { held, candidates } = classify(list, &node);
+    let Classification {
+        held,
+        candidates,
+        url_differences,
+    } = classify(list, &node);
     let total_candidates = candidates.len();
     let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
     let attempts = store
@@ -498,12 +578,28 @@ where
         .map_err(|err| format!("could not read the earlier tries: {err}"))?;
     let (due, waiting) = split_waiting(candidates, &attempts, now);
     check_limits(rows, due.len())?;
+    {
+        let guard = store.lock().expect("attempt store mutex poisoned");
+        guard
+            .replace_url_differences(now, &url_differences)
+            .map_err(|err| format!("could not replace URL differences: {err}"))?;
+    }
+    for difference in &url_differences {
+        eprintln!(
+            "podcastindex: url difference id={} guid={} node={} list={}",
+            difference.podcastindex_id,
+            difference.feed_guid,
+            difference.node_url,
+            difference.list_url
+        );
+    }
     let import_gap = measure_import_gap(store, now, &list_ids)?;
 
     let mut report = PassReport {
         rows,
         held,
         candidates: total_candidates,
+        url_differences: url_differences.len(),
         waiting,
         sent: 0,
         outcomes: BTreeMap::new(),
@@ -647,8 +743,8 @@ pub async fn run(options: PassOptions) {
 mod tests {
     use super::{
         Attempt, AttemptStore, MAX_DUE_CANDIDATES, MAX_LIST_ROWS, MIN_LIST_ROWS, NodeFeed,
-        PassReport, RETRY_WAIT_SECS, check_limits, classify, comparable_url, count_import_gap,
-        run_pass, split_waiting, waits,
+        PassReport, RETRY_WAIT_SECS, UrlDifference, check_limits, classify, comparable_url,
+        count_import_gap, run_pass, split_waiting, waits,
     };
     use crate::crawl::{CrawlOutcome, CrawlReport};
     use crate::podcastindex_api::MusicListRow;
@@ -701,6 +797,72 @@ mod tests {
         let result = classify(rows, &nodes);
         assert_eq!(result.held, 1, "the GUID must hold the row");
         assert!(result.candidates.is_empty(), "no candidate must remain");
+    }
+
+    #[test]
+    fn another_host_for_a_held_guid_gives_a_url_difference() {
+        let result = classify(
+            vec![row(
+                17,
+                "https://epochradio.com/feed/tony-salomone-free",
+                Some("ABCDEF01-0000"),
+            )],
+            &[node("abcdef01-0000", "https://feeds.rssblue.com/free")],
+        );
+        assert_eq!(result.held, 1, "the GUID must hold the row");
+        assert_eq!(result.url_differences.len(), 1, "record the host change");
+        assert_eq!(result.url_differences[0].podcastindex_id, 17);
+        assert_eq!(result.url_differences[0].feed_guid, "abcdef01-0000");
+        assert_eq!(
+            result.url_differences[0].node_url,
+            "https://feeds.rssblue.com/free"
+        );
+        assert_eq!(
+            result.url_differences[0].list_url,
+            "https://epochradio.com/feed/tony-salomone-free"
+        );
+    }
+
+    #[test]
+    fn wavlake_url_forms_with_same_host_are_not_a_difference() {
+        let result = classify(
+            vec![row(1, "https://wavlake.com/feed/1234", Some("g1"))],
+            &[node("g1", "https://wavlake.com/feed/music/1234")],
+        );
+        assert_eq!(result.held, 1, "the GUID must hold the row");
+        assert!(result.url_differences.is_empty(), "the hosts match");
+    }
+
+    #[test]
+    fn normalized_scheme_www_and_trailing_slash_are_not_differences() {
+        for (list_url, node_url) in [
+            ("http://example.com/feed", "https://example.com/feed"),
+            ("https://www.example.com/feed", "https://example.com/feed"),
+            ("https://example.com/feed/", "https://example.com/feed"),
+        ] {
+            let result = classify(vec![row(1, list_url, Some("g1"))], &[node("g1", node_url)]);
+            assert!(result.url_differences.is_empty(), "normalized URLs match");
+        }
+    }
+
+    #[test]
+    fn a_row_held_only_by_url_has_no_url_difference() {
+        let result = classify(
+            vec![row(1, "https://example.com/feed", Some("unknown"))],
+            &[node("g1", "https://example.com/feed")],
+        );
+        assert_eq!(result.held, 1, "the URL must hold the row");
+        assert!(result.url_differences.is_empty(), "there is no GUID match");
+    }
+
+    #[test]
+    fn a_url_difference_stays_held_and_is_not_a_candidate() {
+        let result = classify(
+            vec![row(1, "https://list.example/feed", Some("g1"))],
+            &[node("g1", "https://node.example/feed")],
+        );
+        assert_eq!(result.held, 1, "the URL difference remains held");
+        assert!(result.candidates.is_empty(), "held rows are not candidates");
     }
 
     #[test]
@@ -937,6 +1099,7 @@ mod tests {
             rows: 8_601,
             held: 8_403,
             candidates: 198,
+            url_differences: 2,
             waiting: 142,
             sent: 56,
             outcomes,
@@ -944,7 +1107,7 @@ mod tests {
         };
         assert_eq!(
             report.to_string(),
-            "podcastindex: rows=8601 held=8403 candidates=198 waiting=142 sent=56 \
+            "podcastindex: rows=8601 held=8403 candidates=198 url_differences=2 waiting=142 sent=56 \
              accepted=56 rejected=0 fetch_error=3 import_gap=1"
         );
         let none = PassReport {
@@ -1101,6 +1264,48 @@ mod tests {
         assert_eq!(report.sent, 1, "sent");
     }
 
+    /// stophammer ADR 0104 §2: a pass with the pipeline sends no URL of a
+    /// URL difference.
+    #[tokio::test]
+    async fn a_pass_sends_the_candidate_and_not_the_url_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let sent: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&sent);
+        let report = run_pass(
+            &store,
+            1_000,
+            false,
+            || async {
+                Ok(list_of_rows(vec![
+                    row(1, "https://due.example/a", Some("gd")),
+                    row(7, "https://list.example/feed", Some("moved-guid")),
+                ]))
+            },
+            || async {
+                let mut feeds = node_of_list();
+                feeds.push(node("moved-guid", "https://node.example/feed"));
+                Ok(feeds)
+            },
+            move |urls, _sink| async move {
+                seen.lock().unwrap().push(urls);
+            },
+        )
+        .await
+        .expect("the pass must succeed");
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![vec!["https://due.example/a".to_string()]],
+            "only the candidate goes to the pipeline"
+        );
+        assert_eq!(report.url_differences, 1, "the report counts the row");
+        assert_eq!(
+            report.candidates, 1,
+            "the URL difference is not a candidate"
+        );
+    }
+
     #[tokio::test]
     async fn dry_run_never_calls_the_pipeline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1127,6 +1332,106 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no pipeline call");
         assert_eq!(report.candidates, 2, "candidates");
         assert_eq!(report.sent, 0, "sent");
+    }
+
+    #[tokio::test]
+    async fn dry_run_writes_url_differences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(&dir);
+        let store = store_in(&dir);
+        let report = run_pass(
+            &store,
+            1_000,
+            true,
+            || async {
+                Ok(list_of_rows(vec![row(
+                    7,
+                    "https://list.example/feed",
+                    Some("different-guid"),
+                )]))
+            },
+            || async {
+                let mut feeds = node_of_list();
+                feeds.push(node("different-guid", "https://node.example/feed"));
+                Ok(feeds)
+            },
+            |_urls, _sink| async {},
+        )
+        .await
+        .expect("the dry run must succeed");
+        assert_eq!(report.url_differences, 1, "the report counts the row");
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM music_list_url_differences", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 1, "the dry run writes the difference");
+    }
+
+    #[test]
+    fn replace_url_differences_keeps_only_the_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(&dir);
+        let store = AttemptStore::open(&path);
+        let difference = |id| UrlDifference {
+            podcastindex_id: id,
+            feed_guid: format!("guid-{id}"),
+            node_url: format!("https://node.example/{id}"),
+            list_url: format!("https://list.example/{id}"),
+        };
+        store.replace_url_differences(1, &[difference(1)]).unwrap();
+        store
+            .replace_url_differences(2, &[difference(2), difference(3)])
+            .unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT podcastindex_id FROM music_list_url_differences ORDER BY podcastindex_id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec![2, 3], "the second call replaces the first");
+    }
+
+    #[tokio::test]
+    async fn limit_failure_keeps_the_previous_url_differences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = state_path(&dir);
+        let store = store_in(&dir);
+        let previous = UrlDifference {
+            podcastindex_id: 42,
+            feed_guid: "old-guid".to_string(),
+            node_url: "https://node.example/old".to_string(),
+            list_url: "https://list.example/old".to_string(),
+        };
+        store
+            .lock()
+            .unwrap()
+            .replace_url_differences(10, &[previous])
+            .unwrap();
+        let result = run_pass(
+            &store,
+            1_000,
+            true,
+            || async { Ok(vec![row(1, "https://list.example/new", Some("new-guid"))]) },
+            || async { Ok(vec![node("new-guid", "https://node.example/new")]) },
+            |_urls, _sink| async {},
+        )
+        .await;
+        assert!(result.is_err(), "a short list must fail the limits");
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT podcastindex_id FROM music_list_url_differences",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id, 42, "the prior table row stays in place");
     }
 
     #[tokio::test]

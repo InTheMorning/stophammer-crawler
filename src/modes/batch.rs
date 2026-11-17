@@ -13,6 +13,12 @@ use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS, host_key, interl
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 const CRAWL_ATTEMPTS: u32 = 3;
+/// The maximum host backoff (`stophammer` ADR 0104 §6).
+const MAX_HOST_BACKOFF: Duration = Duration::from_secs(60);
+/// The maximum `Retry-After` wait (`stophammer` ADR 0104 §6).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// The number of successful fetches before backoff decay (`stophammer` ADR 0104 §6).
+const BACKOFF_DECAY_FETCHES: u8 = 20;
 
 /// A function that gets each URL and its report as soon as a fetch ends.
 ///
@@ -122,8 +128,15 @@ pub(crate) struct HostThrottle {
 }
 
 struct HostSlot {
+    host: String,
     semaphore: Arc<Semaphore>,
-    next_allowed_at: Mutex<Instant>,
+    state: Mutex<HostSlotState>,
+}
+
+struct HostSlotState {
+    next_allowed_at: Instant,
+    backoff: Duration,
+    fetches_without_429: u8,
 }
 
 pub(crate) struct HostLease {
@@ -149,10 +162,15 @@ impl HostThrottle {
 
         let slot = {
             let mut slots = self.slots.lock().await;
-            Arc::clone(slots.entry(host).or_insert_with(|| {
+            Arc::clone(slots.entry(host.clone()).or_insert_with(|| {
                 Arc::new(HostSlot {
+                    host,
                     semaphore: Arc::new(Semaphore::new(1)),
-                    next_allowed_at: Mutex::new(Instant::now()),
+                    state: Mutex::new(HostSlotState {
+                        next_allowed_at: Instant::now(),
+                        backoff: Duration::ZERO,
+                        fetches_without_429: 0,
+                    }),
                 })
             }))
         };
@@ -163,8 +181,10 @@ impl HostThrottle {
             .expect("host semaphore closed");
 
         let wait = {
-            let next_allowed_at = slot.next_allowed_at.lock().await;
-            (*next_allowed_at).saturating_duration_since(Instant::now())
+            let state = slot.state.lock().await;
+            state
+                .next_allowed_at
+                .saturating_duration_since(Instant::now())
         };
         if !wait.is_zero() {
             tokio::time::sleep(wait).await;
@@ -176,13 +196,68 @@ impl HostThrottle {
         }
     }
 
-    pub(crate) async fn release(&self, lease: &HostLease, delay: Duration) {
+    /// Set the next allowed fetch time of the host of `lease`
+    /// (`stophammer` ADR 0104 §6).
+    ///
+    /// `retry_wait` is the wait before a retry of the same URL after a failed
+    /// fetch. The caller gives `Duration::ZERO` when it does not retry. The
+    /// next fetch to the host waits for the longest of the host delay, the
+    /// backoff, the `Retry-After` of a `429` and `retry_wait`.
+    pub(crate) async fn release(
+        &self,
+        lease: &HostLease,
+        report: &CrawlReport,
+        retry_wait: Duration,
+    ) {
         let Some(slot) = &lease.slot else {
             return;
         };
 
-        let mut next_allowed_at = slot.next_allowed_at.lock().await;
-        *next_allowed_at = Instant::now() + delay.max(self.host_delay);
+        let mut state = slot.state.lock().await;
+        let retry_after = if report.fetch_http_status == Some(429) {
+            match &report.outcome {
+                CrawlOutcome::FetchError {
+                    retry_after_secs: Some(seconds),
+                    ..
+                } => Duration::from_secs(*seconds).min(MAX_RETRY_AFTER),
+                _ => Duration::ZERO,
+            }
+        } else {
+            Duration::ZERO
+        };
+
+        if report.fetch_http_status == Some(429) {
+            let doubled_backoff = state.backoff.saturating_mul(2);
+            let doubled_host_delay = self.host_delay.saturating_mul(2);
+            let initial_backoff = if doubled_host_delay.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                doubled_host_delay
+            };
+            state.backoff = doubled_backoff.max(initial_backoff).min(MAX_HOST_BACKOFF);
+            state.fetches_without_429 = 0;
+            eprintln!(
+                "crawl: host {} answered 429, delay now {} ms",
+                slot.host,
+                state.backoff.as_millis()
+            );
+        } else {
+            state.fetches_without_429 = state.fetches_without_429.saturating_add(1);
+            if state.fetches_without_429 >= BACKOFF_DECAY_FETCHES {
+                state.backoff /= 2;
+                if state.backoff <= self.host_delay {
+                    state.backoff = Duration::ZERO;
+                }
+                state.fetches_without_429 = 0;
+            }
+        }
+
+        let delay = self
+            .host_delay
+            .max(state.backoff)
+            .max(retry_after)
+            .max(retry_wait.min(MAX_RETRY_AFTER));
+        state.next_allowed_at = Instant::now() + delay;
     }
 }
 
@@ -198,11 +273,16 @@ async fn crawl_feed_with_retries(
     loop {
         let lease = host_throttle.acquire(url).await;
         let report = crawl_feed_report(client, url, config, cache).await;
-        let delay = report
-            .outcome
-            .retry_delay(attempt)
-            .unwrap_or(host_throttle.host_delay);
-        host_throttle.release(&lease, delay).await;
+        // stophammer ADR 0104 §6: a failed fetch keeps its retry wait. A
+        // `Retry-After` of the node (an `IngestError`) does not slow the
+        // feed host.
+        let retry_wait = match report.outcome {
+            CrawlOutcome::FetchError {
+                retryable: true, ..
+            } => report.outcome.retry_delay(attempt).unwrap_or_default(),
+            _ => Duration::ZERO,
+        };
+        host_throttle.release(&lease, &report, retry_wait).await;
         if report.is_retryable() && attempt < CRAWL_ATTEMPTS {
             eprintln!(
                 "  crawl: retrying after attempt {attempt}/{CRAWL_ATTEMPTS} for {url}: {}",
@@ -687,7 +767,7 @@ pub(crate) async fn run_urls_with_sink(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use stophammer_parser::types::{IngestFeedData, IngestRemoteFeedRef};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -695,8 +775,8 @@ mod tests {
 
     use super::{
         CrawlConfig, CrawlOutcome, CrawlReport, FeedCache, FeedCacheDb, FetchCounts, FollowLevel,
-        HostThrottle, crawl_feed_with_retries, exclude_seen_urls, report_follow_urls, run_wave,
-        run_waves,
+        HostLease, HostThrottle, MAX_HOST_BACKOFF, MAX_RETRY_AFTER, crawl_feed_with_retries,
+        exclude_seen_urls, report_follow_urls, run_wave, run_waves,
     };
     use crate::url_queue::{FollowQueueLimit, MAX_FOLLOW_QUEUE_URLS};
 
@@ -757,6 +837,206 @@ mod tests {
             redirects: Vec::new(),
             wasted_200: false,
         }
+    }
+
+    fn status_report(status: u16, outcome: CrawlOutcome) -> CrawlReport {
+        CrawlReport {
+            outcome,
+            fetch_http_status: Some(status),
+            raw_medium: None,
+            parsed_feed_guid: None,
+            final_url: None,
+            content_sha256: None,
+            raw_xml: None,
+            parsed_feed: None,
+            redirects: Vec::new(),
+            wasted_200: false,
+        }
+    }
+
+    fn fetch_429(retry_after_secs: Option<u64>) -> CrawlReport {
+        status_report(
+            429,
+            CrawlOutcome::FetchError {
+                reason: "http 429".to_string(),
+                retryable: true,
+                retry_after_secs,
+            },
+        )
+    }
+
+    fn successful_fetch() -> CrawlReport {
+        status_report(
+            200,
+            CrawlOutcome::Accepted {
+                warnings: Vec::new(),
+            },
+        )
+    }
+
+    async fn backoff_for(lease: &HostLease) -> Duration {
+        lease
+            .slot
+            .as_ref()
+            .expect("host URL has a throttle slot")
+            .state
+            .lock()
+            .await
+            .backoff
+    }
+
+    #[tokio::test]
+    async fn host_backoff_doubles_and_caps_after_fetch_429() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+
+        throttle
+            .release(&lease, &fetch_429(None), Duration::ZERO)
+            .await;
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(3));
+        throttle
+            .release(&lease, &fetch_429(None), Duration::ZERO)
+            .await;
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(6));
+        for _ in 0..8 {
+            throttle
+                .release(&lease, &fetch_429(None), Duration::ZERO)
+                .await;
+        }
+        assert_eq!(backoff_for(&lease).await, MAX_HOST_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn host_backoff_is_isolated_by_host() {
+        let throttle = HostThrottle::new(Duration::from_secs(1));
+        let host_a = throttle.acquire("https://host-a.example/feed").await;
+        let host_b = throttle.acquire("https://host-b.example/feed").await;
+
+        throttle
+            .release(&host_a, &fetch_429(None), Duration::ZERO)
+            .await;
+
+        assert_eq!(backoff_for(&host_a).await, Duration::from_secs(2));
+        assert_eq!(backoff_for(&host_b).await, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn retry_after_sets_at_least_thirty_seconds_and_caps_at_ten_minutes() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+
+        let release_started = Instant::now();
+        throttle
+            .release(&lease, &fetch_429(Some(30)), Duration::ZERO)
+            .await;
+        let state = lease.slot.as_ref().expect("host slot").state.lock().await;
+        assert!(state.next_allowed_at.duration_since(release_started) >= Duration::from_secs(30));
+        drop(state);
+
+        throttle
+            .release(&lease, &fetch_429(Some(3600)), Duration::ZERO)
+            .await;
+        let state = lease.slot.as_ref().expect("host slot").state.lock().await;
+        let retry_wait = state.next_allowed_at.duration_since(Instant::now());
+        assert!(retry_wait <= MAX_RETRY_AFTER);
+        assert!(retry_wait >= Duration::from_secs(590));
+    }
+
+    #[tokio::test]
+    async fn twenty_fetches_without_429_halve_backoff_and_nineteen_do_not() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+        for _ in 0..3 {
+            throttle
+                .release(&lease, &fetch_429(None), Duration::ZERO)
+                .await;
+        }
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(12));
+
+        for _ in 0..19 {
+            throttle
+                .release(&lease, &successful_fetch(), Duration::ZERO)
+                .await;
+        }
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(12));
+        throttle
+            .release(&lease, &successful_fetch(), Duration::ZERO)
+            .await;
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn backoff_at_or_below_host_delay_becomes_zero() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+        throttle
+            .release(&lease, &fetch_429(None), Duration::ZERO)
+            .await;
+        for _ in 0..20 {
+            throttle
+                .release(&lease, &successful_fetch(), Duration::ZERO)
+                .await;
+        }
+        assert_eq!(backoff_for(&lease).await, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn ingest_retry_after_does_not_change_feed_host_wait() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+        let report = status_report(
+            200,
+            CrawlOutcome::IngestError {
+                reason: "ingest http 429".to_string(),
+                retryable: true,
+                retry_after_secs: Some(120),
+            },
+        );
+
+        throttle.release(&lease, &report, Duration::ZERO).await;
+
+        let state = lease.slot.as_ref().expect("host slot").state.lock().await;
+        assert!(
+            state.next_allowed_at.duration_since(Instant::now()) <= Duration::from_millis(1500)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_wait_of_a_failed_fetch_holds_the_host() {
+        let throttle = HostThrottle::new(Duration::from_millis(1500));
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+        let report = status_report(
+            503,
+            CrawlOutcome::FetchError {
+                reason: "http 503".to_string(),
+                retryable: true,
+                retry_after_secs: Some(120),
+            },
+        );
+
+        let release_started = Instant::now();
+        throttle
+            .release(&lease, &report, Duration::from_secs(120))
+            .await;
+
+        let state = lease.slot.as_ref().expect("host slot").state.lock().await;
+        assert!(
+            state.next_allowed_at.duration_since(release_started) >= Duration::from_secs(120),
+            "a 503 with Retry-After: 120 must hold the host for 120 s"
+        );
+        assert_eq!(state.backoff, Duration::ZERO, "only a 429 sets a backoff");
+    }
+
+    #[tokio::test]
+    async fn zero_host_delay_still_gives_fetch_429_a_backoff() {
+        let throttle = HostThrottle::new(Duration::ZERO);
+        let lease = throttle.acquire("https://host-a.example/feed").await;
+
+        throttle
+            .release(&lease, &fetch_429(None), Duration::ZERO)
+            .await;
+
+        assert_eq!(backoff_for(&lease).await, Duration::from_secs(1));
     }
 
     fn no_change_report(feed: IngestFeedData) -> CrawlReport {
