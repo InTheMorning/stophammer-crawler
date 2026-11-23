@@ -264,6 +264,7 @@ mod tests {
             blocks: Vec::new(),
             podcast_namespace: None,
             feed_payment_routes: Vec::new(),
+            feed_value_blocks: Vec::new(),
             live_items: Vec::new(),
             tracks: Vec::new(),
         }
@@ -290,6 +291,7 @@ mod tests {
             entity_ids: Vec::new(),
             links: Vec::new(),
             payment_routes: Vec::new(),
+            value_blocks: Vec::new(),
             value_time_splits: Vec::new(),
             transcripts: Vec::new(),
             remote_items,

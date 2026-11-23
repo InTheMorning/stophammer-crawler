@@ -1448,6 +1448,7 @@ pub(crate) mod tests {
             blocks: Vec::new(),
             podcast_namespace: None,
             feed_payment_routes: Vec::new(),
+            feed_value_blocks: Vec::new(),
             live_items: Vec::new(),
             tracks: Vec::new(),
         }
