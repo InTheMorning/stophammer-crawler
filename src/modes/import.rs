@@ -2127,6 +2127,8 @@ mod tests {
             title: "Feed Title".to_string(),
             description: None,
             image_url: None,
+            itunes_image_url: None,
+            rss_image_url: None,
             language: None,
             explicit: false,
             itunes_type: None,
