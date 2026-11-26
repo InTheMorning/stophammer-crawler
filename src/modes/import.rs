@@ -2140,6 +2140,7 @@ mod tests {
             new_feed_url: None,
             locked: None,
             locked_owner: None,
+            podroll: Vec::new(),
             remote_items: Vec::new(),
             persons: Vec::new(),
             entity_ids: Vec::new(),

@@ -2383,6 +2383,7 @@ mod tests {
             new_feed_url: None,
             locked: None,
             locked_owner: None,
+            podroll: Vec::new(),
             remote_items: vec![IngestRemoteFeedRef {
                 position: 0,
                 medium: Some("music".to_string()),
@@ -2428,6 +2429,7 @@ mod tests {
             new_feed_url: None,
             locked: None,
             locked_owner: None,
+            podroll: Vec::new(),
             remote_items: vec![IngestRemoteFeedRef {
                 position: 0,
                 medium: Some("publisher".to_string()),
