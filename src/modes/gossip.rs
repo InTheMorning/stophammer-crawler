@@ -12,7 +12,7 @@ use crate::crawl::{
 };
 use crate::dedup::Dedup;
 use crate::feed_cache::FeedCacheDb;
-use crate::feed_skip::is_index_medium;
+use crate::feed_skip::{is_index_medium, prior_medium_gate_skip};
 use crate::follow::FollowLevel;
 use crate::modes::batch::{HostThrottle, report_follow_urls};
 use crate::modes::import::{
@@ -348,15 +348,9 @@ impl ProgressStore {
             return Some(format!("known non-music medium: {m}"));
         }
 
-        // Skip if medium-gate rejection (includes absent podcast:medium)
-        if outcome == "rejected"
-            && let Some(ref r) = reason
-            && r.starts_with("[medium_music]")
-        {
-            return Some(format!("prior medium-gate rejection: {r}"));
-        }
-
-        None
+        // Skip if medium-gate rejection (includes absent podcast:medium),
+        // except for a publisher feed (`stophammer` ADR 0101 §4).
+        prior_medium_gate_skip(&outcome, reason.as_deref(), medium.as_deref())
     }
 }
 
@@ -3058,6 +3052,31 @@ mod tests {
         let skip = store.should_skip_feed("https://example.com/no-medium.xml", None);
         assert!(skip.is_some());
         assert!(skip.unwrap().contains("medium-gate rejection"));
+    }
+
+    /// `stophammer` ADR 0101 §4 and ADR 0057 §3, operator choice 2026-11-26:
+    /// a publisher feed that the medium gate refused gets the next podping.
+    /// Its next body can carry a block that retires the record.
+    #[test]
+    fn should_not_skip_publisher_medium_gate_rejection() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("gossip_state.db");
+        let store = ProgressStore::open(db_path.to_str().expect("utf-8 path"));
+
+        let report = make_report(
+            "rejected",
+            Some("[medium_music] publisher feed has no remoteItem with medium='music' or 'musicL'"),
+            Some(200),
+            Some("publisher"),
+            Some("guid-label"),
+        );
+        store.upsert_feed_memory("https://example.com/label.xml", &report, 100);
+
+        assert_eq!(
+            store.should_skip_feed("https://example.com/label.xml", None),
+            None,
+            "a refused publisher feed must get the next podping"
+        );
     }
 
     #[test]

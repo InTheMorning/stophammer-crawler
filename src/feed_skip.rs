@@ -43,6 +43,26 @@ fn repeated_failure(outcome: &str, reason: Option<&str>, medium: Option<&str>) -
     }
 }
 
+/// Gives the skip reason for a prior medium-gate rejection, or `None`.
+///
+/// A publisher feed that the node rejected before can pass now, because it
+/// can list only playlists (`stophammer` ADR 0101 §4), or because it now
+/// carries a block that retires its record (`stophammer` ADR 0057 §3). So its
+/// URL is not skipped. The shared skip list and the gossip feed memory both
+/// use this rule.
+pub(crate) fn prior_medium_gate_skip(
+    outcome: &str,
+    reason: Option<&str>,
+    medium: Option<&str>,
+) -> Option<String> {
+    let reason = reason?;
+    let is_publisher = medium.is_some_and(|value| value.eq_ignore_ascii_case("publisher"));
+    (matches!(outcome, "rejected" | "skipped_known_irrelevant")
+        && reason.starts_with("[medium_music]")
+        && !is_publisher)
+        .then(|| format!("prior medium-gate rejection: {reason}"))
+}
+
 /// The skip reason of a body with a channel and no `podcast:medium` that
 /// does not parse (`stophammer` ADR 0074 §3b).
 pub(crate) const UNPARSED_NO_MEDIUM_SKIP_REASON: &str =
@@ -157,17 +177,8 @@ impl FeedSkipDb {
             return Some(format!("known non-music medium: {m}"));
         }
 
-        // Prior medium-gate rejection. A publisher feed that the node rejected
-        // before can pass now, because it can list only playlists
-        // (`stophammer` ADR 0101 §4). So its URL is not skipped.
-        if matches!(outcome.as_str(), "rejected" | "skipped_known_irrelevant")
-            && let Some(ref r) = reason
-            && r.starts_with("[medium_music]")
-            && !medium
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("publisher"))
-        {
-            return Some(format!("prior medium-gate rejection: {r}"));
+        if let Some(skip) = prior_medium_gate_skip(&outcome, reason.as_deref(), medium.as_deref()) {
+            return Some(skip);
         }
 
         // ADR 0074 §3b: a channel with no title or no GUID, and with no
